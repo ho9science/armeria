@@ -27,7 +27,11 @@ import static org.mockito.Mockito.verify;
 import java.util.ArrayList;
 import java.util.List;
 
+import javax.annotation.Nullable;
+
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ArgumentsSource;
 import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
 
@@ -42,7 +46,7 @@ class DeferredStreamMessageTest {
         final DeferredStreamMessage<Object> m = new DeferredStreamMessage<>();
         assertThat(m.isOpen()).isTrue();
         assertThat(m.isEmpty()).isFalse();
-        assertThat(m.completionFuture()).isNotDone();
+        assertThat(m.whenComplete()).isNotDone();
     }
 
     @Test
@@ -54,42 +58,62 @@ class DeferredStreamMessageTest {
         assertThatThrownBy(() -> m.delegate(null)).isInstanceOf(NullPointerException.class);
     }
 
-    @Test
-    void testEarlyAbort() {
+    @ParameterizedTest
+    @ArgumentsSource(AbortCauseArgumentProvider.class)
+    void testEarlyAbort(@Nullable Throwable cause) {
         final DeferredStreamMessage<Object> m = new DeferredStreamMessage<>();
-        m.abort();
-        assertAborted(m);
-        assertFailedSubscription(m, AbortedStreamException.class);
+        if (cause == null) {
+            m.abort();
+        } else {
+            m.abort(cause);
+        }
+        assertAborted(m, cause);
+        if (cause == null) {
+            assertFailedSubscription(m, AbortedStreamException.class);
+        } else {
+            assertFailedSubscription(m, cause.getClass());
+        }
     }
 
-    @Test
-    void testEarlyAbortWithSubscriber() {
+    @ParameterizedTest
+    @ArgumentsSource(AbortCauseArgumentProvider.class)
+    void testEarlyAbortWithSubscriber(@Nullable Throwable cause) {
         final DeferredStreamMessage<Object> m = new DeferredStreamMessage<>();
         @SuppressWarnings("unchecked")
         final Subscriber<Object> subscriber = mock(Subscriber.class);
         m.subscribe(subscriber, ImmediateEventExecutor.INSTANCE);
-        m.abort();
-        assertAborted(m);
+        if (cause == null) {
+            m.abort();
+        } else {
+            m.abort(cause);
+        }
+        assertAborted(m, cause);
 
         final DefaultStreamMessage<Object> d = new DefaultStreamMessage<>();
         m.delegate(d);
-        assertAborted(d);
+        assertAborted(d, cause);
     }
 
-    @Test
-    void testLateAbort() {
+    @ParameterizedTest
+    @ArgumentsSource(AbortCauseArgumentProvider.class)
+    void testLateAbort(@Nullable Throwable cause) {
         final DeferredStreamMessage<Object> m = new DeferredStreamMessage<>();
         final DefaultStreamMessage<Object> d = new DefaultStreamMessage<>();
 
         m.delegate(d);
-        m.abort();
+        if (cause == null) {
+            m.abort();
+        } else {
+            m.abort(cause);
+        }
 
-        assertAborted(m);
-        assertAborted(d);
+        assertAborted(m, cause);
+        assertAborted(d, cause);
     }
 
-    @Test
-    void testLateAbortWithSubscriber() {
+    @ParameterizedTest
+    @ArgumentsSource(AbortCauseArgumentProvider.class)
+    void testLateAbortWithSubscriber(@Nullable Throwable cause) {
         final DeferredStreamMessage<Object> m = new DeferredStreamMessage<>();
         final DefaultStreamMessage<Object> d = new DefaultStreamMessage<>();
         @SuppressWarnings("unchecked")
@@ -99,11 +123,19 @@ class DeferredStreamMessageTest {
         m.delegate(d);
         verify(subscriber).onSubscribe(any());
 
-        m.abort();
-        verify(subscriber, times(1)).onError(isA(AbortedStreamException.class));
+        if (cause == null) {
+            m.abort();
+        } else {
+            m.abort(cause);
+        }
+        if (cause == null) {
+            verify(subscriber, times(1)).onError(isA(AbortedStreamException.class));
+        } else {
+            verify(subscriber, times(1)).onError(isA(cause.getClass()));
+        }
 
-        assertAborted(m);
-        assertAborted(d);
+        assertAborted(m, cause);
+        assertAborted(d, cause);
     }
 
     @Test
@@ -136,12 +168,14 @@ class DeferredStreamMessageTest {
         assertFailedSubscription(m, IllegalStateException.class);
     }
 
-    private static void assertAborted(StreamMessage<?> m) {
+    private static void assertAborted(StreamMessage<?> m, @Nullable Throwable cause) {
+        final Class<? extends Throwable> causeType = cause != null ? cause.getClass()
+                                                                   : AbortedStreamException.class;
         assertThat(m.isOpen()).isFalse();
         assertThat(m.isEmpty()).isTrue();
-        assertThat(m.completionFuture()).isCompletedExceptionally();
-        assertThatThrownBy(() -> m.completionFuture().get())
-                .hasCauseInstanceOf(AbortedStreamException.class);
+        assertThat(m.whenComplete()).isCompletedExceptionally();
+        assertThatThrownBy(() -> m.whenComplete().get())
+                .hasCauseInstanceOf(causeType);
     }
 
     private static void assertFailedSubscription(StreamMessage<?> m, Class<? extends Throwable> causeType) {
@@ -170,11 +204,11 @@ class DeferredStreamMessageTest {
 
         assertThat(m.isOpen()).isFalse();
         assertThat(m.isEmpty()).isFalse();
-        assertThat(m.completionFuture()).isCompletedWithValue(null);
+        assertThat(m.whenComplete()).isCompletedWithValue(null);
 
         assertThat(d.isOpen()).isFalse();
         assertThat(d.isEmpty()).isFalse();
-        assertThat(d.completionFuture()).isCompletedWithValue(null);
+        assertThat(d.whenComplete()).isCompletedWithValue(null);
     }
 
     @Test
@@ -198,11 +232,11 @@ class DeferredStreamMessageTest {
 
         assertThat(m.isOpen()).isFalse();
         assertThat(m.isEmpty()).isFalse();
-        assertThat(m.completionFuture()).hasFailedWithThrowableThat().isSameAs(exception);
+        assertThat(m.whenComplete()).hasFailedWithThrowableThat().isSameAs(exception);
 
         assertThat(d.isOpen()).isFalse();
         assertThat(d.isEmpty()).isFalse();
-        assertThat(d.completionFuture()).hasFailedWithThrowableThat().isSameAs(exception);
+        assertThat(d.whenComplete()).hasFailedWithThrowableThat().isSameAs(exception);
     }
 
     private static class RecordingSubscriber implements Subscriber<String> {

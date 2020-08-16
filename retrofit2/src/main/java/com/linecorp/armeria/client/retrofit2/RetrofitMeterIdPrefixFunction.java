@@ -15,117 +15,153 @@
  */
 package com.linecorp.armeria.client.retrofit2;
 
+import static com.linecorp.armeria.internal.common.metric.DefaultMeterIdPrefixFunction.addHttpStatus;
 import static java.util.Objects.requireNonNull;
 
-import javax.annotation.Nullable;
+import java.lang.annotation.Annotation;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.util.List;
+import java.util.Map;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableList.Builder;
+import com.google.common.collect.MapMaker;
 
-import com.linecorp.armeria.common.HttpMethod;
 import com.linecorp.armeria.common.HttpStatus;
+import com.linecorp.armeria.common.RequestHeaders;
 import com.linecorp.armeria.common.logging.RequestLog;
+import com.linecorp.armeria.common.logging.RequestOnlyLog;
 import com.linecorp.armeria.common.metric.MeterIdPrefix;
 import com.linecorp.armeria.common.metric.MeterIdPrefixFunction;
-import com.linecorp.armeria.internal.metric.RequestMetricSupport;
 
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Tag;
 import retrofit2.Invocation;
+import retrofit2.http.DELETE;
+import retrofit2.http.GET;
+import retrofit2.http.HEAD;
+import retrofit2.http.HTTP;
+import retrofit2.http.OPTIONS;
+import retrofit2.http.PATCH;
+import retrofit2.http.POST;
+import retrofit2.http.PUT;
 
 /**
  * Returns the default function for retrofit that creates a {@link MeterIdPrefix} with the specified name and
  * the {@link Tag}s derived from the {@link RequestLog} properties and {@link Invocation}.
  * <ul>
- *     <li>{@code service} - Retrofit service interface name or defaultServiceName if Retrofit service interface
- *                           name is not available</li>　
- *     <li>{@code method} - Retrofit service interface method name or {@link HttpMethod#name()} if Retrofit
- *                          service interface name is not available</li>
- *     <li>{@code httpStatus} - {@link HttpStatus#code()}</li>
+ *     <li>{@code service} (or {@code serviceTagName}) - Retrofit service interface name, provided
+ *                                                       {@code serviceName} or {@code UNKNOWN} if Retrofit
+ *                                                       service interface method available</li>
+ *     <li>{@code path}   - Retrofit service interface method path taken from method annotation
+ *                          or {@link RequestHeaders#path()} if Retrofit service interface method available</li>
+ *     <li>{@code method} - Retrofit service interface method
+ *                          or {@code UNKNOWN} if Retrofit service interface method available</li>
+ *     <li>{@code http.method} - HTTP method name from Retrofit service interface method annotation
+ *                               or from {@link RequestHeaders#method()} if Retrofit service interface
+ *                               method not available</li>
+ *     <li>{@code http.status} - {@link HttpStatus#code()}</li>
  * </ul>
  */
 public final class RetrofitMeterIdPrefixFunction implements MeterIdPrefixFunction {
 
-    public static final class RetrofitMeterIdPrefixFunctionBuilder {
+    private static final List<Class<?>> RETROFIT_ANNOTATIONS = ImmutableList.of(
+            POST.class, PUT.class, PATCH.class, HEAD.class, GET.class, OPTIONS.class, HTTP.class, DELETE.class);
 
-        private final String name;
-        @Nullable
-        private String serviceTagName;
-        @Nullable
-        private String defaultServiceName;
+    private static final Map<Method, String> pathCache = new MapMaker().weakKeys().makeMap();
 
-        private RetrofitMeterIdPrefixFunctionBuilder(String name) {
-            this.name = name;
-        }
-
-        /**
-         * Make tag of {@link RetrofitMeterIdPrefixFunction} contains Retrofit service interface name.
-         */
-        public RetrofitMeterIdPrefixFunctionBuilder withServiceTag(String serviceTagName,
-                                                                   String defaultServiceName) {
-            this.serviceTagName = requireNonNull(serviceTagName, "serviceTagName");
-            this.defaultServiceName = requireNonNull(defaultServiceName, "defaultServiceName");
-            return this;
-        }
-
-        public RetrofitMeterIdPrefixFunction build() {
-            return new RetrofitMeterIdPrefixFunction(name, serviceTagName, defaultServiceName);
-        }
-    }
+    private static final String NONE = "none";
 
     /**
-     * Creates a {@link RetrofitMeterIdPrefixFunctionBuilder} with {@code name}.
+     * Returns a newly created {@link RetrofitMeterIdPrefixFunction} with the specified {@code name}.
      */
-    public static RetrofitMeterIdPrefixFunctionBuilder builder(String name) {
-        return new RetrofitMeterIdPrefixFunctionBuilder(requireNonNull(name, "name"));
+    public static RetrofitMeterIdPrefixFunction of(String name) {
+        return new RetrofitMeterIdPrefixFunction(name);
     }
 
     private final String name;
-    @Nullable
-    private final String serviceTagName;
-    @Nullable
-    private final String defaultServiceName;
 
-    RetrofitMeterIdPrefixFunction(String name, @Nullable String serviceTagName,
-                                  @Nullable String defaultServiceName) {
-        this.name = name;
-        if (serviceTagName != null && defaultServiceName != null) {
-            this.serviceTagName = serviceTagName;
-            this.defaultServiceName = defaultServiceName;
-        } else {
-            this.serviceTagName = null;
-            this.defaultServiceName = null;
-        }
+    private RetrofitMeterIdPrefixFunction(String name) {
+        this.name = requireNonNull(name, "name");
     }
 
     @Override
-    public MeterIdPrefix activeRequestPrefix(MeterRegistry registry, RequestLog log) {
-        final ImmutableList.Builder<Tag> tagListBuilder = ImmutableList.builderWithExpectedSize(3);
-        buildTags(tagListBuilder, log);
+    public MeterIdPrefix activeRequestPrefix(MeterRegistry registry, RequestOnlyLog log) {
+        /* http.method, method, path, service */
+        final Builder<Tag> tagListBuilder = ImmutableList.builderWithExpectedSize(4);
+        final RequestHeaders requestHeaders = log.requestHeaders();
+        final String httpMethod = requestHeaders.method().name();
+        tagListBuilder.add(Tag.of("http.method", httpMethod));
+        addMethodPathAndService(tagListBuilder, log, requestHeaders);
         return new MeterIdPrefix(name, tagListBuilder.build());
     }
 
     @Override
-    public MeterIdPrefix apply(MeterRegistry registry, RequestLog log) {
-        final ImmutableList.Builder<Tag> tagListBuilder = ImmutableList.builderWithExpectedSize(3);
-        buildTags(tagListBuilder, log);
-        RequestMetricSupport.appendHttpStatusTag(tagListBuilder, log);
+    public MeterIdPrefix completeRequestPrefix(MeterRegistry registry, RequestLog log) {
+        /* http.method, http.status, method, path, service */
+        final Builder<Tag> tagListBuilder = ImmutableList.builderWithExpectedSize(5);
+        final RequestHeaders requestHeaders = log.requestHeaders();
+        final String httpMethod = requestHeaders.method().name();
+        tagListBuilder.add(Tag.of("http.method", httpMethod));
+        addHttpStatus(tagListBuilder, log);
+        addMethodPathAndService(tagListBuilder, log, requestHeaders);
         return new MeterIdPrefix(name, tagListBuilder.build());
     }
 
-    private void buildTags(ImmutableList.Builder<Tag> tagListBuilder, RequestLog log) {
+    private static void addMethodPathAndService(Builder<Tag> tagListBuilder, RequestOnlyLog log,
+                                                RequestHeaders requestHeaders) {
+        final String methodName;
+        final String serviceName;
+        final String path;
+
         final Invocation invocation = InvocationUtil.getInvocation(log);
         if (invocation != null) {
-            if (serviceTagName != null) {
-                tagListBuilder.add(Tag.of(serviceTagName,
-                                          invocation.method().getDeclaringClass().getSimpleName()));
-            }
-            tagListBuilder.add(Tag.of("method", invocation.method().getName()));
+            final Method method = invocation.method();
+            methodName = method.getName();
+            serviceName = method.getDeclaringClass().getName();
+            path = getPathFromMethod(method);
         } else {
-            if (serviceTagName != null) {
-                assert defaultServiceName != null;
-                tagListBuilder.add(Tag.of(serviceTagName, defaultServiceName));
-            }
-            tagListBuilder.add(Tag.of("method", log.method().name()));
+            methodName = requestHeaders.method().name();
+            serviceName = NONE;
+            path = requestHeaders.path();
         }
+
+        tagListBuilder.add(Tag.of("method", methodName));
+        tagListBuilder.add(Tag.of("path", path));
+        tagListBuilder.add(Tag.of("service", serviceName));
+    }
+
+    @VisibleForTesting
+    static String getPathFromMethod(Method method) {
+        final String path = pathCache.get(method);
+        if (path != null) {
+            return path;
+        }
+
+        return pathCache.computeIfAbsent(method, key -> {
+            for (Annotation annotation : method.getDeclaredAnnotations()) {
+                if (!RETROFIT_ANNOTATIONS.contains(annotation.annotationType())) {
+                    continue;
+                }
+                if (annotation.annotationType().equals(HTTP.class)) {
+                    final HTTP http = (HTTP) annotation;
+                    return http.path();
+                } else {
+                    final Method valueMethod;
+                    try {
+                        valueMethod = annotation.annotationType().getMethod("value");
+                        return (String) valueMethod.invoke(annotation);
+                    } catch (NoSuchMethodException | IllegalAccessException | InvocationTargetException e) {
+                        // Should never happen on valid Retrofit client.
+                        throw new IllegalStateException("Unexpected retrofit annotation: " +
+                                                        annotation.annotationType(), e);
+                    }
+                }
+            }
+            // Should never reach here.
+            return NONE;
+        });
     }
 }

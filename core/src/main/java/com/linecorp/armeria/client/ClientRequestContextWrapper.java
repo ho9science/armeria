@@ -17,12 +17,19 @@
 package com.linecorp.armeria.client;
 
 import java.time.Duration;
-import java.util.Map.Entry;
+import java.util.concurrent.CompletableFuture;
+import java.util.function.Consumer;
 
-import com.linecorp.armeria.client.endpoint.EndpointSelector;
+import javax.annotation.Nullable;
+
+import com.linecorp.armeria.client.endpoint.EndpointGroup;
 import com.linecorp.armeria.common.HttpHeaders;
-import com.linecorp.armeria.common.Request;
+import com.linecorp.armeria.common.HttpHeadersBuilder;
+import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.RequestContextWrapper;
+import com.linecorp.armeria.common.RequestId;
+import com.linecorp.armeria.common.RpcRequest;
+import com.linecorp.armeria.common.util.TimeoutMode;
 
 /**
  * Wraps an existing {@link ClientRequestContext}.
@@ -38,23 +45,14 @@ public class ClientRequestContextWrapper
     }
 
     @Override
-    public ClientRequestContext newDerivedContext() {
-        return delegate().newDerivedContext();
+    public ClientRequestContext newDerivedContext(RequestId id, @Nullable HttpRequest req,
+                                                  @Nullable RpcRequest rpcReq, @Nullable Endpoint endpoint) {
+        return delegate().newDerivedContext(id, req, rpcReq, endpoint);
     }
 
     @Override
-    public ClientRequestContext newDerivedContext(Request request) {
-        return delegate().newDerivedContext(request);
-    }
-
-    @Override
-    public ClientRequestContext newDerivedContext(Request request, Endpoint endpoint) {
-        return delegate().newDerivedContext(request, endpoint);
-    }
-
-    @Override
-    public EndpointSelector endpointSelector() {
-        return delegate().endpointSelector();
+    public EndpointGroup endpointGroup() {
+        return delegate().endpointGroup();
     }
 
     @Override
@@ -93,13 +91,18 @@ public class ClientRequestContextWrapper
     }
 
     @Override
-    public void setResponseTimeoutMillis(long responseTimeoutMillis) {
-        delegate().setResponseTimeoutMillis(responseTimeoutMillis);
+    public void clearResponseTimeout() {
+        delegate().clearResponseTimeout();
     }
 
     @Override
-    public void setResponseTimeout(Duration responseTimeout) {
-        delegate().setResponseTimeout(responseTimeout);
+    public void setResponseTimeoutMillis(TimeoutMode mode, long responseTimeoutMillis) {
+        delegate().setResponseTimeoutMillis(mode, responseTimeoutMillis);
+    }
+
+    @Override
+    public void setResponseTimeout(TimeoutMode mode, Duration responseTimeout) {
+        delegate().setResponseTimeout(mode, responseTimeout);
     }
 
     @Override
@@ -123,22 +126,32 @@ public class ClientRequestContextWrapper
     }
 
     @Override
-    public void setAdditionalRequestHeaders(Iterable<? extends Entry<? extends CharSequence, ?>> headers) {
-        delegate().setAdditionalRequestHeaders(headers);
-    }
-
-    @Override
     public void addAdditionalRequestHeader(CharSequence name, Object value) {
         delegate().addAdditionalRequestHeader(name, value);
     }
 
     @Override
-    public void addAdditionalRequestHeaders(Iterable<? extends Entry<? extends CharSequence, ?>> headers) {
-        delegate().setAdditionalRequestHeaders(headers);
+    public void mutateAdditionalRequestHeaders(Consumer<HttpHeadersBuilder> mutator) {
+        delegate().additionalRequestHeaders();
     }
 
     @Override
-    public boolean removeAdditionalRequestHeader(CharSequence name) {
-        return delegate().removeAdditionalRequestHeader(name);
+    public void timeoutNow() {
+        delegate().timeoutNow();
+    }
+
+    @Override
+    public boolean isTimedOut() {
+        return delegate().isTimedOut();
+    }
+
+    @Override
+    public CompletableFuture<Void> whenResponseTimingOut() {
+        return delegate().whenResponseTimingOut();
+    }
+
+    @Override
+    public CompletableFuture<Void> whenResponseTimedOut() {
+        return delegate().whenResponseTimedOut();
     }
 }

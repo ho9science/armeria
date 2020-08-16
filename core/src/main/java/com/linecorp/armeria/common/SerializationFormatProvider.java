@@ -20,13 +20,18 @@ import static java.util.Objects.requireNonNull;
 
 import java.util.Set;
 
+import javax.annotation.Nullable;
+
 import com.google.common.base.Ascii;
 import com.google.common.base.MoreObjects;
 import com.google.common.collect.ImmutableList;
 
+import com.linecorp.armeria.common.annotation.UnstableApi;
+
 /**
  * Registers the {@link SerializationFormat}s dynamically via Java SPI (Service Provider Interface).
  */
+@UnstableApi
 public abstract class SerializationFormatProvider {
 
     /**
@@ -37,6 +42,7 @@ public abstract class SerializationFormatProvider {
     /**
      * A registration entry of a {@link SerializationFormat}.
      */
+    @UnstableApi
     protected static final class Entry implements Comparable<Entry> {
         final String uriText;
         final MediaType primaryMediaType;
@@ -48,14 +54,15 @@ public abstract class SerializationFormatProvider {
         public Entry(String uriText, MediaType primaryMediaType, MediaType... alternativeMediaTypes) {
             this.uriText = Ascii.toLowerCase(requireNonNull(uriText, "uriText"));
             this.primaryMediaType = requireNonNull(primaryMediaType, "primaryMediaType");
-            mediaTypes = new MediaTypeSet(ImmutableList.<MediaType>builder()
-                    .add(primaryMediaType)
-                    .add(requireNonNull(alternativeMediaTypes, "alternativeMediaTypes"))
-                    .build());
+            requireNonNull(alternativeMediaTypes, "alternativeMediaTypes");
+            mediaTypes = MediaTypeSet.of(ImmutableList.<MediaType>builder()
+                                                 .add(primaryMediaType)
+                                                 .add(alternativeMediaTypes)
+                                                 .build());
         }
 
         @Override
-        public boolean equals(Object obj) {
+        public boolean equals(@Nullable Object obj) {
             if (this == obj) {
                 return true;
             }

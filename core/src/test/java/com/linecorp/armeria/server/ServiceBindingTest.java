@@ -18,9 +18,13 @@ package com.linecorp.armeria.server;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.fail;
+import static org.awaitility.Awaitility.await;
 
 import java.io.IOException;
+import java.util.Queue;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CountDownLatch;
+import java.util.function.Function;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -28,7 +32,7 @@ import org.junit.jupiter.api.extension.RegisterExtension;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 
-import com.linecorp.armeria.client.HttpClient;
+import com.linecorp.armeria.client.WebClient;
 import com.linecorp.armeria.common.AggregatedHttpResponse;
 import com.linecorp.armeria.common.HttpHeaderNames;
 import com.linecorp.armeria.common.HttpMethod;
@@ -36,56 +40,40 @@ import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.MediaType;
 import com.linecorp.armeria.common.RequestHeaders;
-import com.linecorp.armeria.common.logging.ContentPreviewerAdapter;
-import com.linecorp.armeria.common.logging.ContentPreviewerFactory;
-import com.linecorp.armeria.common.logging.RequestLogAvailability;
-import com.linecorp.armeria.testing.junit.server.ServerExtension;
+import com.linecorp.armeria.testing.junit5.server.ServerExtension;
 
 class ServiceBindingTest {
 
     private static CountDownLatch accessLogWriterCheckLatch;
     private static CountDownLatch propertyCheckLatch;
+    private static final Queue<Integer> decoratorLog = new ArrayBlockingQueue<>(100);
+
+    private static final LoggingDecorator decorator1 = new LoggingDecorator(1);
+    private static final LoggingDecorator decorator2 = new LoggingDecorator(2);
+    private static final LoggingDecorator decorator3 = new LoggingDecorator(3);
 
     @RegisterExtension
     static final ServerExtension server = new ServerExtension(true) {
         @Override
         protected void configure(ServerBuilder sb) throws Exception {
-            final ContentPreviewerFactory requestContentPreviewerFactory = (ctx, headers) ->
-                    new ContentPreviewerAdapter() {
-                        @Override
-                        public String produce() {
-                            return "request content";
-                        }
-                    };
-            final ContentPreviewerFactory responseContentPreviewerFactory = (ctx, headers) ->
-                    new ContentPreviewerAdapter() {
-                        @Override
-                        public String produce() {
-                            return "response content";
-                        }
-                    };
-
             sb.route().get("/greet/{name}")
               .post("/greet")
               .produces(MediaType.PLAIN_TEXT_UTF_8)
               .requestTimeoutMillis(1000)
               .maxRequestLength(8192)
               .verboseResponses(true)
-              .requestContentPreviewerFactory(requestContentPreviewerFactory)
-              .responseContentPreviewerFactory(responseContentPreviewerFactory)
               .accessLogWriter(log -> accessLogWriterCheckLatch.countDown(), true)
               .decorator(delegate -> (ctx, req) -> {
-                  ctx.log().addListener(log -> {
+                  ctx.log().whenComplete().thenAccept(log -> {
                       assertThat(ctx.requestTimeoutMillis()).isEqualTo(1000);
                       assertThat(ctx.maxRequestLength()).isEqualTo(8192);
-                      assertThat(ctx.verboseResponses()).isTrue();
-                      assertThat(log.requestContentPreview()).isEqualTo("request content");
-                      assertThat(log.responseContentPreview()).isEqualTo("response content");
+                      assertThat(ctx.config().verboseResponses()).isTrue();
 
                       propertyCheckLatch.countDown();
-                  }, RequestLogAvailability.COMPLETE);
+                  });
                   return delegate.serve(ctx, req);
               })
+              .decorators(decorator1, decorator2, decorator3)
               .build((ctx, req) -> {
                   if (req.method() == HttpMethod.GET) {
                       return HttpResponse.of(ctx.pathParam("name"));
@@ -102,6 +90,7 @@ class ServiceBindingTest {
               .methods(HttpMethod.POST)
               .consumes(MediaType.JSON, MediaType.PLAIN_TEXT_UTF_8)
               .produces(MediaType.JSON, MediaType.PLAIN_TEXT_UTF_8)
+              .decorators(decorator1, decorator2, decorator3)
               .build((ctx, req) -> HttpResponse.from(
                       req.aggregate().thenApply(request -> {
                           final String resContent;
@@ -117,18 +106,20 @@ class ServiceBindingTest {
     };
 
     @BeforeEach
-    void setup() {
+    void setUp() {
         accessLogWriterCheckLatch = new CountDownLatch(1);
         propertyCheckLatch = new CountDownLatch(1);
+        decoratorLog.clear();
     }
 
     @Test
     void routeService() throws InterruptedException {
-        final HttpClient client = HttpClient.of(server.uri("/"));
+        final WebClient client = WebClient.of(server.httpUri());
         AggregatedHttpResponse res = client.get("/greet/armeria").aggregate().join();
         propertyCheckLatch.await();
         assertThat(res.status()).isSameAs(HttpStatus.OK);
         assertThat(res.contentUtf8()).isEqualTo("armeria");
+        await().untilAsserted(() -> assertThat(decoratorLog).containsExactly(3, 2, 1));
 
         res = client.post("/greet", "armeria").aggregate().join();
         assertThat(res.status()).isSameAs(HttpStatus.OK);
@@ -143,11 +134,12 @@ class ServiceBindingTest {
 
     @Test
     void consumesAndProduces() throws IOException {
-        final HttpClient client = HttpClient.of(server.uri("/"));
+        final WebClient client = WebClient.of(server.httpUri());
         AggregatedHttpResponse res = client.execute(RequestHeaders.of(HttpMethod.POST, "/hello"), "armeria")
                                            .aggregate().join();
         assertThat(res.status()).isSameAs(HttpStatus.OK);
         assertThat(res.contentUtf8()).isEqualTo("armeria");
+        await().untilAsserted(() -> assertThat(decoratorLog).containsExactly(3, 2, 1));
 
         res = client.execute(RequestHeaders.of(HttpMethod.POST, "/hello",
                                                HttpHeaderNames.CONTENT_TYPE, MediaType.PLAIN_TEXT_UTF_8),
@@ -179,13 +171,29 @@ class ServiceBindingTest {
 
     @Test
     void accessLogWriter() throws InterruptedException {
-        final HttpClient client = HttpClient.of(server.uri("/"));
+        final WebClient client = WebClient.of(server.httpUri());
         client.execute(RequestHeaders.of(HttpMethod.POST, "/hello"), "armeria")
               .aggregate().join();
 
         assertThat(accessLogWriterCheckLatch.getCount()).isOne();
 
-        client.get("/greet/armeria");
+        client.get("/greet/armeria").aggregate();
         accessLogWriterCheckLatch.await();
+    }
+
+    private static final class LoggingDecorator implements Function<HttpService, HttpService> {
+        private final Integer index;
+
+        private LoggingDecorator(Integer index) {
+            this.index = index;
+        }
+
+        @Override
+        public HttpService apply(HttpService delegate) {
+            return (ctx, req) -> {
+                ctx.log().whenComplete().thenAccept(log -> decoratorLog.add(index));
+                return delegate.serve(ctx, req);
+            };
+        }
     }
 }

@@ -36,8 +36,7 @@ import org.junit.rules.Timeout;
 import com.google.common.base.Strings;
 import com.google.protobuf.ByteString;
 
-import com.linecorp.armeria.client.ClientBuilder;
-import com.linecorp.armeria.client.grpc.GrpcClientOptions;
+import com.linecorp.armeria.client.Clients;
 import com.linecorp.armeria.common.grpc.GrpcSerializationFormats;
 import com.linecorp.armeria.grpc.testing.FlowControlTestServiceGrpc.FlowControlTestServiceImplBase;
 import com.linecorp.armeria.grpc.testing.FlowControlTestServiceGrpc.FlowControlTestServiceStub;
@@ -45,7 +44,7 @@ import com.linecorp.armeria.grpc.testing.Messages.Payload;
 import com.linecorp.armeria.grpc.testing.Messages.SimpleRequest;
 import com.linecorp.armeria.grpc.testing.Messages.SimpleResponse;
 import com.linecorp.armeria.server.ServerBuilder;
-import com.linecorp.armeria.server.grpc.GrpcServiceBuilder;
+import com.linecorp.armeria.server.grpc.GrpcService;
 import com.linecorp.armeria.testing.junit4.server.ServerRule;
 
 import io.grpc.stub.ClientCallStreamObserver;
@@ -190,10 +189,11 @@ public class GrpcFlowControlTest {
             sb.maxRequestLength(0);
             sb.requestTimeoutMillis(0);
 
-            sb.serviceUnder("/", new GrpcServiceBuilder()
-                    .addService(new FlowControlService())
-                    .setMaxInboundMessageSizeBytes(Integer.MAX_VALUE)
-                    .build());
+            sb.serviceUnder("/",
+                            GrpcService.builder()
+                                       .addService(new FlowControlService())
+                                       .setMaxInboundMessageSizeBytes(Integer.MAX_VALUE)
+                                       .build());
         }
     };
 
@@ -204,11 +204,10 @@ public class GrpcFlowControlTest {
 
     @Before
     public void setUp() {
-        client = new ClientBuilder(server.uri(GrpcSerializationFormats.PROTO, "/"))
-                .maxResponseLength(0)
-                .responseTimeoutMillis(0)
-                .option(GrpcClientOptions.MAX_INBOUND_MESSAGE_SIZE_BYTES.newValue(Integer.MAX_VALUE))
-                .build(FlowControlTestServiceStub.class);
+        client = Clients.builder(server.httpUri(GrpcSerializationFormats.PROTO))
+                        .maxResponseLength(0)
+                        .responseTimeoutMillis(0)
+                        .build(FlowControlTestServiceStub.class);
     }
 
     @Test

@@ -31,7 +31,8 @@ import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.MediaType;
 
 /**
- * A skeletal builder class which helps easier implementation of an {@link HttpFile} builder.
+ * A skeletal builder class which helps easier implementation of {@link HttpFileBuilder} or
+ * {@link AggregatedHttpFileBuilder}.
  */
 public abstract class AbstractHttpFileBuilder {
 
@@ -149,7 +150,7 @@ public abstract class AbstractHttpFileBuilder {
      * {@link HttpResponse}.
      */
     protected final HttpHeaders buildHeaders() {
-        return headers != null ? headers.build() : HttpHeaders.of();
+        return headers != null ? headers.removeAndThen(HttpHeaderNames.STATUS).build() : HttpHeaders.of();
     }
 
     private HttpHeadersBuilder headersBuilder() {
@@ -198,7 +199,7 @@ public abstract class AbstractHttpFileBuilder {
     }
 
     /**
-     * Sets the {@code "content-type"} header. This method is a shortcut of:
+     * Sets the {@code "content-type"} header. This method is a shortcut for:
      * <pre>{@code
      * builder.autoDetectedContentType(false);
      * builder.setHeader(HttpHeaderNames.CONTENT_TYPE, contentType);
@@ -212,7 +213,7 @@ public abstract class AbstractHttpFileBuilder {
     }
 
     /**
-     * Sets the {@code "content-type"} header. This method is a shortcut of:
+     * Sets the {@code "content-type"} header. This method is a shortcut for:
      * <pre>{@code
      * builder.autoDetectedContentType(false);
      * builder.setHeader(HttpHeaderNames.CONTENT_TYPE, contentType);
@@ -225,7 +226,7 @@ public abstract class AbstractHttpFileBuilder {
     }
 
     /**
-     * Sets the {@code "cache-control"} header. This method is a shortcut of:
+     * Sets the {@code "cache-control"} header. This method is a shortcut for:
      * <pre>{@code
      * builder.setHeader(HttpHeaderNames.CACHE_CONTROL, cacheControl);
      * }</pre>
@@ -236,7 +237,7 @@ public abstract class AbstractHttpFileBuilder {
     }
 
     /**
-     * Sets the {@code "cache-control"} header. This method is a shortcut of:
+     * Sets the {@code "cache-control"} header. This method is a shortcut for:
      * <pre>{@code
      * builder.setHeader(HttpHeaderNames.CACHE_CONTROL, cacheControl);
      * }</pre>

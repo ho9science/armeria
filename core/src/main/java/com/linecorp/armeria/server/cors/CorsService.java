@@ -16,13 +16,18 @@
 
 package com.linecorp.armeria.server.cors;
 
-import static com.linecorp.armeria.internal.ArmeriaHttpUtil.isCorsPreflightRequest;
+import static com.linecorp.armeria.internal.common.ArmeriaHttpUtil.isCorsPreflightRequest;
 import static java.util.Objects.requireNonNull;
+
+import java.util.List;
+import java.util.stream.Collectors;
 
 import javax.annotation.Nullable;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import com.google.common.collect.ImmutableList;
 
 import com.linecorp.armeria.common.FilteredHttpResponse;
 import com.linecorp.armeria.common.HttpHeaderNames;
@@ -30,15 +35,14 @@ import com.linecorp.armeria.common.HttpObject;
 import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.HttpStatus;
-import com.linecorp.armeria.common.HttpStatusClass;
 import com.linecorp.armeria.common.ResponseHeaders;
 import com.linecorp.armeria.common.ResponseHeadersBuilder;
-import com.linecorp.armeria.server.Service;
+import com.linecorp.armeria.server.HttpService;
 import com.linecorp.armeria.server.ServiceRequestContext;
 import com.linecorp.armeria.server.SimpleDecoratingHttpService;
 
 /**
- * Decorates an HTTP {@link Service} to add the
+ * Decorates an {@link HttpService} to add the
  * <a href="https://en.wikipedia.org/wiki/Cross-origin_resource_sharing">Cross-Origin Resource Sharing
  * (CORS)</a> support.
  *
@@ -51,12 +55,41 @@ public final class CorsService extends SimpleDecoratingHttpService {
     static final String ANY_ORIGIN = "*";
     static final String NULL_ORIGIN = "null";
 
-    private final CorsConfig config;
+    /**
+     * Returns a new {@link CorsServiceBuilder} with its origin set with {@code "*"} (any origin).
+     */
+    public static CorsServiceBuilder builderForAnyOrigin() {
+        return new CorsServiceBuilder();
+    }
 
     /**
-     * Creates a new {@link CorsService} that decorates the specified {@code delegate} to add CORS support.
+     * Returns a new {@link CorsServiceBuilder} with the specified {@code origins}.
      */
-    public CorsService(Service<HttpRequest, HttpResponse> delegate, CorsConfig config) {
+    public static CorsServiceBuilder builder(String... origins) {
+        return builder(ImmutableList.copyOf(requireNonNull(origins, "origins")));
+    }
+
+    /**
+     * Returns a new {@link CorsServiceBuilder} with the specified {@code origins}.
+     */
+    public static CorsServiceBuilder builder(Iterable<String> origins) {
+        requireNonNull(origins, "origins");
+        final List<String> copied = ImmutableList.copyOf(origins);
+        if (copied.contains(ANY_ORIGIN)) {
+            if (copied.size() > 1) {
+                logger.warn("Any origin (*) has been already included. Other origins ({}) will be ignored.",
+                            copied.stream()
+                                  .filter(c -> !ANY_ORIGIN.equals(c))
+                                  .collect(Collectors.joining(",")));
+            }
+            return builderForAnyOrigin();
+        }
+        return new CorsServiceBuilder(copied);
+    }
+
+    private final CorsConfig config;
+
+    CorsService(HttpService delegate, CorsConfig config) {
         super(delegate);
         this.config = requireNonNull(config, "config");
     }
@@ -72,17 +105,15 @@ public final class CorsService extends SimpleDecoratingHttpService {
     public HttpResponse serve(ServiceRequestContext ctx, HttpRequest req) throws Exception {
         // check if CORS preflight must be returned, or if
         // we need to forbid access because origin could not be validated
-        if (config.isEnabled()) {
-            if (isCorsPreflightRequest(req)) {
-                return handleCorsPreflight(ctx, req);
-            }
-            if (config.isShortCircuit() &&
-                config.getPolicy(req.headers().get(HttpHeaderNames.ORIGIN), ctx.routingContext()) == null) {
-                return forbidden();
-            }
+        if (isCorsPreflightRequest(req)) {
+            return handleCorsPreflight(ctx, req);
+        }
+        if (config.isShortCircuit() &&
+            config.getPolicy(req.headers().get(HttpHeaderNames.ORIGIN), ctx.routingContext()) == null) {
+            return forbidden();
         }
 
-        return new FilteredHttpResponse(delegate().serve(ctx, req)) {
+        return new FilteredHttpResponse(unwrap().serve(ctx, req)) {
             @Override
             protected HttpObject filter(HttpObject obj) {
                 if (!(obj instanceof ResponseHeaders)) {
@@ -91,7 +122,7 @@ public final class CorsService extends SimpleDecoratingHttpService {
 
                 final ResponseHeaders headers = (ResponseHeaders) obj;
                 final HttpStatus status = headers.status();
-                if (status.codeClass() == HttpStatusClass.INFORMATIONAL) {
+                if (status.isInformational()) {
                     return headers;
                 }
 
@@ -155,9 +186,6 @@ public final class CorsService extends SimpleDecoratingHttpService {
     @Nullable
     private CorsPolicy setCorsOrigin(ServiceRequestContext ctx, HttpRequest request,
                                      ResponseHeadersBuilder headers) {
-        if (!config.isEnabled()) {
-            return null;
-        }
 
         final String origin = request.headers().get(HttpHeaderNames.ORIGIN);
         if (origin != null) {

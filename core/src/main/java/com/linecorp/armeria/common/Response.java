@@ -23,30 +23,17 @@ import com.linecorp.armeria.common.stream.StreamMessage;
 
 /**
  * A response stream or a holder of the future result value.
- * It has to be a {@link HttpResponse} or a {@link RpcResponse}.
+ * It has to be an {@link HttpResponse} or an {@link RpcResponse}.
  */
 public interface Response {
-
-    /**
-     * Returns a {@link CompletableFuture} which completes when
-     * 1) the response stream has been closed (the {@link StreamMessage} has been completed) or
-     * 2) the result value is set (the {@link CompletionStage} has completed.)
-     *
-     * @deprecated Use {@link #completionFuture()}.
-     */
-    @Deprecated
-    default CompletableFuture<?> closeFuture() {
-        return completionFuture();
-    }
-
     /**
      * Returns a {@link CompletableFuture} which completes when
      * 1) the response stream has been closed (the {@link StreamMessage} has been completed) or
      * 2) the result value is set (the {@link CompletionStage} has completed.)
      */
-    default CompletableFuture<?> completionFuture() {
+    default CompletableFuture<?> whenComplete() {
         if (this instanceof StreamMessage) {
-            return ((StreamMessage<?>) this).completionFuture();
+            return ((StreamMessage<?>) this).whenComplete();
         }
 
         if (this instanceof CompletionStage) {

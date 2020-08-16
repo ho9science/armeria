@@ -18,16 +18,15 @@ package com.linecorp.armeria.server.annotation.decorator;
 import java.util.function.Function;
 
 import com.linecorp.armeria.common.HttpRequest;
-import com.linecorp.armeria.common.HttpResponse;
-import com.linecorp.armeria.internal.DefaultValues;
-import com.linecorp.armeria.server.Service;
+import com.linecorp.armeria.internal.server.annotation.DefaultValues;
+import com.linecorp.armeria.server.HttpService;
 import com.linecorp.armeria.server.annotation.DecoratorFactoryFunction;
-import com.linecorp.armeria.server.throttling.RateLimitingThrottlingStrategy;
-import com.linecorp.armeria.server.throttling.ThrottlingHttpService;
+import com.linecorp.armeria.server.throttling.ThrottlingService;
+import com.linecorp.armeria.server.throttling.ThrottlingStrategy;
 
 /**
- * A factory which creates a {@link ThrottlingHttpService} decorator with a
- * {@link RateLimitingThrottlingStrategy}.
+ * A factory which creates a {@link ThrottlingService} decorator with a
+ * {@link ThrottlingStrategy#rateLimiting(double, String)}.
  */
 public final class RateLimitingDecoratorFactoryFunction
         implements DecoratorFactoryFunction<RateLimitingDecorator> {
@@ -35,9 +34,14 @@ public final class RateLimitingDecoratorFactoryFunction
      * Creates a new decorator with the specified {@code parameter}.
      */
     @Override
-    public Function<Service<HttpRequest, HttpResponse>,
-            ? extends Service<HttpRequest, HttpResponse>> newDecorator(RateLimitingDecorator parameter) {
-        return ThrottlingHttpService.newDecorator(new RateLimitingThrottlingStrategy<>(
-                parameter.value(), DefaultValues.isSpecified(parameter.name()) ? parameter.name() : null));
+    public Function<? super HttpService, ? extends HttpService> newDecorator(RateLimitingDecorator parameter) {
+        final String name = parameter.name();
+        final ThrottlingStrategy<HttpRequest> throttlingStrategy;
+        if (DefaultValues.isSpecified(name)) {
+            throttlingStrategy = ThrottlingStrategy.rateLimiting(parameter.value());
+        } else {
+            throttlingStrategy = ThrottlingStrategy.rateLimiting(parameter.value(), name);
+        }
+        return ThrottlingService.newDecorator(throttlingStrategy);
     }
 }

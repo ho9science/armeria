@@ -16,19 +16,19 @@
 
 package com.linecorp.armeria.client.encoding;
 
-import static com.linecorp.armeria.common.stream.SubscriptionOption.WITH_POOLED_OBJECTS;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
-import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.zip.GZIPOutputStream;
 
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
+import org.reactivestreams.Subscriber;
+import org.reactivestreams.Subscription;
 
 import com.google.common.collect.ImmutableMap;
 
@@ -38,16 +38,15 @@ import com.linecorp.armeria.common.HttpObject;
 import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.ResponseHeaders;
-import com.linecorp.armeria.unsafe.ByteBufHttpData;
+import com.linecorp.armeria.common.stream.SubscriptionOption;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
-import io.netty.buffer.UnpooledHeapByteBuf;
 
-public class HttpDecodedResponseTest {
+class HttpDecodedResponseTest {
 
     private static final Map<String, StreamDecoderFactory> DECODERS =
-            ImmutableMap.of("gzip", new GzipStreamDecoderFactory());
+            ImmutableMap.of("gzip", StreamDecoderFactory.gzip());
 
     private static final ResponseHeaders RESPONSE_HEADERS =
             ResponseHeaders.of(HttpStatus.OK, HttpHeaderNames.CONTENT_ENCODING, "gzip");
@@ -65,61 +64,82 @@ public class HttpDecodedResponseTest {
     }
 
     @Test
-    public void unpooledPayload_unpooledDrain() {
+    void unpooledPayload_unpooledDrain() {
         final HttpData payload = HttpData.wrap(PAYLOAD);
         final HttpResponse delegate = HttpResponse.of(RESPONSE_HEADERS, payload);
         final HttpResponse decoded = new HttpDecodedResponse(delegate, DECODERS, ByteBufAllocator.DEFAULT);
-        final ByteBuf buf = responseBuf(decoded, false);
+        final HttpData decodedPayload = responseData(decoded, false);
 
-        assertThat(buf).isInstanceOf(UnpooledHeapByteBuf.class);
+        assertThat(decodedPayload.isPooled()).isFalse();
     }
 
     @Test
-    public void pooledPayload_unpooledDrain() {
-        final ByteBufHttpData payload = new ByteBufHttpData(
-                ByteBufAllocator.DEFAULT.buffer().writeBytes(PAYLOAD), true);
+    void pooledPayload_unpooledDrain() {
+        final ByteBuf payloadBuf = ByteBufAllocator.DEFAULT.buffer().writeBytes(PAYLOAD);
+        final HttpData payload = HttpData.wrap(payloadBuf).withEndOfStream();
         final HttpResponse delegate = HttpResponse.of(RESPONSE_HEADERS, payload);
         final HttpResponse decoded = new HttpDecodedResponse(delegate, DECODERS, ByteBufAllocator.DEFAULT);
-        final ByteBuf buf = responseBuf(decoded, false);
+        final HttpData decodedPayload = responseData(decoded, false);
 
-        assertThat(buf).isInstanceOf(UnpooledHeapByteBuf.class);
-        assertThat(payload.refCnt()).isZero();
+        assertThat(decodedPayload.isPooled()).isFalse();
+        assertThat(payloadBuf.refCnt()).isZero();
     }
 
-    // Users that request pooled objects still always need to be ok with unpooled ones.
     @Test
-    public void unpooledPayload_pooledDrain() {
+    void unpooledPayload_pooledDrain() {
         final HttpData payload = HttpData.wrap(PAYLOAD);
         final HttpResponse delegate = HttpResponse.of(RESPONSE_HEADERS, payload);
         final HttpResponse decoded = new HttpDecodedResponse(delegate, DECODERS, ByteBufAllocator.DEFAULT);
-        final ByteBuf buf = responseBuf(decoded, true);
+        final HttpData decodedPayload = responseData(decoded, true);
 
-        assertThat(buf).isNotInstanceOf(UnpooledHeapByteBuf.class);
+        assertThat(decodedPayload.isPooled()).isTrue();
+        assertThat(decodedPayload.byteBuf().refCnt()).isOne();
+        decodedPayload.close();
     }
 
     @Test
-    public void pooledPayload_pooledDrain() {
-        final ByteBufHttpData payload = new ByteBufHttpData(
-                ByteBufAllocator.DEFAULT.buffer().writeBytes(PAYLOAD), true);
+    void pooledPayload_pooledDrain() {
+        final ByteBuf payloadBuf = ByteBufAllocator.DEFAULT.buffer().writeBytes(PAYLOAD);
+        final HttpData payload = HttpData.wrap(payloadBuf).withEndOfStream();
         final HttpResponse delegate = HttpResponse.of(RESPONSE_HEADERS, payload);
         final HttpResponse decoded = new HttpDecodedResponse(delegate, DECODERS, ByteBufAllocator.DEFAULT);
-        final ByteBuf buf = responseBuf(decoded, true);
+        final HttpData decodedPayload = responseData(decoded, true);
+        final ByteBuf decodedPayloadBuf = decodedPayload.byteBuf();
 
-        assertThat(buf).isNotInstanceOf(UnpooledHeapByteBuf.class);
-        assertThat(payload.refCnt()).isZero();
+        assertThat(payloadBuf.refCnt()).isZero();
+        assertThat(decodedPayload.isPooled()).isTrue();
+        decodedPayload.close();
+        assertThat(decodedPayloadBuf.refCnt()).isZero();
     }
 
-    private static ByteBuf responseBuf(HttpResponse decoded, boolean withPooledObjects) {
-        final CompletableFuture<List<HttpObject>> future;
+    private static HttpData responseData(HttpResponse decoded, boolean withPooledObjects) {
+        final CompletableFuture<HttpData> future = new CompletableFuture<>();
+        final Subscriber<HttpObject> subscriber = new Subscriber<HttpObject>() {
+            @Override
+            public void onSubscribe(Subscription s) {
+                s.request(Long.MAX_VALUE);
+            }
+
+            @Override
+            public void onNext(HttpObject o) {
+                if (o instanceof HttpData) {
+                    future.complete((HttpData) o);
+                }
+            }
+
+            @Override
+            public void onError(Throwable t) {}
+
+            @Override
+            public void onComplete() {}
+        };
+
         if (withPooledObjects) {
-            future = decoded.drainAll(WITH_POOLED_OBJECTS);
+            decoded.subscribe(subscriber, SubscriptionOption.WITH_POOLED_OBJECTS);
         } else {
-            future = decoded.drainAll();
+            decoded.subscribe(subscriber);
         }
-        return future.join().stream()
-                .filter(o -> o instanceof ByteBufHttpData)
-                .map(o -> ((ByteBufHttpData) o).content())
-                .findFirst()
-                .get();
+
+        return future.join();
     }
 }

@@ -34,7 +34,6 @@ import java.util.Set;
 import javax.annotation.Nullable;
 
 import com.google.common.collect.ImmutableSet;
-import com.google.common.collect.Iterables;
 import com.google.common.collect.Sets;
 
 import com.linecorp.armeria.common.SessionProtocol;
@@ -116,16 +115,6 @@ public final class ServerPort implements Comparable<ServerPort> {
     }
 
     /**
-     * Returns the {@link SessionProtocol} this {@link ServerPort} uses.
-     *
-     * @deprecated Use {@link #protocols()}.
-     */
-    @Deprecated
-    public SessionProtocol protocol() {
-        return Iterables.getFirst(protocols, null);
-    }
-
-    /**
      * Returns the {@link SessionProtocol}s this {@link ServerPort} uses.
      */
     public Set<SessionProtocol> protocols() {
@@ -185,7 +174,7 @@ public final class ServerPort implements Comparable<ServerPort> {
     }
 
     @Override
-    public boolean equals(Object obj) {
+    public boolean equals(@Nullable Object obj) {
         if (obj == this) {
             return true;
         }

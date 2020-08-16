@@ -18,13 +18,13 @@ package com.linecorp.armeria.server;
 
 import javax.annotation.Nullable;
 
-import com.linecorp.armeria.common.DefaultHttpRequest;
 import com.linecorp.armeria.common.HttpData;
 import com.linecorp.armeria.common.HttpHeaders;
 import com.linecorp.armeria.common.HttpObject;
 import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.RequestHeaders;
-import com.linecorp.armeria.internal.InboundTrafficController;
+import com.linecorp.armeria.internal.common.DefaultHttpRequest;
+import com.linecorp.armeria.internal.common.InboundTrafficController;
 
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.EventLoop;
@@ -94,7 +94,7 @@ final class DecodedHttpRequest extends DefaultHttpRequest {
     }
 
     @Override
-    protected EventLoop defaultSubscriberExecutor() {
+    public EventLoop defaultSubscriberExecutor() {
         return eventLoop;
     }
 
@@ -104,17 +104,18 @@ final class DecodedHttpRequest extends DefaultHttpRequest {
 
         final boolean published;
         if (obj instanceof HttpHeaders) { // HTTP trailers.
-            ctx.logBuilder().requestTrailers((HttpHeaders) obj);
             published = super.tryWrite(obj);
+            ctx.logBuilder().requestTrailers((HttpHeaders) obj);
             // Close this stream because HTTP trailers is the last element of the request.
             close();
         } else {
             final HttpData httpData = (HttpData) obj;
-            ctx.logBuilder().increaseRequestLength(httpData);
+            httpData.touch(ctx);
             published = super.tryWrite(httpData);
             if (published) {
                 inboundTrafficController.inc(httpData.length());
             }
+            ctx.logBuilder().increaseRequestLength(httpData);
         }
 
         return published;
@@ -130,7 +131,8 @@ final class DecodedHttpRequest extends DefaultHttpRequest {
 
     /**
      * Sets the specified {@link HttpResponse} which responds to this request. This is always called
-     * by the {@link HttpServerHandler} after the handler gets the {@link HttpResponse} from a {@link Service}.
+     * by the {@link HttpServerHandler} after the handler gets the {@link HttpResponse} from an
+     * {@link HttpService}.
      */
     void setResponse(HttpResponse response) {
         if (isResponseAborted) {
@@ -153,7 +155,7 @@ final class DecodedHttpRequest extends DefaultHttpRequest {
         // Try to close the request first, then abort the response if it is already closed.
         if (!tryClose(cause) &&
             response != null && !response.isComplete()) {
-            response.abort();
+            response.abort(cause);
         }
     }
 }

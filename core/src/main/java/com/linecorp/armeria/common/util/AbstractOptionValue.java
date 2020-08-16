@@ -20,21 +20,25 @@ import static java.util.Objects.requireNonNull;
 /**
  * A holder of a value of an {@link AbstractOption}.
  *
- * @param <O> the {@link AbstractOption} that this option value is created by
- * @param <V> the type of the value of the option {@code 'O'}
+ * @param <T> the type of the option value holder.
+ * @param <U> the type of the option.
+ * @param <V> the type of the option value.
  *
  * @see AbstractOption
  * @see AbstractOptions
  */
-public abstract class AbstractOptionValue<O extends AbstractOption<V>, V> {
+public abstract class AbstractOptionValue<
+        T extends AbstractOptionValue<T, U, V>,
+        U extends AbstractOption<U, T, V>,
+        V> {
 
-    private final O option;
+    private final U option;
     private final V value;
 
     /**
      * Creates a new instance with the specified {@code option} and {@code value}.
      */
-    protected AbstractOptionValue(O option, V value) {
+    protected AbstractOptionValue(U option, V value) {
         this.option = requireNonNull(option, "option");
         this.value = requireNonNull(value, "value");
     }
@@ -42,19 +46,19 @@ public abstract class AbstractOptionValue<O extends AbstractOption<V>, V> {
     /**
      * Returns the option that this option value holder belongs to.
      */
-    public O option() {
+    public final U option() {
         return option;
     }
 
     /**
      * Returns the value of this option value holder has.
      */
-    public V value() {
+    public final V value() {
         return value;
     }
 
     @Override
-    public String toString() {
+    public final String toString() {
         return option.toString() + '=' + value;
     }
 }

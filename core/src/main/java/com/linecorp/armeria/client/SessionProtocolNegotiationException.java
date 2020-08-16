@@ -18,10 +18,9 @@ package com.linecorp.armeria.client;
 
 import static java.util.Objects.requireNonNull;
 
-import java.util.Optional;
-
 import javax.annotation.Nullable;
 
+import com.linecorp.armeria.common.Flags;
 import com.linecorp.armeria.common.SessionProtocol;
 
 /**
@@ -65,13 +64,19 @@ public final class SessionProtocolNegotiationException extends RuntimeException 
 
     /**
      * Returns the actual {@link SessionProtocol}.
+     *
+     * @return the actual {@link SessionProtocol}, or {@code null} if failed to determine the protocol.
      */
-    public Optional<SessionProtocol> actual() {
-        return Optional.ofNullable(actual);
+    @Nullable
+    public SessionProtocol actual() {
+        return actual;
     }
 
     @Override
     public Throwable fillInStackTrace() {
+        if (Flags.verboseExceptionSampler().isSampled(getClass())) {
+            return super.fillInStackTrace();
+        }
         return this;
     }
 }

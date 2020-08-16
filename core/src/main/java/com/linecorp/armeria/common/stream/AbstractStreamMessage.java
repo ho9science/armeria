@@ -19,55 +19,35 @@ package com.linecorp.armeria.common.stream;
 import static com.linecorp.armeria.common.stream.StreamMessageUtil.abortedOrLate;
 import static com.linecorp.armeria.common.stream.StreamMessageUtil.containsNotifyCancellation;
 import static com.linecorp.armeria.common.stream.StreamMessageUtil.containsWithPooledObjects;
+import static com.linecorp.armeria.common.util.Exceptions.throwIfFatal;
 import static java.util.Objects.requireNonNull;
 
-import java.util.List;
-import java.util.Queue;
 import java.util.concurrent.CompletableFuture;
 
 import javax.annotation.Nullable;
 
 import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import com.google.common.base.MoreObjects;
-import com.spotify.futures.CompletableFutures;
 
-import com.linecorp.armeria.common.CommonPools;
-import com.linecorp.armeria.common.RequestContext;
-import com.linecorp.armeria.internal.PooledObjects;
+import com.linecorp.armeria.common.util.CompositeException;
+import com.linecorp.armeria.common.util.EventLoopCheckingFuture;
+import com.linecorp.armeria.unsafe.PooledObjects;
 
-import io.netty.util.ReferenceCountUtil;
 import io.netty.util.concurrent.EventExecutor;
 
 abstract class AbstractStreamMessage<T> implements StreamMessage<T> {
+
+    static final Logger logger = LoggerFactory.getLogger(AbstractStreamMessage.class);
 
     static final CloseEvent SUCCESSFUL_CLOSE = new CloseEvent(null);
     static final CloseEvent CANCELLED_CLOSE = new CloseEvent(CancelledSubscriptionException.INSTANCE);
     static final CloseEvent ABORTED_CLOSE = new CloseEvent(AbortedStreamException.INSTANCE);
 
-    private final CompletableFuture<Void> completionFuture = new CompletableFuture<>();
-
-    @Override
-    public final void subscribe(Subscriber<? super T> subscriber) {
-        subscribe(subscriber, defaultSubscriberExecutor());
-    }
-
-    @Override
-    public final void subscribe(Subscriber<? super T> subscriber, boolean withPooledObjects) {
-        subscribe(subscriber, defaultSubscriberExecutor(), withPooledObjects, false);
-    }
-
-    @Override
-    public final void subscribe(Subscriber<? super T> subscriber, SubscriptionOption... options) {
-        subscribe(subscriber, defaultSubscriberExecutor(), options);
-    }
-
-    @Override
-    public final void subscribe(Subscriber<? super T> subscriber, EventExecutor executor,
-                                boolean withPooledObjects) {
-        subscribe(subscriber, executor, withPooledObjects, false);
-    }
+    private final CompletableFuture<Void> completionFuture = new EventLoopCheckingFuture<>();
 
     @Override
     public final void subscribe(Subscriber<? super T> subscriber, EventExecutor executor) {
@@ -106,62 +86,8 @@ abstract class AbstractStreamMessage<T> implements StreamMessage<T> {
      */
     abstract SubscriptionImpl subscribe(SubscriptionImpl subscription);
 
-    /**
-     * Returns the default {@link EventExecutor} which will be used when a user subscribes using
-     * {@link #subscribe(Subscriber)} or {@link #subscribe(Subscriber, SubscriptionOption...)}.
-     */
-    protected EventExecutor defaultSubscriberExecutor() {
-        return RequestContext.mapCurrent(RequestContext::eventLoop, () -> CommonPools.workerGroup().next());
-    }
-
     @Override
-    public final CompletableFuture<List<T>> drainAll() {
-        return drainAll(defaultSubscriberExecutor());
-    }
-
-    @Override
-    public final CompletableFuture<List<T>> drainAll(boolean withPooledObjects) {
-        return drainAll(defaultSubscriberExecutor(), withPooledObjects);
-    }
-
-    @Override
-    public final CompletableFuture<List<T>> drainAll(SubscriptionOption... options) {
-        return drainAll(defaultSubscriberExecutor(), options);
-    }
-
-    // TODO(minwoox) Make this method private after the deprecated overriden method is removed.
-    @Override
-    public final CompletableFuture<List<T>> drainAll(EventExecutor executor, boolean withPooledObjects) {
-        requireNonNull(executor, "executor");
-        final StreamMessageDrainer<T> drainer = new StreamMessageDrainer<>(withPooledObjects);
-        final SubscriptionImpl subscription = new SubscriptionImpl(this, drainer, executor,
-                                                                   withPooledObjects, false);
-        final SubscriptionImpl actualSubscription = subscribe(subscription);
-
-        if (actualSubscription != subscription) {
-            // Failed to subscribe.
-            return CompletableFutures.exceptionallyCompletedFuture(
-                    abortedOrLate(actualSubscription.subscriber()));
-        }
-
-        return drainer.future();
-    }
-
-    @Override
-    public final CompletableFuture<List<T>> drainAll(EventExecutor executor) {
-        return drainAll(executor, false);
-    }
-
-    @Override
-    public final CompletableFuture<List<T>> drainAll(EventExecutor executor, SubscriptionOption... options) {
-        requireNonNull(options, "options");
-
-        final boolean withPooledObjects = containsWithPooledObjects(options);
-        return drainAll(executor, withPooledObjects);
-    }
-
-    @Override
-    public final CompletableFuture<Void> completionFuture() {
+    public final CompletableFuture<Void> whenComplete() {
         return completionFuture;
     }
 
@@ -181,12 +107,6 @@ abstract class AbstractStreamMessage<T> implements StreamMessage<T> {
     abstract void cancel();
 
     /**
-     * Callback invoked to notify a {@link Subscriber} of a {@link CloseEvent}. The
-     * {@link AbstractStreamMessage} needs to ensure the notification happens on the correct thread.
-     */
-    abstract void notifySubscriberOfCloseEvent(SubscriptionImpl subscription, CloseEvent event);
-
-    /**
      * Invoked after an element is removed from the {@link StreamMessage} and before
      * {@link Subscriber#onNext(Object)} is invoked.
      *
@@ -199,52 +119,45 @@ abstract class AbstractStreamMessage<T> implements StreamMessage<T> {
         final Throwable cause = abortedOrLate(oldSubscriber);
 
         if (subscription.needsDirectInvocation()) {
-            lateSubscriber.onSubscribe(NoopSubscription.INSTANCE);
-            lateSubscriber.onError(cause);
+            handleLateSubscriber(lateSubscriber, cause);
         } else {
             subscription.executor().execute(() -> {
-                lateSubscriber.onSubscribe(NoopSubscription.INSTANCE);
-                lateSubscriber.onError(cause);
+                handleLateSubscriber(lateSubscriber, cause);
             });
         }
     }
 
-    T prepareObjectForNotification(SubscriptionImpl subscription, T o) {
-        ReferenceCountUtil.touch(o);
+    private static void handleLateSubscriber(Subscriber<?> lateSubscriber, Throwable cause) {
+        try {
+            lateSubscriber.onSubscribe(NoopSubscription.INSTANCE);
+            lateSubscriber.onError(cause);
+        } catch (Throwable t) {
+            throwIfFatal(t);
+            logger.warn("Subscriber should not throw an exception. subscriber: {}", lateSubscriber, t);
+        }
+    }
+
+    final T prepareObjectForNotification(SubscriptionImpl subscription, T o) {
         onRemoval(o);
         if (!subscription.withPooledObjects()) {
-            o = PooledObjects.toUnpooled(o);
+            o = PooledObjects.copyAndClose(o);
+        } else {
+            PooledObjects.touch(o);
         }
         return o;
     }
 
     /**
-     * Helper method for the common case of cleaning up all elements in a queue when shutting down the stream.
+     * Returns newly created {@link CloseEvent} if the specified {@link Throwable} is not an instance of
+     * {@link CancelledSubscriptionException#INSTANCE} or {@link AbortedStreamException#INSTANCE}.
      */
-    void cleanupQueue(SubscriptionImpl subscription, Queue<Object> queue) {
-        final Throwable cause = ClosedPublisherException.get();
-        for (;;) {
-            final Object e = queue.poll();
-            if (e == null) {
-                break;
-            }
-
-            try {
-                if (e instanceof CloseEvent) {
-                    notifySubscriberOfCloseEvent(subscription, (CloseEvent) e);
-                    continue;
-                }
-
-                if (e instanceof CompletableFuture) {
-                    ((CompletableFuture<?>) e).completeExceptionally(cause);
-                }
-
-                @SuppressWarnings("unchecked")
-                final T obj = (T) e;
-                onRemoval(obj);
-            } finally {
-                ReferenceCountUtil.safeRelease(e);
-            }
+    static CloseEvent newCloseEvent(Throwable cause) {
+        if (cause == CancelledSubscriptionException.INSTANCE) {
+            return CANCELLED_CLOSE;
+        } else if (cause == AbortedStreamException.INSTANCE) {
+            return ABORTED_CLOSE;
+        } else {
+            return new CloseEvent(cause);
         }
     }
 
@@ -301,7 +214,8 @@ abstract class AbstractStreamMessage<T> implements StreamMessage<T> {
         @Override
         public void request(long n) {
             if (n <= 0) {
-                invokeOnError(new IllegalArgumentException(
+                // Just abort the publisher so subscriber().onError(e) is called and resources are cleaned up.
+                publisher.abort(new IllegalArgumentException(
                         "n: " + n + " (expected: > 0, see Reactive Streams specification rule 3.9)"));
                 return;
             }
@@ -313,14 +227,6 @@ abstract class AbstractStreamMessage<T> implements StreamMessage<T> {
         public void cancel() {
             cancelRequested = true;
             publisher.cancel();
-        }
-
-        private void invokeOnError(Throwable cause) {
-            if (needsDirectInvocation()) {
-                subscriber.onError(cause);
-            } else {
-                executor.execute(() -> subscriber.onError(cause));
-            }
         }
 
         // We directly run callbacks for event loops if we're already on the loop, which applies to the vast
@@ -340,7 +246,7 @@ abstract class AbstractStreamMessage<T> implements StreamMessage<T> {
 
     static final class CloseEvent {
         @Nullable
-        private final Throwable cause;
+        final Throwable cause;
 
         CloseEvent(@Nullable Throwable cause) {
             this.cause = cause;
@@ -361,16 +267,25 @@ abstract class AbstractStreamMessage<T> implements StreamMessage<T> {
             if (cause == null) {
                 try {
                     subscriber.onComplete();
-                } finally {
                     completionFuture.complete(null);
+                } catch (Throwable t) {
+                    completionFuture.completeExceptionally(t);
+                    throwIfFatal(t);
+                    logger.warn("Subscriber.onComplete() should not raise an exception. subscriber: {}",
+                                subscriber, t);
                 }
             } else {
                 try {
                     if (subscription.notifyCancellation || !(cause instanceof CancelledSubscriptionException)) {
                         subscriber.onError(cause);
                     }
-                } finally {
                     completionFuture.completeExceptionally(cause);
+                } catch (Throwable t) {
+                    final Exception composite = new CompositeException(t, cause);
+                    completionFuture.completeExceptionally(composite);
+                    throwIfFatal(t);
+                    logger.warn("Subscriber.onError() should not raise an exception. subscriber: {}",
+                                subscriber, composite);
                 }
             }
         }

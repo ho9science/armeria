@@ -16,13 +16,17 @@
 
 package com.linecorp.armeria.common.stream;
 
+import static com.linecorp.armeria.common.util.Exceptions.throwIfFatal;
+
 import javax.annotation.Nullable;
 
-import io.netty.util.ReferenceCountUtil;
+import com.linecorp.armeria.common.annotation.UnstableApi;
+import com.linecorp.armeria.unsafe.PooledObjects;
 
 /**
  * A {@link FixedStreamMessage} that publishes two objects.
  */
+@UnstableApi
 public class TwoElementFixedStreamMessage<T> extends FixedStreamMessage<T> {
 
     @Nullable
@@ -46,7 +50,7 @@ public class TwoElementFixedStreamMessage<T> extends FixedStreamMessage<T> {
             try {
                 onRemoval(obj1);
             } finally {
-                ReferenceCountUtil.safeRelease(obj1);
+                PooledObjects.close(obj1);
             }
             obj1 = null;
         }
@@ -54,7 +58,7 @@ public class TwoElementFixedStreamMessage<T> extends FixedStreamMessage<T> {
             try {
                 onRemoval(obj2);
             } finally {
-                ReferenceCountUtil.safeRelease(obj2);
+                PooledObjects.close(obj2);
             }
             obj2 = null;
         }
@@ -116,6 +120,12 @@ public class TwoElementFixedStreamMessage<T> extends FixedStreamMessage<T> {
         inOnNext = true;
         try {
             subscription.subscriber().onNext(published);
+        } catch (Throwable t) {
+            // Just abort this stream so subscriber().onError(e) is called and resources are cleaned up.
+            abort(t);
+            throwIfFatal(t);
+            logger.warn("Subscriber.onNext({}) should not raise an exception. subscriber: {}",
+                        obj, subscription.subscriber(), t);
         } finally {
             inOnNext = false;
         }

@@ -18,18 +18,20 @@ package com.linecorp.armeria.server.file;
 import static java.util.Objects.requireNonNull;
 
 import java.time.Clock;
+import java.util.concurrent.Executor;
 
 import javax.annotation.Nullable;
 
 import com.linecorp.armeria.common.HttpHeaders;
-import com.linecorp.armeria.internal.RouteUtil;
+import com.linecorp.armeria.internal.server.RouteUtil;
 
-final class ClassPathHttpVfs extends AbstractHttpVfs {
+final class ClassPathHttpVfs extends AbstractBlockingHttpVfs {
 
     private final ClassLoader classLoader;
     private final String rootDir;
 
     ClassPathHttpVfs(ClassLoader classLoader, String rootDir) {
+        super(false);
         this.classLoader = requireNonNull(classLoader, "classLoader");
         this.rootDir = normalizeRootDir(rootDir);
     }
@@ -48,11 +50,13 @@ final class ClassPathHttpVfs extends AbstractHttpVfs {
     }
 
     @Override
-    public HttpFile get(String path, Clock clock, @Nullable String contentEncoding,
-                        HttpHeaders additionalHeaders) {
+    protected HttpFile blockingGet(
+            Executor fileReadExecutor, String path, Clock clock,
+            @Nullable String contentEncoding, HttpHeaders additionalHeaders) {
+
         RouteUtil.ensureAbsolutePath(path, "path");
         final String resourcePath = rootDir.isEmpty() ? path.substring(1) : rootDir + path;
-        final HttpFileBuilder builder = HttpFileBuilder.ofResource(classLoader, resourcePath);
+        final HttpFileBuilder builder = HttpFile.builder(classLoader, resourcePath);
         return FileSystemHttpVfs.build(builder, clock, path, contentEncoding, additionalHeaders);
     }
 

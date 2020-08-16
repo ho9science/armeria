@@ -18,10 +18,10 @@ package com.linecorp.armeria.client;
 
 import javax.annotation.Nullable;
 
-import com.linecorp.armeria.common.DefaultHttpResponse;
 import com.linecorp.armeria.common.HttpData;
 import com.linecorp.armeria.common.HttpObject;
-import com.linecorp.armeria.internal.InboundTrafficController;
+import com.linecorp.armeria.internal.common.DefaultHttpResponse;
+import com.linecorp.armeria.internal.common.InboundTrafficController;
 
 import io.netty.channel.EventLoop;
 import io.netty.util.concurrent.EventExecutor;
@@ -46,7 +46,7 @@ final class DecodedHttpResponse extends DefaultHttpResponse {
     }
 
     @Override
-    protected EventExecutor defaultSubscriberExecutor() {
+    public EventExecutor defaultSubscriberExecutor() {
         return eventLoop;
     }
 

@@ -3,9 +3,9 @@ package example.armeria.server.annotated;
 import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.HttpStatus;
-import com.linecorp.armeria.common.RequestContext;
 import com.linecorp.armeria.common.logging.LogLevel;
 import com.linecorp.armeria.server.HttpStatusException;
+import com.linecorp.armeria.server.ServiceRequestContext;
 import com.linecorp.armeria.server.annotation.ExceptionHandler;
 import com.linecorp.armeria.server.annotation.ExceptionHandlerFunction;
 import com.linecorp.armeria.server.annotation.Get;
@@ -17,7 +17,7 @@ import example.armeria.server.annotated.ExceptionHandlerService.GlobalExceptionH
 /**
  * Examples how to use {@link ExceptionHandler}.
  *
- * @see <a href="https://line.github.io/armeria/server-annotated-service.html#handling-exceptions">
+ * @see <a href="https://armeria.dev/docs/server-annotated-service#handling-exceptions">
  *      Handling exceptions</a>
  */
 @LoggingDecorator(
@@ -87,7 +87,7 @@ public class ExceptionHandlerService {
 
     static final class GlobalExceptionHandler implements ExceptionHandlerFunction {
         @Override
-        public HttpResponse handleException(RequestContext ctx, HttpRequest req, Throwable cause) {
+        public HttpResponse handleException(ServiceRequestContext ctx, HttpRequest req, Throwable cause) {
             if (cause instanceof GloballyGeneralException) {
                 return HttpResponse.of(HttpStatus.FORBIDDEN);
             }
@@ -98,7 +98,7 @@ public class ExceptionHandlerService {
 
     static final class LocalExceptionHandler implements ExceptionHandlerFunction {
         @Override
-        public HttpResponse handleException(RequestContext ctx, HttpRequest req, Throwable cause) {
+        public HttpResponse handleException(ServiceRequestContext ctx, HttpRequest req, Throwable cause) {
             if (cause instanceof LocallySpecificException) {
                 return HttpResponse.of(HttpStatus.SERVICE_UNAVAILABLE);
             }

@@ -27,20 +27,15 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import com.google.common.base.MoreObjects;
 import com.google.common.collect.ImmutableList;
 
+import com.linecorp.armeria.common.annotation.UnstableApi;
+
 /**
  * Metadata about a field of a struct or an exception.
  *
  * @see FieldInfoBuilder
  */
+@UnstableApi
 public final class FieldInfo {
-
-    private final String name;
-    private final FieldLocation location;
-    private final FieldRequirement requirement;
-    private final TypeSignature typeSignature;
-    private final List<FieldInfo> childFieldInfos;
-    @Nullable
-    private final String docString;
 
     /**
      * Creates a new {@link FieldInfo} with the specified {@code name} and {@link TypeSignature}.
@@ -51,6 +46,38 @@ public final class FieldInfo {
         return new FieldInfo(name, FieldLocation.UNSPECIFIED, FieldRequirement.UNSPECIFIED, typeSignature,
                              ImmutableList.of(), null);
     }
+
+    /**
+     * Returns a newly created {@link FieldInfoBuilder}.
+     */
+    public static FieldInfoBuilder builder(String name, TypeSignature typeSignature) {
+        return new FieldInfoBuilder(name, typeSignature);
+    }
+
+    /**
+     * Returns a newly created {@link FieldInfoBuilder}.
+     */
+    public static FieldInfoBuilder builder(String name, TypeSignature typeSignature,
+                                           FieldInfo... childFieldInfos) {
+        return new FieldInfoBuilder(name, typeSignature, childFieldInfos);
+    }
+
+    /**
+     * Returns a newly created {@link FieldInfoBuilder}.
+     */
+    public static FieldInfoBuilder builder(String name, TypeSignature typeSignature,
+                                           Iterable<FieldInfo> childFieldInfos) {
+        return new FieldInfoBuilder(name, typeSignature, childFieldInfos);
+    }
+
+    private final String name;
+    private final FieldLocation location;
+    private final FieldRequirement requirement;
+    private final TypeSignature typeSignature;
+    private final List<FieldInfo> childFieldInfos;
+
+    @Nullable
+    private final String docString;
 
     /**
      * Creates a new instance.
@@ -116,7 +143,7 @@ public final class FieldInfo {
     }
 
     @Override
-    public boolean equals(Object o) {
+    public boolean equals(@Nullable Object o) {
         if (this == o) {
             return true;
         }

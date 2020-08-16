@@ -7,22 +7,21 @@ import java.util.stream.Collectors;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
+import com.linecorp.armeria.common.Cookie;
+import com.linecorp.armeria.common.Cookies;
 import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.MediaType;
 import com.linecorp.armeria.common.logging.LogLevel;
-import com.linecorp.armeria.server.annotation.Cookies;
 import com.linecorp.armeria.server.annotation.Get;
 import com.linecorp.armeria.server.annotation.Header;
 import com.linecorp.armeria.server.annotation.Param;
 import com.linecorp.armeria.server.annotation.decorator.LoggingDecorator;
 
-import io.netty.handler.codec.http.cookie.Cookie;
-
 /**
  * Examples how to use {@link Param}, {@link Header} and {@link Cookies}.
  *
- * @see <a href="https://line.github.io/armeria/server-annotated-service.html#parameter-injection">
+ * @see <a href="https://armeria.dev/docs/server-annotated-service#parameter-injection">
  *      Parameter injection</a>
  */
 @LoggingDecorator(

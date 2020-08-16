@@ -29,23 +29,22 @@ import org.slf4j.LoggerFactory;
 import com.linecorp.armeria.common.HttpData;
 import com.linecorp.armeria.common.HttpHeaders;
 import com.linecorp.armeria.common.HttpObject;
-import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.HttpStatus;
-import com.linecorp.armeria.common.HttpStatusClass;
 import com.linecorp.armeria.common.RequestHeaders;
 import com.linecorp.armeria.common.ResponseHeaders;
-import com.linecorp.armeria.common.logging.RequestLogBuilder;
+import com.linecorp.armeria.common.logging.RequestLogProperty;
 import com.linecorp.armeria.common.stream.CancelledSubscriptionException;
 import com.linecorp.armeria.common.stream.StreamWriter;
 import com.linecorp.armeria.common.util.Exceptions;
-import com.linecorp.armeria.internal.InboundTrafficController;
+import com.linecorp.armeria.internal.common.InboundTrafficController;
+import com.linecorp.armeria.internal.common.TimeoutScheduler;
+import com.linecorp.armeria.internal.common.TimeoutScheduler.TimeoutTask;
+import com.linecorp.armeria.unsafe.PooledObjects;
 
 import io.netty.channel.Channel;
 import io.netty.channel.EventLoop;
-import io.netty.util.ReferenceCountUtil;
 import io.netty.util.collection.IntObjectHashMap;
 import io.netty.util.collection.IntObjectMap;
-import io.netty.util.concurrent.ScheduledFuture;
 
 abstract class HttpResponseDecoder {
 
@@ -54,6 +53,7 @@ abstract class HttpResponseDecoder {
     private final IntObjectMap<HttpResponseWrapper> responses = new IntObjectHashMap<>();
     private final Channel channel;
     private final InboundTrafficController inboundTrafficController;
+    private int unfinishedResponses;
     private boolean disconnectWhenFinished;
 
     HttpResponseDecoder(Channel channel, InboundTrafficController inboundTrafficController) {
@@ -70,11 +70,11 @@ abstract class HttpResponseDecoder {
     }
 
     HttpResponseWrapper addResponse(
-            int id, @Nullable HttpRequest req, DecodedHttpResponse res, RequestLogBuilder logBuilder,
-            long responseTimeoutMillis, long maxContentLength) {
+            int id, DecodedHttpResponse res, @Nullable ClientRequestContext ctx,
+            EventLoop eventLoop, long responseTimeoutMillis, long maxContentLength) {
 
         final HttpResponseWrapper newRes =
-                new HttpResponseWrapper(req, res, logBuilder, responseTimeoutMillis, maxContentLength);
+                new HttpResponseWrapper(res, ctx, responseTimeoutMillis, maxContentLength);
         final HttpResponseWrapper oldRes = responses.put(id, newRes);
 
         assert oldRes == null : "addResponse(" + id + ", " + res + ", " + responseTimeoutMillis + "): " +
@@ -95,15 +95,25 @@ abstract class HttpResponseDecoder {
 
     @Nullable
     final HttpResponseWrapper removeResponse(int id) {
-        return responses.remove(id);
-    }
-
-    final int unfinishedResponses() {
-        return responses.size();
+        final HttpResponseWrapper removed = responses.remove(id);
+        if (removed != null) {
+            unfinishedResponses--;
+            assert unfinishedResponses >= 0 : unfinishedResponses;
+        }
+        return removed;
     }
 
     final boolean hasUnfinishedResponses() {
-        return !responses.isEmpty();
+        return unfinishedResponses != 0;
+    }
+
+    final boolean reserveUnfinishedResponse(int maxUnfinishedResponses) {
+        if (unfinishedResponses >= maxUnfinishedResponses) {
+            return false;
+        }
+
+        unfinishedResponses++;
+        return true;
     }
 
     final void failUnfinishedResponses(Throwable cause) {
@@ -112,6 +122,7 @@ abstract class HttpResponseDecoder {
                 res.close(cause);
             }
         } finally {
+            unfinishedResponses -= responses.size();
             responses.clear();
         }
     }
@@ -128,7 +139,7 @@ abstract class HttpResponseDecoder {
         return disconnectWhenFinished;
     }
 
-    static final class HttpResponseWrapper implements StreamWriter<HttpObject>, Runnable {
+    static final class HttpResponseWrapper implements StreamWriter<HttpObject> {
 
         enum State {
             WAIT_NON_INFORMATIONAL,
@@ -136,53 +147,27 @@ abstract class HttpResponseDecoder {
             DONE
         }
 
-        @Nullable
-        private final HttpRequest request;
         private final DecodedHttpResponse delegate;
-        private final RequestLogBuilder logBuilder;
-        private final long responseTimeoutMillis;
-        private final long maxContentLength;
         @Nullable
-        private ScheduledFuture<?> responseTimeoutFuture;
+        private final ClientRequestContext ctx;
+
+        private final long maxContentLength;
+        private final long responseTimeoutMillis;
 
         private boolean loggedResponseFirstBytesTransferred;
 
         private State state = State.WAIT_NON_INFORMATIONAL;
 
-        HttpResponseWrapper(@Nullable HttpRequest request, DecodedHttpResponse delegate,
-                            RequestLogBuilder logBuilder, long responseTimeoutMillis, long maxContentLength) {
-            this.request = request;
+        HttpResponseWrapper(DecodedHttpResponse delegate, @Nullable ClientRequestContext ctx,
+                            long responseTimeoutMillis, long maxContentLength) {
             this.delegate = delegate;
-            this.logBuilder = logBuilder;
-            this.responseTimeoutMillis = responseTimeoutMillis;
+            this.ctx = ctx;
             this.maxContentLength = maxContentLength;
+            this.responseTimeoutMillis = responseTimeoutMillis;
         }
 
-        CompletableFuture<Void> completionFuture() {
-            return delegate.completionFuture();
-        }
-
-        void scheduleTimeout(EventLoop eventLoop) {
-            if (responseTimeoutFuture != null || responseTimeoutMillis <= 0 || !isOpen()) {
-                // No need to schedule a response timeout if:
-                // - the timeout has been scheduled already,
-                // - the timeout has been disabled or
-                // - the response stream has been closed already.
-                return;
-            }
-
-            responseTimeoutFuture = eventLoop.schedule(
-                    this, responseTimeoutMillis, TimeUnit.MILLISECONDS);
-        }
-
-        boolean cancelTimeout() {
-            final ScheduledFuture<?> responseTimeoutFuture = this.responseTimeoutFuture;
-            if (responseTimeoutFuture == null) {
-                return true;
-            }
-
-            this.responseTimeoutFuture = null;
-            return responseTimeoutFuture.cancel(false);
+        CompletableFuture<Void> whenComplete() {
+            return delegate.whenComplete();
         }
 
         long maxContentLength() {
@@ -195,19 +180,10 @@ abstract class HttpResponseDecoder {
 
         void logResponseFirstBytesTransferred() {
             if (!loggedResponseFirstBytesTransferred) {
-                logBuilder.responseFirstBytesTransferred();
+                if (ctx != null) {
+                    ctx.logBuilder().responseFirstBytesTransferred();
+                }
                 loggedResponseFirstBytesTransferred = true;
-            }
-        }
-
-        @Override
-        public void run() {
-            final ResponseTimeoutException cause = ResponseTimeoutException.get();
-            delegate.close(cause);
-            logBuilder.endResponse(cause);
-
-            if (request != null) {
-                request.abort();
             }
         }
 
@@ -225,35 +201,20 @@ abstract class HttpResponseDecoder {
          */
         @Override
         public boolean tryWrite(HttpObject o) {
+            boolean wrote = false;
             switch (state) {
                 case WAIT_NON_INFORMATIONAL:
-                    // NB: It's safe to call logBuilder.startResponse() multiple times.
-                    logBuilder.startResponse();
-
-                    assert o instanceof HttpHeaders && !(o instanceof RequestHeaders) : o;
-
-                    if (o instanceof ResponseHeaders) {
-                        final ResponseHeaders headers = (ResponseHeaders) o;
-                        final HttpStatus status = headers.status();
-                        if (status.codeClass() != HttpStatusClass.INFORMATIONAL) {
-                            state = State.WAIT_DATA_OR_TRAILERS;
-                            logBuilder.responseHeaders(headers);
-                        }
-                    }
+                    wrote = handleWaitNonInformational(o);
                     break;
                 case WAIT_DATA_OR_TRAILERS:
-                    if (o instanceof HttpHeaders) {
-                        state = State.DONE;
-                        logBuilder.responseTrailers((HttpHeaders) o);
-                    } else {
-                        logBuilder.increaseResponseLength((HttpData) o);
-                    }
+                    wrote = handleWaitDataOrTrailers(o);
                     break;
                 case DONE:
-                    ReferenceCountUtil.safeRelease(o);
-                    return false;
+                    PooledObjects.close(o);
+                    break;
             }
-            return delegate.tryWrite(o);
+
+            return wrote;
         }
 
         @Override
@@ -261,9 +222,58 @@ abstract class HttpResponseDecoder {
             return delegate.tryWrite(o);
         }
 
+        private boolean handleWaitNonInformational(HttpObject o) {
+            // NB: It's safe to call logBuilder.startResponse() multiple times.
+            if (ctx != null) {
+                ctx.logBuilder().startResponse();
+            }
+
+            assert o instanceof HttpHeaders && !(o instanceof RequestHeaders) : o;
+
+            if (o instanceof ResponseHeaders) {
+                final ResponseHeaders headers = (ResponseHeaders) o;
+                final HttpStatus status = headers.status();
+                if (!status.isInformational()) {
+                    state = State.WAIT_DATA_OR_TRAILERS;
+                    if (ctx != null) {
+                        ctx.logBuilder().defer(RequestLogProperty.RESPONSE_HEADERS);
+                        try {
+                            return delegate.tryWrite(headers);
+                        } finally {
+                            ctx.logBuilder().responseHeaders(headers);
+                        }
+                    }
+                }
+            }
+
+            return delegate.tryWrite(o);
+        }
+
+        private boolean handleWaitDataOrTrailers(HttpObject o) {
+            if (o instanceof HttpHeaders) {
+                state = State.DONE;
+                if (ctx != null) {
+                    ctx.logBuilder().defer(RequestLogProperty.RESPONSE_TRAILERS);
+                    try {
+                        return delegate.tryWrite(o);
+                    } finally {
+                        ctx.logBuilder().responseTrailers((HttpHeaders) o);
+                    }
+                }
+            } else {
+                final HttpData data = (HttpData) o;
+                data.touch(ctx);
+                if (ctx != null) {
+                    ctx.logBuilder().increaseResponseLength(data);
+                }
+            }
+
+            return delegate.tryWrite(o);
+        }
+
         @Override
-        public CompletableFuture<Void> onDemand(Runnable task) {
-            return delegate.onDemand(task);
+        public CompletableFuture<Void> whenConsumed() {
+            return delegate.whenConsumed();
         }
 
         void onSubscriptionCancelled(@Nullable Throwable cause) {
@@ -281,37 +291,114 @@ abstract class HttpResponseDecoder {
         }
 
         private void close(@Nullable Throwable cause,
-                           Consumer<Throwable> actionOnTimeoutCancelled) {
+                           Consumer<Throwable> actionOnNotTimedOut) {
             state = State.DONE;
-            if (cancelTimeout()) {
-                actionOnTimeoutCancelled.accept(cause);
-            } else {
-                if (cause != null && !Exceptions.isExpected(cause)) {
-                    logger.warn("Unexpected exception:", cause);
+
+            if (ctx != null) {
+                if (cause == null) {
+                    ctx.request().abort();
+                } else {
+                    ctx.request().abort(cause);
                 }
             }
 
-            if (request != null) {
-                request.abort();
-            }
+            cancelTimeoutOrLog(cause, actionOnNotTimedOut);
         }
 
         private void closeAction(@Nullable Throwable cause) {
             if (cause != null) {
                 delegate.close(cause);
-                logBuilder.endResponse(cause);
+                if (ctx != null) {
+                    ctx.logBuilder().endResponse(cause);
+                }
             } else {
                 delegate.close();
-                logBuilder.endResponse();
+                if (ctx != null) {
+                    ctx.logBuilder().endResponse();
+                }
             }
         }
 
         private void cancelAction(@Nullable Throwable cause) {
             if (cause != null && !(cause instanceof CancelledSubscriptionException)) {
-                logBuilder.endResponse(cause);
+                if (ctx != null) {
+                    ctx.logBuilder().endResponse(cause);
+                }
             } else {
-                logBuilder.endResponse();
+                if (ctx != null) {
+                    ctx.logBuilder().endResponse();
+                }
             }
+        }
+
+        private void cancelTimeoutOrLog(@Nullable Throwable cause,
+                                        Consumer<Throwable> actionOnNotTimedOut) {
+
+            TimeoutScheduler responseTimeoutScheduler = null;
+            if (ctx instanceof DefaultClientRequestContext) {
+                responseTimeoutScheduler = ((DefaultClientRequestContext) ctx).responseTimeoutScheduler();
+            }
+
+            if (responseTimeoutScheduler == null || !responseTimeoutScheduler.isTimedOut()) {
+                if (responseTimeoutScheduler != null) {
+                    responseTimeoutScheduler.clearTimeout(false);
+                }
+                // There's no timeout or the response has not been timed out.
+                actionOnNotTimedOut.accept(cause);
+                return;
+            }
+
+            if (delegate.isOpen()) {
+                closeAction(cause);
+            }
+
+            // Response has been timed out already.
+            // Log only when it's not a ResponseTimeoutException.
+            if (cause instanceof ResponseTimeoutException) {
+                return;
+            }
+
+            if (cause == null || !logger.isWarnEnabled() || Exceptions.isExpected(cause)) {
+                return;
+            }
+
+            final StringBuilder logMsg = new StringBuilder("Unexpected exception while closing a request");
+            if (ctx != null) {
+                final String authority = ctx.request().authority();
+                if (authority != null) {
+                    logMsg.append(" to ").append(authority);
+                }
+            }
+
+            logger.warn(logMsg.append(':').toString(), cause);
+        }
+
+        void initTimeout() {
+            if (ctx instanceof DefaultClientRequestContext) {
+                final TimeoutScheduler responseTimeoutScheduler =
+                        ((DefaultClientRequestContext) ctx).responseTimeoutScheduler();
+                responseTimeoutScheduler.init(ctx.eventLoop(), newTimeoutTask(),
+                                      TimeUnit.MILLISECONDS.toNanos(responseTimeoutMillis));
+            }
+        }
+
+        private TimeoutTask newTimeoutTask() {
+            return new TimeoutTask() {
+                @Override
+                public boolean canSchedule() {
+                    return delegate.isOpen() && state != State.DONE;
+                }
+
+                @Override
+                public void run() {
+                    final ResponseTimeoutException cause = ResponseTimeoutException.get();
+                    delegate.close(cause);
+                    if (ctx != null) {
+                        ctx.request().abort(cause);
+                        ctx.logBuilder().endResponse(cause);
+                    }
+                }
+            };
         }
 
         @Override

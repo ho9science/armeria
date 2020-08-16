@@ -20,43 +20,41 @@ import static java.util.Objects.requireNonNull;
 
 import java.net.IDN;
 import java.net.InetSocketAddress;
+import java.time.Duration;
 
 import javax.annotation.Nullable;
 
 import com.google.common.base.Ascii;
 import com.google.common.collect.ImmutableList;
 
+import com.linecorp.armeria.client.Endpoint;
+import com.linecorp.armeria.client.endpoint.EndpointSelectionStrategy;
 import com.linecorp.armeria.client.retry.Backoff;
 import com.linecorp.armeria.common.CommonPools;
-import com.linecorp.armeria.internal.TransportType;
+import com.linecorp.armeria.internal.common.util.TransportType;
 
 import io.netty.channel.EventLoop;
+import io.netty.resolver.dns.DnsNameResolverBuilder;
 import io.netty.resolver.dns.DnsServerAddressStreamProvider;
 import io.netty.resolver.dns.DnsServerAddressStreamProviders;
 import io.netty.resolver.dns.DnsServerAddresses;
 
-abstract class DnsEndpointGroupBuilder<B extends DnsEndpointGroupBuilder<B>> {
+abstract class DnsEndpointGroupBuilder {
 
     private final String hostname;
     @Nullable
     private EventLoop eventLoop;
     private int minTtl = 1;
     private int maxTtl = Integer.MAX_VALUE;
+    private long queryTimeoutMillis = 5000; // 5 seconds
     private DnsServerAddressStreamProvider serverAddressStreamProvider =
             DnsServerAddressStreamProviders.platformDefault();
     private Backoff backoff = Backoff.exponential(1000, 32000).withJitter(0.2);
+    private EndpointSelectionStrategy selectionStrategy = EndpointSelectionStrategy.weightedRoundRobin();
 
     DnsEndpointGroupBuilder(String hostname) {
         this.hostname = Ascii.toLowerCase(IDN.toASCII(requireNonNull(hostname, "hostname"),
                                                       IDN.ALLOW_UNASSIGNED));
-    }
-
-    /**
-     * Returns {@code this}.
-     */
-    @SuppressWarnings("unchecked")
-    private B self() {
-        return (B) this;
     }
 
     final String hostname() {
@@ -74,13 +72,13 @@ abstract class DnsEndpointGroupBuilder<B extends DnsEndpointGroupBuilder<B>> {
     /**
      * Sets the {@link EventLoop} to use for sending DNS queries.
      */
-    public final B eventLoop(EventLoop eventLoop) {
+    public DnsEndpointGroupBuilder eventLoop(EventLoop eventLoop) {
         requireNonNull(eventLoop, "eventLoop");
         checkArgument(TransportType.isSupported(eventLoop),
                       "unsupported event loop type: %s", eventLoop);
 
         this.eventLoop = eventLoop;
-        return self();
+        return this;
     }
 
     final int minTtl() {
@@ -98,12 +96,40 @@ abstract class DnsEndpointGroupBuilder<B extends DnsEndpointGroupBuilder<B>> {
      * {@code minTtl} and {@code maxTtl} are {@code 1} and {@link Integer#MAX_VALUE}, which practically tells
      * to respect the server TTL.
      */
-    public final B ttl(int minTtl, int maxTtl) {
+    public DnsEndpointGroupBuilder ttl(int minTtl, int maxTtl) {
         checkArgument(minTtl > 0 && minTtl <= maxTtl,
                       "minTtl: %s, maxTtl: %s (expected: 1 <= minTtl <= maxTtl)", minTtl, maxTtl);
         this.minTtl = minTtl;
         this.maxTtl = maxTtl;
-        return self();
+        return this;
+    }
+
+    /**
+     * Sets the timeout of the DNS query performed by this endpoint group. {@code 0} disables the timeout.
+     *
+     * @see DnsNameResolverBuilder#queryTimeoutMillis(long)
+     */
+    public DnsEndpointGroupBuilder queryTimeout(Duration queryTimeout) {
+        requireNonNull(queryTimeout, "queryTimeout");
+        checkArgument(!queryTimeout.isNegative(), "queryTimeout: %s (expected: >= 0)",
+                      queryTimeout);
+        return queryTimeoutMillis(queryTimeout.toMillis());
+    }
+
+    /**
+     * Sets the timeout of the DNS query performed by this endpoint group in milliseconds.
+     * {@code 0} disables the timeout.
+     *
+     * @see DnsNameResolverBuilder#queryTimeoutMillis(long)
+     */
+    public DnsEndpointGroupBuilder queryTimeoutMillis(long queryTimeoutMillis) {
+        checkArgument(queryTimeoutMillis >= 0, "queryTimeoutMillis: %s (expected: >= 0)", queryTimeoutMillis);
+        this.queryTimeoutMillis = queryTimeoutMillis;
+        return this;
+    }
+
+    final long queryTimeoutMillis() {
+        return queryTimeoutMillis;
     }
 
     final DnsServerAddressStreamProvider serverAddressStreamProvider() {
@@ -113,18 +139,18 @@ abstract class DnsEndpointGroupBuilder<B extends DnsEndpointGroupBuilder<B>> {
     /**
      * Sets the DNS server addresses to send queries to. Operating system default is used by default.
      */
-    public final B serverAddresses(InetSocketAddress... serverAddresses) {
+    public DnsEndpointGroupBuilder serverAddresses(InetSocketAddress... serverAddresses) {
         return serverAddresses(ImmutableList.copyOf(requireNonNull(serverAddresses, "serverAddresses")));
     }
 
     /**
      * Sets the DNS server addresses to send queries to. Operating system default is used by default.
      */
-    public final B serverAddresses(Iterable<InetSocketAddress> serverAddresses) {
+    public DnsEndpointGroupBuilder serverAddresses(Iterable<InetSocketAddress> serverAddresses) {
         requireNonNull(serverAddresses, "serverAddresses");
         final DnsServerAddresses addrs = DnsServerAddresses.sequential(serverAddresses);
         serverAddressStreamProvider = hostname -> addrs.stream();
-        return self();
+        return this;
     }
 
     final Backoff backoff() {
@@ -136,8 +162,20 @@ abstract class DnsEndpointGroupBuilder<B extends DnsEndpointGroupBuilder<B>> {
      * server sent an error response. {@code Backoff.exponential(1000, 32000).withJitter(0.2)} is used by
      * default.
      */
-    public final B backoff(Backoff backoff) {
+    public DnsEndpointGroupBuilder backoff(Backoff backoff) {
         this.backoff = requireNonNull(backoff, "backoff");
-        return self();
+        return this;
+    }
+
+    /**
+     * Sets the {@link EndpointSelectionStrategy} that deteremines the enumeration order of {@link Endpoint}s.
+     */
+    public DnsEndpointGroupBuilder selectionStrategy(EndpointSelectionStrategy selectionStrategy) {
+        this.selectionStrategy = requireNonNull(selectionStrategy, "selectionStrategy");
+        return this;
+    }
+
+    final EndpointSelectionStrategy selectionStrategy() {
+        return selectionStrategy;
     }
 }

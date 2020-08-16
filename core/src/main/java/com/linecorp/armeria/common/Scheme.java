@@ -19,7 +19,6 @@ package com.linecorp.armeria.common;
 import static java.util.Objects.requireNonNull;
 
 import java.util.Map;
-import java.util.Optional;
 
 import javax.annotation.Nullable;
 
@@ -71,15 +70,20 @@ public final class Scheme implements Comparable<Scheme> {
      * Parses the specified {@link String} into a {@link Scheme}. This method will return the same
      * {@link Scheme} instance for equal values of {@code scheme}.
      *
-     * @return {@link Optional#empty()} if the specified {@link String} could not be parsed or
+     * @return {@code null} if the specified {@link String} could not be parsed or
      *         there is no such {@link Scheme} available
      */
-    public static Optional<Scheme> tryParse(@Nullable String scheme) {
+    @Nullable
+    public static Scheme tryParse(@Nullable String scheme) {
         if (scheme == null) {
-            return Optional.empty();
+            return null;
         }
-
-        return Optional.ofNullable(SCHEMES.get(Ascii.toLowerCase(scheme)));
+        final String lowercaseScheme = Ascii.toLowerCase(scheme);
+        final Scheme parsedScheme = SCHEMES.get(lowercaseScheme);
+        if (parsedScheme != null) {
+            return parsedScheme;
+        }
+        return SCHEMES.get(SerializationFormat.NONE.uriText() + '+' + lowercaseScheme);
     }
 
     /**
@@ -90,12 +94,11 @@ public final class Scheme implements Comparable<Scheme> {
      *                                  there is no such {@link Scheme} available
      */
     public static Scheme parse(String scheme) {
-        final Scheme res = SCHEMES.get(Ascii.toLowerCase(requireNonNull(scheme, "scheme")));
-        if (res == null) {
+        final Scheme parsedScheme = tryParse(requireNonNull(scheme, "scheme"));
+        if (parsedScheme == null) {
             throw new IllegalArgumentException("scheme: " + scheme);
         }
-
-        return res;
+        return parsedScheme;
     }
 
     /**
@@ -145,7 +148,7 @@ public final class Scheme implements Comparable<Scheme> {
     }
 
     @Override
-    public boolean equals(Object obj) {
+    public boolean equals(@Nullable Object obj) {
         return this == obj;
     }
 

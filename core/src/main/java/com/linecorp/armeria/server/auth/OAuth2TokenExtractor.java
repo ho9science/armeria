@@ -31,12 +31,13 @@ import com.google.common.base.Strings;
 
 import com.linecorp.armeria.common.HttpHeaderNames;
 import com.linecorp.armeria.common.RequestHeaders;
+import com.linecorp.armeria.common.auth.OAuth2Token;
 
 import io.netty.util.AsciiString;
 
 /**
  * Extracts {@link OAuth2Token} from {@link RequestHeaders}, in order to be used by
- * {@link HttpAuthServiceBuilder}.
+ * {@link AuthServiceBuilder}.
  */
 final class OAuth2TokenExtractor implements Function<RequestHeaders, OAuth2Token> {
 

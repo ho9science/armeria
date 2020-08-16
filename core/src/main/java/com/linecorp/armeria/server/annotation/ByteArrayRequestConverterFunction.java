@@ -16,25 +16,28 @@
 
 package com.linecorp.armeria.server.annotation;
 
+import java.lang.reflect.ParameterizedType;
+
+import javax.annotation.Nullable;
+
 import com.linecorp.armeria.common.AggregatedHttpRequest;
 import com.linecorp.armeria.common.HttpData;
 import com.linecorp.armeria.server.ServiceRequestContext;
 
 /**
- * A default implementation of a {@link RequestConverterFunction} which converts a binary body of
- * the {@link AggregatedHttpRequest} to one of {@code byte[]} or {@link HttpData}.
+ * A {@link RequestConverterFunction} which converts a binary body of the
+ * {@link AggregatedHttpRequest} to one of {@code byte[]} or {@link HttpData} depending on the
+ * {@code expectedResultType}.
+ * Note that this {@link RequestConverterFunction} is applied to the annotated service by default,
+ * so you don't have to set explicitly.
  */
-public class ByteArrayRequestConverterFunction implements RequestConverterFunction {
+public final class ByteArrayRequestConverterFunction implements RequestConverterFunction {
 
-    /**
-     * Converts the specified {@link AggregatedHttpRequest} to an object of {@code expectedResultType}.
-     * This converter allows only {@code byte[]} and {@link HttpData} as its return type, and
-     * {@link AggregatedHttpRequest} would be consumed only if it does not have a {@code Content-Type} header
-     * or if it has {@code Content-Type: application/octet-stream} or {@code Content-Type: application/binary}.
-     */
     @Override
-    public Object convertRequest(ServiceRequestContext ctx, AggregatedHttpRequest request,
-                                 Class<?> expectedResultType) throws Exception {
+    public Object convertRequest(
+            ServiceRequestContext ctx, AggregatedHttpRequest request, Class<?> expectedResultType,
+            @Nullable ParameterizedType expectedParameterizedResultType) throws Exception {
+
         final HttpData content = request.content();
         if (expectedResultType == byte[].class) {
             return content.array();

@@ -20,14 +20,10 @@ import static com.linecorp.armeria.common.SessionProtocol.H1;
 import static com.linecorp.armeria.common.SessionProtocol.H1C;
 import static com.linecorp.armeria.common.SessionProtocol.H2;
 import static com.linecorp.armeria.common.SessionProtocol.H2C;
-import static com.linecorp.armeria.testing.internal.TestUtil.withTimeout;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assumptions.assumeThat;
 import static org.awaitility.Awaitility.await;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertNull;
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
 
 import java.io.ByteArrayInputStream;
 import java.io.EOFException;
@@ -49,7 +45,6 @@ import java.util.zip.InflaterInputStream;
 
 import javax.annotation.Nullable;
 
-import org.junit.Test;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -66,12 +61,10 @@ import com.google.common.base.Strings;
 import com.google.common.io.ByteStreams;
 
 import com.linecorp.armeria.client.ClientFactory;
-import com.linecorp.armeria.client.ClientFactoryBuilder;
-import com.linecorp.armeria.client.HttpClient;
-import com.linecorp.armeria.client.HttpClientBuilder;
+import com.linecorp.armeria.client.WebClient;
+import com.linecorp.armeria.client.WebClientBuilder;
 import com.linecorp.armeria.common.AggregatedHttpResponse;
 import com.linecorp.armeria.common.ClosedSessionException;
-import com.linecorp.armeria.common.DefaultHttpData;
 import com.linecorp.armeria.common.HttpData;
 import com.linecorp.armeria.common.HttpHeaderNames;
 import com.linecorp.armeria.common.HttpHeaders;
@@ -87,18 +80,16 @@ import com.linecorp.armeria.common.RequestHeaders;
 import com.linecorp.armeria.common.ResponseHeaders;
 import com.linecorp.armeria.common.SessionProtocol;
 import com.linecorp.armeria.common.logging.RequestLog;
-import com.linecorp.armeria.common.logging.RequestLogAvailability;
+import com.linecorp.armeria.common.stream.ClosedStreamException;
 import com.linecorp.armeria.common.util.EventLoopGroups;
-import com.linecorp.armeria.common.util.Exceptions;
-import com.linecorp.armeria.internal.PathAndQuery;
-import com.linecorp.armeria.server.encoding.HttpEncodingService;
-import com.linecorp.armeria.testing.junit.server.ServerExtension;
-import com.linecorp.armeria.unsafe.ByteBufHttpData;
+import com.linecorp.armeria.common.util.TimeoutMode;
+import com.linecorp.armeria.internal.common.PathAndQuery;
+import com.linecorp.armeria.server.encoding.EncodingService;
+import com.linecorp.armeria.testing.junit5.server.ServerExtension;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.channel.EventLoopGroup;
-import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 import io.netty.util.AsciiString;
 import io.netty.util.NetUtil;
 
@@ -106,11 +97,12 @@ class HttpServerTest {
 
     private static final EventLoopGroup workerGroup = EventLoopGroups.newEventLoopGroup(1);
 
-    private static final ClientFactory clientFactory = new ClientFactoryBuilder()
-            .workerGroup(workerGroup, false) // Will be shut down by the Server.
-            .idleTimeout(Duration.ofSeconds(3))
-            .sslContextCustomizer(b -> b.trustManager(InsecureTrustManagerFactory.INSTANCE))
-            .build();
+    private static final ClientFactory clientFactory =
+            ClientFactory.builder()
+                         .workerGroup(workerGroup, false) // Will be shut down by the Server.
+                         .idleTimeout(Duration.ofSeconds(3))
+                         .tlsNoVerify()
+                         .build();
 
     private static final long MAX_CONTENT_LENGTH = 65536;
 
@@ -144,7 +136,7 @@ class HttpServerTest {
                 }
             });
 
-            sb.service("/delay-deferred/{delay}", (HttpService) (ctx, req) -> {
+            sb.service("/delay-deferred/{delay}", (ctx, req) -> {
                 final CompletableFuture<HttpResponse> responseFuture = new CompletableFuture<>();
                 final HttpResponse res = HttpResponse.from(responseFuture);
                 final long delayMillis = Long.parseLong(ctx.pathParam("delay"));
@@ -158,7 +150,7 @@ class HttpServerTest {
                 protected HttpResponse doGet(ServiceRequestContext ctx, HttpRequest req) {
                     final CompletableFuture<HttpResponse> responseFuture = new CompletableFuture<>();
                     final HttpResponse res = HttpResponse.from(responseFuture);
-                    ctx.setRequestTimeoutHandler(
+                    ctx.whenRequestTimingOut().thenRun(
                             () -> responseFuture.complete(
                                     HttpResponse.of(HttpStatus.OK, MediaType.PLAIN_TEXT_UTF_8, "timed out")));
                     final long delayMillis = Long.parseLong(ctx.pathParam("delay"));
@@ -168,10 +160,10 @@ class HttpServerTest {
                 }
             });
 
-            sb.service("/delay-custom-deferred/{delay}", (HttpService) (ctx, req) -> {
+            sb.service("/delay-custom-deferred/{delay}", (ctx, req) -> {
                 final CompletableFuture<HttpResponse> responseFuture = new CompletableFuture<>();
                 final HttpResponse res = HttpResponse.from(responseFuture);
-                ctx.setRequestTimeoutHandler(
+                ctx.whenRequestTimingOut().thenRun(
                         () -> responseFuture.complete(HttpResponse.of(
                                 HttpStatus.OK, MediaType.PLAIN_TEXT_UTF_8, "timed out")));
                 final long delayMillis = Long.parseLong(ctx.pathParam("delay"));
@@ -223,7 +215,7 @@ class HttpServerTest {
                                         final ByteBuf content = PooledByteBufAllocator.DEFAULT
                                                 .buffer(1)
                                                 .writeByte('0' + finalI);
-                                        data = new ByteBufHttpData(content, false);
+                                        data = HttpData.wrap(content);
                                     } else {
                                         data = HttpData.ofAscii(String.valueOf(finalI));
                                     }
@@ -302,7 +294,7 @@ class HttpServerTest {
                             HttpData.ofUtf8("is "),
                             HttpData.ofUtf8("awesome!"));
                 }
-            }.decorate(HttpEncodingService.class));
+            }.decorate(EncodingService.newDecorator()));
 
             sb.service("/images", new AbstractHttpService() {
                 @Override
@@ -314,7 +306,7 @@ class HttpServerTest {
                             HttpData.ofUtf8("is "),
                             HttpData.ofUtf8("awesome!"));
                 }
-            }.decorate(HttpEncodingService.class));
+            }.decorate(EncodingService.newDecorator()));
 
             sb.service("/small", new AbstractHttpService() {
                 @Override
@@ -326,7 +318,7 @@ class HttpServerTest {
                                                HttpHeaderNames.CONTENT_LENGTH, response.length()),
                             HttpData.ofUtf8(response));
                 }
-            }.decorate(HttpEncodingService.class));
+            }.decorate(EncodingService.newDecorator()));
 
             sb.service("/large", new AbstractHttpService() {
                 @Override
@@ -338,19 +330,19 @@ class HttpServerTest {
                                                HttpHeaderNames.CONTENT_LENGTH, response.length()),
                             HttpData.ofUtf8(response));
                 }
-            }.decorate(HttpEncodingService.class));
+            }.decorate(EncodingService.newDecorator()));
 
             sb.service("/sslsession", new AbstractHttpService() {
                 @Override
                 protected HttpResponse doGet(ServiceRequestContext ctx, HttpRequest req) {
                     if (ctx.sessionProtocol().isTls()) {
-                        assertNotNull(ctx.sslSession());
+                        assertThat(ctx.sslSession()).isNotNull();
                     } else {
-                        assertNull(ctx.sslSession());
+                        assertThat(ctx.sslSession()).isNull();
                     }
                     return HttpResponse.of(HttpStatus.OK);
                 }
-            }.decorate(HttpEncodingService.class));
+            }.decorate(EncodingService.newDecorator()));
 
             sb.service("/headers", new AbstractHttpService() {
                 @Override
@@ -362,7 +354,7 @@ class HttpServerTest {
                                                HttpHeaderNames.of("X-Custom-Header2"), "custom2"),
                             HttpData.ofUtf8("headers"));
                 }
-            }.decorate(HttpEncodingService.class));
+            }.decorate(EncodingService.newDecorator()));
 
             sb.service("/trailers", new AbstractHttpService() {
                 @Override
@@ -378,31 +370,32 @@ class HttpServerTest {
             sb.service("/head-headers-only", (ctx, req) -> HttpResponse.of(HttpStatus.OK));
 
             sb.service("/additional-trailers-other-trailers", (ctx, req) -> {
-                ctx.addAdditionalResponseTrailer(HttpHeaderNames.of("additional-trailer"), "value2");
+                ctx.mutateAdditionalResponseTrailers(
+                        mutator -> mutator.add(HttpHeaderNames.of("additional-trailer"), "value2"));
                 return HttpResponse.of(ResponseHeaders.of(HttpStatus.OK),
                                        HttpData.ofAscii("foobar"),
                                        HttpHeaders.of(HttpHeaderNames.of("original-trailer"), "value1"));
             });
 
             sb.service("/additional-trailers-no-other-trailers", (ctx, req) -> {
-                ctx.addAdditionalResponseTrailer(HttpHeaderNames.of("additional-trailer"), "value2");
-                String payload = "foobar";
+                ctx.mutateAdditionalResponseTrailers(
+                        mutator -> mutator.add(HttpHeaderNames.of("additional-trailer"), "value2"));
+                final String payload = "foobar";
                 return HttpResponse.of(ResponseHeaders.of(HttpStatus.OK),
-                                       new DefaultHttpData(payload.getBytes(StandardCharsets.UTF_8),
-                                                           true));
+                                       HttpData.ofUtf8(payload).withEndOfStream());
             });
 
             sb.service("/additional-trailers-no-eos", (ctx, req) -> {
-                ctx.addAdditionalResponseTrailer(HttpHeaderNames.of("additional-trailer"), "value2");
-                String payload = "foobar";
+                ctx.mutateAdditionalResponseTrailers(
+                        mutator -> mutator.add(HttpHeaderNames.of("additional-trailer"), "value2"));
+                final String payload = "foobar";
                 return HttpResponse.of(ResponseHeaders.of(HttpStatus.OK),
-                                       new DefaultHttpData(payload.getBytes(StandardCharsets.UTF_8),
-                                                           false));
+                                       HttpData.ofUtf8(payload).withEndOfStream());
             });
 
             sb.serviceUnder("/not-cached-paths", (ctx, req) -> HttpResponse.of(HttpStatus.OK));
 
-            sb.serviceUnder("/cached-paths", new Service<HttpRequest, HttpResponse>() {
+            sb.serviceUnder("/cached-paths", new HttpService() {
                 @Override
                 public HttpResponse serve(ServiceRequestContext ctx, HttpRequest req) throws Exception {
                     return HttpResponse.of(HttpStatus.OK);
@@ -416,30 +409,38 @@ class HttpServerTest {
 
             sb.service("/cached-exact-path", (ctx, req) -> HttpResponse.of(HttpStatus.OK));
 
-            final Function<Service<HttpRequest, HttpResponse>, Service<HttpRequest, HttpResponse>> decorator =
+            final Function<? super HttpService, ? extends HttpService> decorator =
                     s -> new SimpleDecoratingHttpService(s) {
                         @Override
                         public HttpResponse serve(ServiceRequestContext ctx, HttpRequest req) throws Exception {
                             pendingRequestLogs.incrementAndGet();
-                            ctx.setRequestTimeoutMillis(serverRequestTimeoutMillis);
+                            if (serverRequestTimeoutMillis == 0) {
+                                ctx.clearRequestTimeout();
+                            } else {
+                                ctx.setRequestTimeoutMillis(TimeoutMode.SET_FROM_NOW,
+                                                            serverRequestTimeoutMillis);
+                            }
                             ctx.setMaxRequestLength(serverMaxRequestLength);
-                            ctx.log().addListener(log -> {
+                            ctx.log().whenComplete().thenAccept(log -> {
                                 pendingRequestLogs.decrementAndGet();
                                 requestLogs.add(log);
-                            }, RequestLogAvailability.COMPLETE);
-                            return delegate().serve(ctx, req);
+                            });
+                            return unwrap().serve(ctx, req);
                         }
                     };
             sb.decorator(decorator);
 
             sb.maxRequestLength(MAX_CONTENT_LENGTH);
             sb.idleTimeout(Duration.ofSeconds(5));
+
+            sb.disableServerHeader();
+            sb.disableDateHeader();
         }
     };
 
     @AfterAll
     static void destroy() {
-        CompletableFuture.runAsync(clientFactory::close);
+        clientFactory.closeAsync();
     }
 
     @BeforeEach
@@ -466,510 +467,452 @@ class HttpServerTest {
 
     @ParameterizedTest
     @ArgumentsSource(ClientAndProtocolProvider.class)
-    void testGet(HttpClient client) throws Exception {
-        withTimeout(() -> {
-            final AggregatedHttpResponse res = client.get("/path/foo").aggregate().get();
-            assertThat(res.status()).isEqualTo(HttpStatus.OK);
-            assertThat(res.contentUtf8()).isEqualTo("/foo");
-        });
+    void testGet(WebClient client) throws Exception {
+        final AggregatedHttpResponse res = client.get("/path/foo").aggregate().get();
+        assertThat(res.status()).isEqualTo(HttpStatus.OK);
+        assertThat(res.contentUtf8()).isEqualTo("/foo");
     }
 
     @ParameterizedTest
     @ArgumentsSource(ClientAndProtocolProvider.class)
-    void testHead(HttpClient client) throws Exception {
-        withTimeout(() -> {
-            final AggregatedHttpResponse res = client.head("/path/blah").aggregate().get();
-            assertThat(res.status()).isEqualTo(HttpStatus.OK);
-            assertThat(res.content().isEmpty()).isTrue();
-            assertThat(res.headers().getInt(HttpHeaderNames.CONTENT_LENGTH)).isEqualTo(5);
-        });
+    void testHead(WebClient client) throws Exception {
+        final AggregatedHttpResponse res = client.head("/path/blah").aggregate().get();
+        assertThat(res.status()).isEqualTo(HttpStatus.OK);
+        assertThat(res.content().isEmpty()).isTrue();
+        assertThat(res.headers().getInt(HttpHeaderNames.CONTENT_LENGTH)).isEqualTo(5);
     }
 
     @ParameterizedTest
     @ArgumentsSource(ClientAndProtocolProvider.class)
-    void testPost(HttpClient client) throws Exception {
-        withTimeout(() -> {
-            final AggregatedHttpResponse res = client.post("/echo", "foo").aggregate().get();
-            assertThat(res.status()).isEqualTo(HttpStatus.OK);
-            assertThat(res.contentUtf8()).isEqualTo("foo");
-        });
+    void testPost(WebClient client) throws Exception {
+        final AggregatedHttpResponse res = client.post("/echo", "foo").aggregate().get();
+        assertThat(res.status()).isEqualTo(HttpStatus.OK);
+        assertThat(res.contentUtf8()).isEqualTo("foo");
     }
 
     @ParameterizedTest
     @ArgumentsSource(ClientAndProtocolProvider.class)
-    void testTimeout(HttpClient client) throws Exception {
-        withTimeout(() -> {
-            serverRequestTimeoutMillis = 100L;
-            final AggregatedHttpResponse res = client.get("/delay/2000").aggregate().get();
-            assertThat(res.status()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
-            assertThat(res.contentType()).isEqualTo(MediaType.PLAIN_TEXT_UTF_8);
-            assertThat(res.contentUtf8()).isEqualTo("503 Service Unavailable");
-            assertThat(requestLogs.take().statusCode()).isEqualTo(503);
-        });
+    void testTimeout(WebClient client) throws Exception {
+        serverRequestTimeoutMillis = 100L;
+        final AggregatedHttpResponse res = client.get("/delay/2000").aggregate().get();
+        assertThat(res.status()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
+        assertThat(res.contentType()).isEqualTo(MediaType.PLAIN_TEXT_UTF_8);
+        assertThat(res.contentUtf8()).isEqualTo("503 Service Unavailable");
+        assertThat(requestLogs.take().responseHeaders().status()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
     }
 
     @ParameterizedTest
     @ArgumentsSource(ClientAndProtocolProvider.class)
-    void testTimeout_deferred(HttpClient client) throws Exception {
-        withTimeout(() -> {
-            serverRequestTimeoutMillis = 100L;
-            final AggregatedHttpResponse res = client.get("/delay-deferred/2000").aggregate().get();
-            assertThat(res.status()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
-            assertThat(res.contentType()).isEqualTo(MediaType.PLAIN_TEXT_UTF_8);
-            assertThat(res.contentUtf8()).isEqualTo("503 Service Unavailable");
-            assertThat(requestLogs.take().statusCode()).isEqualTo(503);
-        });
+    void testTimeout_deferred(WebClient client) throws Exception {
+        serverRequestTimeoutMillis = 100L;
+        final AggregatedHttpResponse res = client.get("/delay-deferred/2000").aggregate().get();
+        assertThat(res.status()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
+        assertThat(res.contentType()).isEqualTo(MediaType.PLAIN_TEXT_UTF_8);
+        assertThat(res.contentUtf8()).isEqualTo("503 Service Unavailable");
+        assertThat(requestLogs.take().responseHeaders().status()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
     }
 
     @ParameterizedTest
     @ArgumentsSource(ClientAndProtocolProvider.class)
-    void testTimeout_customHandler(HttpClient client) throws Exception {
-        withTimeout(() -> {
-            serverRequestTimeoutMillis = 100L;
-            final AggregatedHttpResponse res = client.get("/delay-custom/2000").aggregate().get();
-            assertThat(res.status()).isEqualTo(HttpStatus.OK);
-            assertThat(res.contentType()).isEqualTo(MediaType.PLAIN_TEXT_UTF_8);
-            assertThat(res.contentUtf8()).isEqualTo("timed out");
-            assertThat(requestLogs.take().statusCode()).isEqualTo(200);
-        });
+    void testTimeout_customHandler(WebClient client) throws Exception {
+        serverRequestTimeoutMillis = 100L;
+        final AggregatedHttpResponse res = client.get("/delay-custom/2000").aggregate().get();
+        assertThat(res.status()).isEqualTo(HttpStatus.OK);
+        assertThat(res.contentType()).isEqualTo(MediaType.PLAIN_TEXT_UTF_8);
+        assertThat(res.contentUtf8()).isEqualTo("timed out");
+        assertThat(requestLogs.take().responseHeaders().status()).isEqualTo(HttpStatus.OK);
     }
 
     @ParameterizedTest
     @ArgumentsSource(ClientAndProtocolProvider.class)
-    void testTimeout_customHandler_deferred(HttpClient client) throws Exception {
-        withTimeout(() -> {
-            serverRequestTimeoutMillis = 100L;
-            final AggregatedHttpResponse res = client.get("/delay-custom-deferred/2000").aggregate().get();
-            assertThat(res.status()).isEqualTo(HttpStatus.OK);
-            assertThat(res.contentType()).isEqualTo(MediaType.PLAIN_TEXT_UTF_8);
-            assertThat(res.contentUtf8()).isEqualTo("timed out");
-            assertThat(requestLogs.take().statusCode()).isEqualTo(200);
-        });
+    void testTimeout_customHandler_deferred(WebClient client) throws Exception {
+        serverRequestTimeoutMillis = 100L;
+        final AggregatedHttpResponse res = client.get("/delay-custom-deferred/2000").aggregate().get();
+        assertThat(res.status()).isEqualTo(HttpStatus.OK);
+        assertThat(res.contentType()).isEqualTo(MediaType.PLAIN_TEXT_UTF_8);
+        assertThat(res.contentUtf8()).isEqualTo("timed out");
+        assertThat(requestLogs.take().responseHeaders().status()).isEqualTo(HttpStatus.OK);
     }
 
     @ParameterizedTest
     @ArgumentsSource(ClientAndProtocolProvider.class)
-    void testTimeoutAfterInformationals(HttpClient client) throws Exception {
-        withTimeout(() -> {
-            serverRequestTimeoutMillis = 1000L;
-            final AggregatedHttpResponse res = client.get("/informed_delay/2000").aggregate().get();
-            assertThat(res.informationals()).isNotEmpty();
-            res.informationals().forEach(h -> {
-                assertThat(h.status()).isEqualTo(HttpStatus.PROCESSING);
-                assertThat(h.names()).contains(HttpHeaderNames.STATUS);
-            });
-
-            assertThat(res.status()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
-            assertThat(res.contentType()).isEqualTo(MediaType.PLAIN_TEXT_UTF_8);
-            assertThat(res.contentUtf8()).isEqualTo("503 Service Unavailable");
-            assertThat(requestLogs.take().statusCode()).isEqualTo(503);
+    void testTimeoutAfterInformationals(WebClient client) throws Exception {
+        serverRequestTimeoutMillis = 1000L;
+        final AggregatedHttpResponse res = client.get("/informed_delay/2000").aggregate().get();
+        assertThat(res.informationals()).isNotEmpty();
+        res.informationals().forEach(h -> {
+            assertThat(h.status()).isEqualTo(HttpStatus.PROCESSING);
+            assertThat(h.names()).contains(HttpHeaderNames.STATUS);
         });
+
+        assertThat(res.status()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
+        assertThat(res.contentType()).isEqualTo(MediaType.PLAIN_TEXT_UTF_8);
+        assertThat(res.contentUtf8()).isEqualTo("503 Service Unavailable");
+        assertThat(requestLogs.take().responseHeaders().status()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
     }
 
     @ParameterizedTest
     @ArgumentsSource(ClientAndProtocolProvider.class)
-    void testTimeoutAfterPartialContent(HttpClient client) throws Exception {
-        withTimeout(() -> {
-            serverRequestTimeoutMillis = 1000L;
-            final CompletableFuture<AggregatedHttpResponse> f = client.get("/content_delay/2000").aggregate();
+    void testTimeoutAfterPartialContent(WebClient client) throws Exception {
+        serverRequestTimeoutMillis = 1000L;
+        final CompletableFuture<AggregatedHttpResponse> f = client.get("/content_delay/2000").aggregate();
 
-            // Because the service has written out the content partially, there's no way for the service
-            // to reply with '503 Service Unavailable', so it will just close the stream.
-            try {
-                f.get();
-                fail();
-            } catch (ExecutionException e) {
-                assertThat(Exceptions.peel(e)).isInstanceOf(ClosedSessionException.class);
-            }
-        });
+        // Because the service has written out the content partially, there's no way for the service
+        // to reply with '503 Service Unavailable', so it will just close the stream.
+
+        final Class<? extends Throwable> expectedCauseType =
+                client.scheme().sessionProtocol().isMultiplex() ?
+                ClosedStreamException.class : ClosedSessionException.class;
+
+        assertThatThrownBy(f::get).isInstanceOf(ExecutionException.class)
+                                  .hasCauseInstanceOf(expectedCauseType);
     }
 
     /**
-     * Similar to {@link #testTimeoutAfterPartialContent()}, but tests the case where the service produces
-     * a pooled buffers.
+     * Similar to {@link #testTimeoutAfterPartialContent(WebClient)}, but tests the case where the service
+     * produces a pooled buffers.
      */
     @ParameterizedTest
     @ArgumentsSource(ClientAndProtocolProvider.class)
-    void testTimeoutAfterPartialContentWithPooling(HttpClient client) throws Exception {
-        withTimeout(() -> {
-            serverRequestTimeoutMillis = 1000L;
-            final CompletableFuture<AggregatedHttpResponse> f =
-                    client.get("/content_delay/2000?pooled").aggregate();
+    void testTimeoutAfterPartialContentWithPooling(WebClient client) throws Exception {
+        serverRequestTimeoutMillis = 1000L;
+        final CompletableFuture<AggregatedHttpResponse> f =
+                client.get("/content_delay/2000?pooled").aggregate();
 
-            // Because the service has written out the content partially, there's no way for the service
-            // to reply with '503 Service Unavailable', so it will just close the stream.
-            try {
-                f.get();
-                fail();
-            } catch (ExecutionException e) {
-                assertThat(Exceptions.peel(e)).isInstanceOf(ClosedSessionException.class);
-            }
-        });
+        // Because the service has written out the content partially, there's no way for the service
+        // to reply with '503 Service Unavailable', so it will just close the stream.
+
+        final Class<? extends Throwable> expectedCauseType =
+                client.scheme().sessionProtocol().isMultiplex() ?
+                ClosedStreamException.class : ClosedSessionException.class;
+
+        assertThatThrownBy(f::get).isInstanceOf(ExecutionException.class)
+                                  .hasCauseInstanceOf(expectedCauseType);
     }
 
     @ParameterizedTest
     @ArgumentsSource(ClientAndProtocolProvider.class)
-    void testTooLargeContentToNonExistentService(HttpClient client) throws Exception {
-        withTimeout(() -> {
-            final byte[] content = new byte[(int) MAX_CONTENT_LENGTH + 1];
-            final AggregatedHttpResponse res = client.post("/non-existent", content).aggregate().get();
-            assertThat(res.status()).isEqualTo(HttpStatus.NOT_FOUND);
-            assertThat(res.contentUtf8()).isEqualTo("404 Not Found");
-        });
+    void testTooLargeContentToNonExistentService(WebClient client) throws Exception {
+        final byte[] content = new byte[(int) MAX_CONTENT_LENGTH + 1];
+        final AggregatedHttpResponse res = client.post("/non-existent", content).aggregate().get();
+        assertThat(res.status()).isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(res.contentUtf8()).isEqualTo("404 Not Found");
     }
 
     @ParameterizedTest
     @ArgumentsSource(ClientAndProtocolProvider.class)
-    void testStrings_noAcceptEncoding(HttpClient client) throws Exception {
-        withTimeout(() -> {
-            final RequestHeaders req = RequestHeaders.of(HttpMethod.GET, "/strings");
-            final CompletableFuture<AggregatedHttpResponse> f = client.execute(req).aggregate();
+    void testStrings_noAcceptEncoding(WebClient client) throws Exception {
+        final RequestHeaders req = RequestHeaders.of(HttpMethod.GET, "/strings");
+        final CompletableFuture<AggregatedHttpResponse> f = client.execute(req).aggregate();
 
-            final AggregatedHttpResponse res = f.get();
+        final AggregatedHttpResponse res = f.get();
 
-            assertThat(res.status()).isEqualTo(HttpStatus.OK);
-            assertThat(res.headers().get(HttpHeaderNames.CONTENT_ENCODING)).isNull();
-            assertThat(res.headers().get(HttpHeaderNames.VARY)).isNull();
-            assertThat(res.contentUtf8()).isEqualTo("Armeria is awesome!");
-        });
+        assertThat(res.status()).isEqualTo(HttpStatus.OK);
+        assertThat(res.headers().get(HttpHeaderNames.CONTENT_ENCODING)).isNull();
+        assertThat(res.headers().get(HttpHeaderNames.VARY)).isNull();
+        assertThat(res.contentUtf8()).isEqualTo("Armeria is awesome!");
     }
 
     @ParameterizedTest
     @ArgumentsSource(ClientAndProtocolProvider.class)
-    void testStrings_acceptEncodingGzip(HttpClient client) throws Exception {
-        withTimeout(() -> {
-            final RequestHeaders req = RequestHeaders.of(HttpMethod.GET, "/strings",
-                                                         HttpHeaderNames.ACCEPT_ENCODING, "gzip");
-            final CompletableFuture<AggregatedHttpResponse> f = client.execute(req).aggregate();
+    void testStrings_acceptEncodingGzip(WebClient client) throws Exception {
+        final RequestHeaders req = RequestHeaders.of(HttpMethod.GET, "/strings",
+                                                     HttpHeaderNames.ACCEPT_ENCODING, "gzip");
+        final CompletableFuture<AggregatedHttpResponse> f = client.execute(req).aggregate();
 
-            final AggregatedHttpResponse res = f.get();
+        final AggregatedHttpResponse res = f.get();
 
-            assertThat(res.status()).isEqualTo(HttpStatus.OK);
-            assertThat(res.headers().get(HttpHeaderNames.CONTENT_ENCODING)).isEqualTo("gzip");
-            assertThat(res.headers().get(HttpHeaderNames.VARY)).isEqualTo("accept-encoding");
+        assertThat(res.status()).isEqualTo(HttpStatus.OK);
+        assertThat(res.headers().get(HttpHeaderNames.CONTENT_ENCODING)).isEqualTo("gzip");
+        assertThat(res.headers().get(HttpHeaderNames.VARY)).isEqualTo("accept-encoding");
 
-            final byte[] decoded;
-            try (GZIPInputStream unzipper = new GZIPInputStream(
-                    new ByteArrayInputStream(res.content().array()))) {
-                decoded = ByteStreams.toByteArray(unzipper);
-            } catch (EOFException e) {
-                throw new IllegalArgumentException(e);
-            }
-            assertThat(new String(decoded, StandardCharsets.UTF_8)).isEqualTo("Armeria is awesome!");
-        });
+        final byte[] decoded;
+        try (GZIPInputStream unzipper = new GZIPInputStream(
+                new ByteArrayInputStream(res.content().array()))) {
+            decoded = ByteStreams.toByteArray(unzipper);
+        } catch (EOFException e) {
+            throw new IllegalArgumentException(e);
+        }
+        assertThat(new String(decoded, StandardCharsets.UTF_8)).isEqualTo("Armeria is awesome!");
     }
 
     @ParameterizedTest
     @ArgumentsSource(ClientAndProtocolProvider.class)
-    void testStrings_acceptEncodingGzip_imageContentType(HttpClient client) throws Exception {
-        withTimeout(() -> {
-            final RequestHeaders req = RequestHeaders.of(HttpMethod.GET, "/images",
-                                                         HttpHeaderNames.ACCEPT_ENCODING, "gzip");
-            final CompletableFuture<AggregatedHttpResponse> f = client.execute(req).aggregate();
+    void testStrings_acceptEncodingGzip_imageContentType(WebClient client) throws Exception {
+        final RequestHeaders req = RequestHeaders.of(HttpMethod.GET, "/images",
+                                                     HttpHeaderNames.ACCEPT_ENCODING, "gzip");
+        final CompletableFuture<AggregatedHttpResponse> f = client.execute(req).aggregate();
 
-            final AggregatedHttpResponse res = f.get();
+        final AggregatedHttpResponse res = f.get();
 
-            assertThat(res.status()).isEqualTo(HttpStatus.OK);
-            assertThat(res.headers().get(HttpHeaderNames.CONTENT_ENCODING)).isNull();
-            assertThat(res.headers().get(HttpHeaderNames.VARY)).isNull();
-            assertThat(res.contentUtf8()).isEqualTo("Armeria is awesome!");
-        });
+        assertThat(res.status()).isEqualTo(HttpStatus.OK);
+        assertThat(res.headers().get(HttpHeaderNames.CONTENT_ENCODING)).isNull();
+        assertThat(res.headers().get(HttpHeaderNames.VARY)).isNull();
+        assertThat(res.contentUtf8()).isEqualTo("Armeria is awesome!");
     }
 
     @ParameterizedTest
     @ArgumentsSource(ClientAndProtocolProvider.class)
-    void testStrings_acceptEncodingGzip_smallFixedContent(HttpClient client) throws Exception {
-        withTimeout(() -> {
-            final RequestHeaders req = RequestHeaders.of(HttpMethod.GET, "/small",
-                                                         HttpHeaderNames.ACCEPT_ENCODING, "gzip");
-            final CompletableFuture<AggregatedHttpResponse> f = client.execute(req).aggregate();
+    void testStrings_acceptEncodingGzip_smallFixedContent(WebClient client) throws Exception {
+        final RequestHeaders req = RequestHeaders.of(HttpMethod.GET, "/small",
+                                                     HttpHeaderNames.ACCEPT_ENCODING, "gzip");
+        final CompletableFuture<AggregatedHttpResponse> f = client.execute(req).aggregate();
 
-            final AggregatedHttpResponse res = f.get();
+        final AggregatedHttpResponse res = f.get();
 
-            assertThat(res.status()).isEqualTo(HttpStatus.OK);
-            assertThat(res.headers().get(HttpHeaderNames.CONTENT_ENCODING)).isNull();
-            assertThat(res.headers().get(HttpHeaderNames.VARY)).isNull();
-            assertThat(res.contentUtf8()).isEqualTo(Strings.repeat("a", 1023));
-        });
+        assertThat(res.status()).isEqualTo(HttpStatus.OK);
+        assertThat(res.headers().get(HttpHeaderNames.CONTENT_ENCODING)).isNull();
+        assertThat(res.headers().get(HttpHeaderNames.VARY)).isNull();
+        assertThat(res.contentUtf8()).isEqualTo(Strings.repeat("a", 1023));
     }
 
     @ParameterizedTest
     @ArgumentsSource(ClientAndProtocolProvider.class)
-    void testStrings_acceptEncodingGzip_largeFixedContent(HttpClient client) throws Exception {
-        withTimeout(() -> {
-            final RequestHeaders req = RequestHeaders.of(HttpMethod.GET, "/large",
-                                                         HttpHeaderNames.ACCEPT_ENCODING, "gzip");
-            final CompletableFuture<AggregatedHttpResponse> f = client.execute(req).aggregate();
+    void testStrings_acceptEncodingGzip_largeFixedContent(WebClient client) throws Exception {
+        final RequestHeaders req = RequestHeaders.of(HttpMethod.GET, "/large",
+                                                     HttpHeaderNames.ACCEPT_ENCODING, "gzip");
+        final CompletableFuture<AggregatedHttpResponse> f = client.execute(req).aggregate();
 
-            final AggregatedHttpResponse res = f.get();
+        final AggregatedHttpResponse res = f.get();
 
-            assertThat(res.status()).isEqualTo(HttpStatus.OK);
-            assertThat(res.headers().get(HttpHeaderNames.CONTENT_ENCODING)).isEqualTo("gzip");
-            assertThat(res.headers().get(HttpHeaderNames.VARY)).isEqualTo("accept-encoding");
+        assertThat(res.status()).isEqualTo(HttpStatus.OK);
+        assertThat(res.headers().get(HttpHeaderNames.CONTENT_ENCODING)).isEqualTo("gzip");
+        assertThat(res.headers().get(HttpHeaderNames.VARY)).isEqualTo("accept-encoding");
 
-            final byte[] decoded;
-            try (GZIPInputStream unzipper = new GZIPInputStream(
-                    new ByteArrayInputStream(res.content().array()))) {
-                decoded = ByteStreams.toByteArray(unzipper);
-            }
-            assertThat(new String(decoded, StandardCharsets.UTF_8)).isEqualTo(Strings.repeat("a", 1024));
-        });
+        final byte[] decoded;
+        try (GZIPInputStream unzipper = new GZIPInputStream(
+                new ByteArrayInputStream(res.content().array()))) {
+            decoded = ByteStreams.toByteArray(unzipper);
+        }
+        assertThat(new String(decoded, StandardCharsets.UTF_8)).isEqualTo(Strings.repeat("a", 1024));
     }
 
     @ParameterizedTest
     @ArgumentsSource(ClientAndProtocolProvider.class)
-    void testStrings_acceptEncodingDeflate(HttpClient client) throws Exception {
-        withTimeout(() -> {
-            final RequestHeaders req = RequestHeaders.of(HttpMethod.GET, "/strings",
-                                                         HttpHeaderNames.ACCEPT_ENCODING, "deflate");
-            final CompletableFuture<AggregatedHttpResponse> f = client.execute(req).aggregate();
+    void testStrings_acceptEncodingDeflate(WebClient client) throws Exception {
+        final RequestHeaders req = RequestHeaders.of(HttpMethod.GET, "/strings",
+                                                     HttpHeaderNames.ACCEPT_ENCODING, "deflate");
+        final CompletableFuture<AggregatedHttpResponse> f = client.execute(req).aggregate();
 
-            final AggregatedHttpResponse res = f.get();
+        final AggregatedHttpResponse res = f.get();
 
-            assertThat(res.status()).isEqualTo(HttpStatus.OK);
-            assertThat(res.headers().get(HttpHeaderNames.CONTENT_ENCODING)).isEqualTo("deflate");
-            assertThat(res.headers().get(HttpHeaderNames.VARY)).isEqualTo("accept-encoding");
+        assertThat(res.status()).isEqualTo(HttpStatus.OK);
+        assertThat(res.headers().get(HttpHeaderNames.CONTENT_ENCODING)).isEqualTo("deflate");
+        assertThat(res.headers().get(HttpHeaderNames.VARY)).isEqualTo("accept-encoding");
 
-            final byte[] decoded;
-            try (InflaterInputStream unzipper =
-                         new InflaterInputStream(new ByteArrayInputStream(res.content().array()))) {
-                decoded = ByteStreams.toByteArray(unzipper);
-            }
-            assertThat(new String(decoded, StandardCharsets.UTF_8)).isEqualTo("Armeria is awesome!");
-        });
+        final byte[] decoded;
+        try (InflaterInputStream unzipper =
+                     new InflaterInputStream(new ByteArrayInputStream(res.content().array()))) {
+            decoded = ByteStreams.toByteArray(unzipper);
+        }
+        assertThat(new String(decoded, StandardCharsets.UTF_8)).isEqualTo("Armeria is awesome!");
     }
 
     @ParameterizedTest
     @ArgumentsSource(ClientAndProtocolProvider.class)
-    void testStrings_acceptEncodingUnknown(HttpClient client) throws Exception {
-        withTimeout(() -> {
-            final RequestHeaders req = RequestHeaders.of(HttpMethod.GET, "/strings",
-                                                         HttpHeaderNames.ACCEPT_ENCODING, "piedpiper");
-            final CompletableFuture<AggregatedHttpResponse> f = client.execute(req).aggregate();
+    void testStrings_acceptEncodingUnknown(WebClient client) throws Exception {
+        final RequestHeaders req = RequestHeaders.of(HttpMethod.GET, "/strings",
+                                                     HttpHeaderNames.ACCEPT_ENCODING, "piedpiper");
+        final CompletableFuture<AggregatedHttpResponse> f = client.execute(req).aggregate();
 
-            final AggregatedHttpResponse res = f.get();
+        final AggregatedHttpResponse res = f.get();
 
-            assertThat(res.status()).isEqualTo(HttpStatus.OK);
-            assertThat(res.headers().get(HttpHeaderNames.CONTENT_ENCODING)).isNull();
-            assertThat(res.headers().get(HttpHeaderNames.VARY)).isNull();
-            assertThat(res.contentUtf8()).isEqualTo("Armeria is awesome!");
-        });
+        assertThat(res.status()).isEqualTo(HttpStatus.OK);
+        assertThat(res.headers().get(HttpHeaderNames.CONTENT_ENCODING)).isNull();
+        assertThat(res.headers().get(HttpHeaderNames.VARY)).isNull();
+        assertThat(res.contentUtf8()).isEqualTo("Armeria is awesome!");
     }
 
     @ParameterizedTest
     @ArgumentsSource(ClientAndProtocolProvider.class)
-    void testSslSession(HttpClient client) throws Exception {
-        withTimeout(() -> {
-            final CompletableFuture<AggregatedHttpResponse> f = client.get("/sslsession").aggregate();
+    void testSslSession(WebClient client) throws Exception {
+        final CompletableFuture<AggregatedHttpResponse> f = client.get("/sslsession").aggregate();
 
-            final AggregatedHttpResponse res = f.get();
+        final AggregatedHttpResponse res = f.get();
 
-            assertThat(res.status()).isEqualTo(HttpStatus.OK);
-        });
+        assertThat(res.status()).isEqualTo(HttpStatus.OK);
     }
 
-    @Test
-    void testHeadHeadersOnly(HttpClient client, SessionProtocol protocol) throws Exception {
+    @ParameterizedTest
+    @ArgumentsSource(ClientAndProtocolProvider.class)
+    void testHeadHeadersOnly(WebClient client, SessionProtocol protocol) throws Exception {
         assumeThat(protocol).isSameAs(H1C);
 
-        withTimeout(() -> {
-            final int port = server.httpPort();
-            try (Socket s = new Socket(NetUtil.LOCALHOST, port)) {
-                s.setSoTimeout(10000);
-                final InputStream in = s.getInputStream();
-                final OutputStream out = s.getOutputStream();
-                out.write("HEAD /head-headers-only HTTP/1.0\r\n\r\n".getBytes(StandardCharsets.US_ASCII));
+        final int port = server.httpPort();
+        try (Socket s = new Socket(NetUtil.LOCALHOST, port)) {
+            s.setSoTimeout(10000);
+            final InputStream in = s.getInputStream();
+            final OutputStream out = s.getOutputStream();
+            out.write("HEAD /head-headers-only HTTP/1.0\r\n\r\n".getBytes(StandardCharsets.US_ASCII));
 
-                // Should neither be chunked nor have content.
-                assertThat(new String(ByteStreams.toByteArray(in)))
-                        .isEqualTo("HTTP/1.1 200 OK\r\n" +
-                                   "content-type: text/plain; charset=utf-8\r\n" +
-                                   "content-length: 6\r\n\r\n");
-            }
-        });
+            // Should neither be chunked nor have content.
+            assertThat(new String(ByteStreams.toByteArray(in)))
+                    .isEqualTo("HTTP/1.1 200 OK\r\n" +
+                               "content-type: text/plain; charset=utf-8\r\n" +
+                               "content-length: 6\r\n\r\n");
+        }
     }
 
     @ParameterizedTest
     @ArgumentsSource(ClientAndProtocolProvider.class)
-    void testExpect100Continue(HttpClient client) throws Exception {
-        withTimeout(() -> {
-            // Makes sure the server sends a '100 Continue' response if 'expect: 100-continue' header exists.
-            final AggregatedHttpResponse res =
-                    client.execute(RequestHeaders.of(HttpMethod.POST, "/echo",
-                                                     HttpHeaderNames.EXPECT, "100-continue"),
-                                   "met expectation")
-                          .aggregate().join();
+    void testExpect100Continue(WebClient client) throws Exception {
+        // Makes sure the server sends a '100 Continue' response if 'expect: 100-continue' header exists.
+        final AggregatedHttpResponse res =
+                client.execute(RequestHeaders.of(HttpMethod.POST, "/echo",
+                                                 HttpHeaderNames.EXPECT, "100-continue"),
+                               "met expectation")
+                      .aggregate().join();
 
-            assertThat(res.status()).isEqualTo(HttpStatus.OK);
-            assertThat(res.informationals()).containsExactly(ResponseHeaders.of(100));
-            assertThat(res.contentUtf8()).isEqualTo("met expectation");
+        assertThat(res.status()).isEqualTo(HttpStatus.OK);
+        assertThat(res.informationals()).containsExactly(ResponseHeaders.of(100));
+        assertThat(res.contentUtf8()).isEqualTo("met expectation");
 
-            // Makes sure the server does not send a '100 Continue' response if 'expect: 100-continue' header
-            // does not exists.
-            final AggregatedHttpResponse res2 =
-                    client.execute(RequestHeaders.of(HttpMethod.POST, "/echo"), "without expectation")
-                          .aggregate().join();
+        // Makes sure the server does not send a '100 Continue' response if 'expect: 100-continue' header
+        // does not exists.
+        final AggregatedHttpResponse res2 =
+                client.execute(RequestHeaders.of(HttpMethod.POST, "/echo"), "without expectation")
+                      .aggregate().join();
 
-            assertThat(res2.status()).isEqualTo(HttpStatus.OK);
-            assertThat(res2.informationals()).isEmpty();
-            assertThat(res2.contentUtf8()).isEqualTo("without expectation");
-        });
+        assertThat(res2.status()).isEqualTo(HttpStatus.OK);
+        assertThat(res2.informationals()).isEmpty();
+        assertThat(res2.contentUtf8()).isEqualTo("without expectation");
     }
 
     @ParameterizedTest
     @ArgumentsSource(ClientAndProtocolProvider.class)
-    void testExpect100ContinueDoesNotBreakHttp1Decoder(HttpClient client, SessionProtocol protocol)
+    void testExpect100ContinueDoesNotBreakHttp1Decoder(WebClient client, SessionProtocol protocol)
             throws Exception {
         assumeThat(protocol).isSameAs(H1C);
 
-        withTimeout(() -> {
-            final int port = server.httpPort();
-            try (Socket s = new Socket(NetUtil.LOCALHOST, port)) {
-                s.setSoTimeout(10000);
-                final InputStream in = s.getInputStream();
-                final OutputStream out = s.getOutputStream();
-                // Send 4 pipelined requests with 'Expect: 100-continue' header.
-                out.write((Strings.repeat("POST /head-headers-only HTTP/1.1\r\n" +
-                                          "Expect: 100-continue\r\n" +
-                                          "Content-Length: 0\r\n\r\n", 3) +
-                           "POST /head-headers-only HTTP/1.1\r\n" +
-                           "Expect: 100-continue\r\n" +
-                           "Content-Length: 0\r\n" +
-                           "Connection: close\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+        final int port = server.httpPort();
+        try (Socket s = new Socket(NetUtil.LOCALHOST, port)) {
+            s.setSoTimeout(10000);
+            final InputStream in = s.getInputStream();
+            final OutputStream out = s.getOutputStream();
+            // Send 4 pipelined requests with 'Expect: 100-continue' header.
+            out.write((Strings.repeat("POST /head-headers-only HTTP/1.1\r\n" +
+                                      "Expect: 100-continue\r\n" +
+                                      "Content-Length: 0\r\n\r\n", 3) +
+                       "POST /head-headers-only HTTP/1.1\r\n" +
+                       "Expect: 100-continue\r\n" +
+                       "Content-Length: 0\r\n" +
+                       "Connection: close\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
 
-                // '100 Continue' responses must appear once for each '200 OK' response.
-                assertThat(new String(ByteStreams.toByteArray(in)))
-                        .isEqualTo(Strings.repeat("HTTP/1.1 100 Continue\r\n\r\n" +
-                                                  "HTTP/1.1 200 OK\r\n" +
-                                                  "content-type: text/plain; charset=utf-8\r\n" +
-                                                  "content-length: 6\r\n\r\n200 OK", 4));
-            }
-        });
-    }
-
-    @Test(timeout = 30000)
-    void testStreamRequestLongerThanTimeout(HttpClient client) throws Exception {
-        withTimeout(() -> {
-            // Disable timeouts and length limits so that test does not fail due to slow transfer.
-            clientWriteTimeoutMillis = 0;
-            clientResponseTimeoutMillis = 0;
-            clientMaxResponseLength = 0;
-            serverRequestTimeoutMillis = 0;
-
-            final HttpRequestWriter request = HttpRequest.streaming(HttpMethod.POST, "/echo");
-            final HttpResponse response = client.execute(request);
-            request.write(HttpData.ofUtf8("a"));
-            Thread.sleep(2000);
-            request.write(HttpData.ofUtf8("b"));
-            Thread.sleep(2000);
-            request.write(HttpData.ofUtf8("c"));
-            Thread.sleep(2000);
-            request.write(HttpData.ofUtf8("d"));
-            Thread.sleep(2000);
-            request.write(HttpData.ofUtf8("e"));
-            request.close();
-            assertThat(response.aggregate().get().contentUtf8()).isEqualTo("abcde");
-        });
+            // '100 Continue' responses must appear once for each '200 OK' response.
+            assertThat(new String(ByteStreams.toByteArray(in)))
+                    .isEqualTo(Strings.repeat("HTTP/1.1 100 Continue\r\n\r\n" +
+                                              "HTTP/1.1 200 OK\r\n" +
+                                              "content-type: text/plain; charset=utf-8\r\n" +
+                                              "content-length: 6\r\n\r\n200 OK", 4));
+        }
     }
 
     @ParameterizedTest
     @ArgumentsSource(ClientAndProtocolProvider.class)
-    void testHeaders(HttpClient client) throws Exception {
-        withTimeout(() -> {
-            final CompletableFuture<AggregatedHttpResponse> f = client.get("/headers").aggregate();
+    void testStreamRequestLongerThanTimeout(WebClient client) throws Exception {
+        // Disable timeouts and length limits so that test does not fail due to slow transfer.
+        clientWriteTimeoutMillis = 0;
+        clientResponseTimeoutMillis = 0;
+        clientMaxResponseLength = 0;
+        serverRequestTimeoutMillis = 0;
 
-            final AggregatedHttpResponse res = f.get();
-
-            assertThat(res.status()).isEqualTo(HttpStatus.OK);
-
-            // Verify all header names are in lowercase
-            for (AsciiString headerName : res.headers().names()) {
-                headerName.chars().filter(Character::isAlphabetic)
-                          .forEach(c -> assertTrue(Character.isLowerCase(c)));
-            }
-
-            assertThat(res.headers().get(HttpHeaderNames.of("x-custom-header1"))).isEqualTo("custom1");
-            assertThat(res.headers().get(HttpHeaderNames.of("x-custom-header2"))).isEqualTo("custom2");
-            assertThat(res.contentUtf8()).isEqualTo("headers");
-        });
+        final HttpRequestWriter request = HttpRequest.streaming(HttpMethod.POST, "/echo");
+        final HttpResponse response = client.execute(request);
+        request.write(HttpData.ofUtf8("a"));
+        Thread.sleep(2000);
+        request.write(HttpData.ofUtf8("b"));
+        Thread.sleep(2000);
+        request.write(HttpData.ofUtf8("c"));
+        Thread.sleep(2000);
+        request.write(HttpData.ofUtf8("d"));
+        Thread.sleep(2000);
+        request.write(HttpData.ofUtf8("e"));
+        request.close();
+        assertThat(response.aggregate().get().contentUtf8()).isEqualTo("abcde");
     }
 
     @ParameterizedTest
     @ArgumentsSource(ClientAndProtocolProvider.class)
-    void testTrailers(HttpClient client) throws Exception {
-        withTimeout(() -> {
-            final CompletableFuture<AggregatedHttpResponse> f = client.get("/trailers").aggregate();
+    void testHeaders(WebClient client) throws Exception {
+        final CompletableFuture<AggregatedHttpResponse> f = client.get("/headers").aggregate();
 
-            final AggregatedHttpResponse res = f.get();
-            assertThat(res.trailers().get(HttpHeaderNames.of("foo"))).isEqualTo("bar");
-        });
+        final AggregatedHttpResponse res = f.get();
+
+        assertThat(res.status()).isEqualTo(HttpStatus.OK);
+
+        // Verify all header names are in lowercase
+        for (AsciiString headerName : res.headers().names()) {
+            headerName.chars().filter(Character::isAlphabetic)
+                      .forEach(c -> assertThat(Character.isLowerCase(c)).isTrue());
+        }
+
+        assertThat(res.headers().get(HttpHeaderNames.of("x-custom-header1"))).isEqualTo("custom1");
+        assertThat(res.headers().get(HttpHeaderNames.of("x-custom-header2"))).isEqualTo("custom2");
+        assertThat(res.contentUtf8()).isEqualTo("headers");
     }
 
     @ParameterizedTest
     @ArgumentsSource(ClientAndProtocolProvider.class)
-    void testExactPathCached(HttpClient client) throws Exception {
-        withTimeout(() -> {
-            assertThat(client.get("/cached-exact-path")
-                             .aggregate().get().status()).isEqualTo(HttpStatus.OK);
-            assertThat(PathAndQuery.cachedPaths()).contains("/cached-exact-path");
-        });
+    void testTrailers(WebClient client) throws Exception {
+        final CompletableFuture<AggregatedHttpResponse> f = client.get("/trailers").aggregate();
+
+        final AggregatedHttpResponse res = f.get();
+        assertThat(res.trailers().get(HttpHeaderNames.of("foo"))).isEqualTo("bar");
     }
 
     @ParameterizedTest
     @ArgumentsSource(ClientAndProtocolProvider.class)
-    void testPrefixPathNotCached(HttpClient client) throws Exception {
-        withTimeout(() -> {
-            assertThat(client.get("/not-cached-paths/hoge")
-                             .aggregate().get().status()).isEqualTo(HttpStatus.OK);
-            assertThat(PathAndQuery.cachedPaths()).doesNotContain("/not-cached-paths/hoge");
-        });
+    void testExactPathCached(WebClient client) throws Exception {
+        assertThat(client.get("/cached-exact-path")
+                         .aggregate().get().status()).isEqualTo(HttpStatus.OK);
+        assertThat(PathAndQuery.cachedPaths()).contains("/cached-exact-path");
     }
 
     @ParameterizedTest
     @ArgumentsSource(ClientAndProtocolProvider.class)
-    void testPrefixPath_cacheForced(HttpClient client) throws Exception {
-        withTimeout(() -> {
-            assertThat(client.get("/cached-paths/hoge")
-                             .aggregate().get().status()).isEqualTo(HttpStatus.OK);
-            assertThat(PathAndQuery.cachedPaths()).contains("/cached-paths/hoge");
-        });
+    void testPrefixPathNotCached(WebClient client) throws Exception {
+        assertThat(client.get("/not-cached-paths/hoge")
+                         .aggregate().get().status()).isEqualTo(HttpStatus.OK);
+        assertThat(PathAndQuery.cachedPaths()).doesNotContain("/not-cached-paths/hoge");
     }
 
     @ParameterizedTest
     @ArgumentsSource(ClientAndProtocolProvider.class)
-    void testAdditionalTrailersOtherTrailers(HttpClient client, SessionProtocol protocol) {
+    void testPrefixPath_cacheForced(WebClient client) throws Exception {
+        assertThat(client.get("/cached-paths/hoge")
+                         .aggregate().get().status()).isEqualTo(HttpStatus.OK);
+        assertThat(PathAndQuery.cachedPaths()).contains("/cached-paths/hoge");
+    }
+
+    @ParameterizedTest
+    @ArgumentsSource(ClientAndProtocolProvider.class)
+    void testAdditionalTrailersOtherTrailers(WebClient client, SessionProtocol protocol) {
         assumeThat(protocol.isMultiplex()).isTrue();
 
-        withTimeout(() -> {
-            final HttpHeaders trailers = client.get("/additional-trailers-other-trailers")
-                                               .aggregate().join().trailers();
-            assertThat(trailers.get(HttpHeaderNames.of("original-trailer"))).isEqualTo("value1");
-            assertThat(trailers.get(HttpHeaderNames.of("additional-trailer"))).isEqualTo("value2");
-        });
+        final HttpHeaders trailers = client.get("/additional-trailers-other-trailers")
+                                           .aggregate().join().trailers();
+        assertThat(trailers.get(HttpHeaderNames.of("original-trailer"))).isEqualTo("value1");
+        assertThat(trailers.get(HttpHeaderNames.of("additional-trailer"))).isEqualTo("value2");
     }
 
     @ParameterizedTest
     @ArgumentsSource(ClientAndProtocolProvider.class)
-    void testAdditionalTrailersNoEndOfStream(HttpClient client, SessionProtocol protocol) {
+    void testAdditionalTrailersNoEndOfStream(WebClient client, SessionProtocol protocol) {
         assumeThat(protocol.isMultiplex()).isTrue();
 
-        withTimeout(() -> {
-            final HttpHeaders trailers = client.get("/additional-trailers-no-eos")
-                                               .aggregate().join().trailers();
-            assertThat(trailers.get(HttpHeaderNames.of("additional-trailer"))).isEqualTo("value2");
-        });
+        final HttpHeaders trailers = client.get("/additional-trailers-no-eos")
+                                           .aggregate().join().trailers();
+        assertThat(trailers.get(HttpHeaderNames.of("additional-trailer"))).isEqualTo("value2");
     }
 
     @ParameterizedTest
     @ArgumentsSource(ClientAndProtocolProvider.class)
-    void testAdditionalTrailersNoOtherTrailers(HttpClient client, SessionProtocol protocol) {
+    void testAdditionalTrailersNoOtherTrailers(WebClient client, SessionProtocol protocol) {
         assumeThat(protocol.isMultiplex()).isTrue();
 
-        withTimeout(() -> {
-            final HttpHeaders trailers = client.get("/additional-trailers-no-other-trailers")
-                                               .aggregate().join().trailers();
-            assertThat(trailers.get(HttpHeaderNames.of("additional-trailer"))).isEqualTo("value2");
-        });
+        final HttpHeaders trailers = client.get("/additional-trailers-no-other-trailers")
+                                           .aggregate().join().trailers();
+        assertThat(trailers.get(HttpHeaderNames.of("additional-trailer"))).isEqualTo("value2");
     }
 
     private static class ClientAndProtocolProvider implements ArgumentsProvider {
@@ -977,7 +920,7 @@ class HttpServerTest {
         public Stream<? extends Arguments> provideArguments(ExtensionContext context) {
             return Stream.of(H1C, H1, H2C, H2)
                          .map(protocol -> {
-                             final HttpClientBuilder builder = new HttpClientBuilder(
+                             final WebClientBuilder builder = WebClient.builder(
                                      protocol.uriText() + "://127.0.0.1:" +
                                      (protocol.isTls() ? server.httpsPort() : server.httpPort()));
 
@@ -985,7 +928,12 @@ class HttpServerTest {
                              builder.decorator(
                                      (delegate, ctx, req) -> {
                                          ctx.setWriteTimeoutMillis(clientWriteTimeoutMillis);
-                                         ctx.setResponseTimeoutMillis(clientResponseTimeoutMillis);
+                                         if (clientResponseTimeoutMillis == 0) {
+                                            ctx.clearResponseTimeout();
+                                         } else {
+                                             ctx.setResponseTimeoutMillis(TimeoutMode.SET_FROM_NOW,
+                                                                          clientResponseTimeoutMillis);
+                                         }
                                          ctx.setMaxResponseLength(clientMaxResponseLength);
                                          return delegate.execute(ctx, req);
                                      });

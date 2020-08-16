@@ -33,7 +33,7 @@ import org.reactivestreams.Subscription;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.linecorp.armeria.client.HttpClient;
+import com.linecorp.armeria.client.WebClient;
 import com.linecorp.armeria.common.HttpData;
 import com.linecorp.armeria.common.HttpMethod;
 import com.linecorp.armeria.common.HttpObject;
@@ -45,7 +45,7 @@ import com.linecorp.armeria.common.ResponseHeaders;
 import com.linecorp.armeria.common.SessionProtocol;
 import com.linecorp.armeria.common.stream.AbortedStreamException;
 import com.linecorp.armeria.common.stream.CancelledSubscriptionException;
-import com.linecorp.armeria.testing.junit.server.ServerExtension;
+import com.linecorp.armeria.testing.junit5.server.ServerExtension;
 
 class HttpServerAbortingInfiniteStreamTest {
     private static final Logger logger = LoggerFactory.getLogger(HttpServerAbortingInfiniteStreamTest.class);
@@ -66,14 +66,14 @@ class HttpServerAbortingInfiniteStreamTest {
                 writer.write(ResponseHeaders.of(HttpStatus.OK));
 
                 // Do not close the response writer because it returns data infinitely.
-                writer.onDemand(new Runnable() {
+                writer.whenConsumed().thenRun(new Runnable() {
                     @Override
                     public void run() {
                         writer.write(HttpData.ofUtf8("infinite stream"));
-                        writer.onDemand(this);
+                        writer.whenConsumed().thenRun(this);
                     }
                 });
-                writer.completionFuture().whenComplete((unused, cause) -> {
+                writer.whenComplete().whenComplete((unused, cause) -> {
                     // We are not expecting that this stream is successfully finished.
                     if (cause != null) {
                         if (ctx.sessionProtocol() == H1C) {
@@ -92,11 +92,11 @@ class HttpServerAbortingInfiniteStreamTest {
     };
 
     @ParameterizedTest
-    @EnumSource(value = SessionProtocol.class, names = { "H1C", "H2C"})
+    @EnumSource(value = SessionProtocol.class, names = { "H1C", "H2C" })
     void shouldCancelInfiniteStreamImmediately(SessionProtocol protocol) {
         expectedProtocol.set(protocol);
 
-        final HttpClient client = HttpClient.of(server.uri(protocol, "/"));
+        final WebClient client = WebClient.of(server.uri(protocol));
         final HttpResponse response = client.execute(RequestHeaders.of(HttpMethod.GET, "/infinity"));
 
         response.subscribe(new Subscriber<HttpObject>() {

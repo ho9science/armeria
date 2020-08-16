@@ -16,48 +16,56 @@
 
 package com.linecorp.armeria.unsafe.grpc;
 
-import static com.google.common.base.Preconditions.checkState;
-
 import java.util.IdentityHashMap;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.protobuf.Message;
 
 import com.linecorp.armeria.common.RequestContext;
+import com.linecorp.armeria.common.annotation.UnstableApi;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.util.AttributeKey;
 
+/**
+ * Provides utility methods useful for storing and releasing the {@link ByteBuf} backing a {@link Message}.
+ */
+@UnstableApi
 public final class GrpcUnsafeBufferUtil {
 
+    /**
+     * An {@link AttributeKey} for storing the {@link ByteBuf}s backing {@link Message}s.
+     */
     @VisibleForTesting
     public static final AttributeKey<IdentityHashMap<Object, ByteBuf>> BUFFERS = AttributeKey.valueOf(
             GrpcUnsafeBufferUtil.class, "BUFFERS");
 
     /**
-     * Stores the {@link ByteBuf} backing {@link Message} to be released later using
+     * Stores the {@link ByteBuf} backing the specified {@link Message} to be released later using
      * {@link #releaseBuffer(Object, RequestContext)}.
      */
     public static void storeBuffer(ByteBuf buf, Object message, RequestContext ctx) {
-        IdentityHashMap<Object, ByteBuf> buffers = ctx.attr(BUFFERS).get();
+        IdentityHashMap<Object, ByteBuf> buffers = ctx.attr(BUFFERS);
         if (buffers == null) {
             buffers = new IdentityHashMap<>();
-            ctx.attr(BUFFERS).set(buffers);
+            ctx.setAttr(BUFFERS, buffers);
         }
         buffers.put(message, buf);
     }
 
     /**
-     * Releases the {@link ByteBuf} backing the provided {@link Message}.
+     * Releases the {@link ByteBuf} backing the specified {@link Message}.
      */
     public static void releaseBuffer(Object message, RequestContext ctx) {
-        final IdentityHashMap<Object, ByteBuf> buffers = ctx.attr(BUFFERS).get();
-        checkState(buffers != null,
-                   "Releasing buffer even though storeBuffer has not been called.");
+        final IdentityHashMap<Object, ByteBuf> buffers = ctx.attr(BUFFERS);
+        if (buffers == null) {
+            return;
+        }
         final ByteBuf removed = buffers.remove(message);
         if (removed == null) {
-            throw new IllegalArgumentException("The provided message does not have a stored buffer.");
+            return;
         }
+
         removed.release();
     }
 

@@ -18,22 +18,24 @@ package com.linecorp.armeria.server;
 
 import static java.util.Objects.requireNonNull;
 
+import java.time.Duration;
+import java.util.function.Function;
+
 import javax.annotation.Nullable;
 
 import com.google.common.base.MoreObjects;
 
-import com.linecorp.armeria.common.HttpRequest;
-import com.linecorp.armeria.common.HttpResponse;
-import com.linecorp.armeria.common.logging.ContentPreviewerFactory;
 import com.linecorp.armeria.server.logging.AccessLogWriter;
 
-final class ServiceConfigBuilder {
+final class ServiceConfigBuilder implements ServiceConfigSetters {
 
     private final Route route;
-    private final Service<HttpRequest, HttpResponse> service;
-    @Nullable
-    private String loggerName;
+    private final HttpService service;
 
+    @Nullable
+    private String defaultServiceName;
+    @Nullable
+    private String defaultLogName;
     @Nullable
     private Long requestTimeoutMillis;
     @Nullable
@@ -41,97 +43,92 @@ final class ServiceConfigBuilder {
     @Nullable
     private Boolean verboseResponses;
     @Nullable
-    private ContentPreviewerFactory requestContentPreviewerFactory;
-    @Nullable
-    private ContentPreviewerFactory responseContentPreviewerFactory;
-    @Nullable
     private AccessLogWriter accessLogWriter;
     private boolean shutdownAccessLogWriterOnStop;
 
-    ServiceConfigBuilder(Route route, Service<HttpRequest, HttpResponse> service) {
+    ServiceConfigBuilder(Route route, HttpService service) {
         this.route = requireNonNull(route, "route");
         this.service = requireNonNull(service, "service");
     }
 
-    ServiceConfigBuilder loggerName(String loggerName) {
-        this.loggerName = requireNonNull(loggerName, "loggerName");
-        return this;
+    @Override
+    public ServiceConfigBuilder requestTimeout(Duration requestTimeout) {
+        return requestTimeoutMillis(requestTimeout.toMillis());
     }
 
-    @Nullable
-    Long requestTimeoutMillis() {
-        return requestTimeoutMillis;
-    }
-
-    ServiceConfigBuilder requestTimeoutMillis(long requestTimeoutMillis) {
+    @Override
+    public ServiceConfigBuilder requestTimeoutMillis(long requestTimeoutMillis) {
         this.requestTimeoutMillis = requestTimeoutMillis;
         return this;
     }
 
-    @Nullable
-    Long maxRequestLength() {
-        return maxRequestLength;
-    }
-
-    ServiceConfigBuilder maxRequestLength(long maxRequestLength) {
+    @Override
+    public ServiceConfigBuilder maxRequestLength(long maxRequestLength) {
         this.maxRequestLength = maxRequestLength;
         return this;
     }
 
-    @Nullable
-    Boolean verboseResponses() {
-        return verboseResponses;
-    }
-
-    ServiceConfigBuilder verboseResponses(boolean verboseResponses) {
+    @Override
+    public ServiceConfigBuilder verboseResponses(boolean verboseResponses) {
         this.verboseResponses = verboseResponses;
         return this;
     }
 
-    @Nullable
-    ContentPreviewerFactory requestContentPreviewerFactory() {
-        return requestContentPreviewerFactory;
-    }
-
-    ServiceConfigBuilder requestContentPreviewerFactory(
-            ContentPreviewerFactory requestContentPreviewerFactory) {
-        this.requestContentPreviewerFactory = requestContentPreviewerFactory;
-        return this;
-    }
-
-    @Nullable
-    ContentPreviewerFactory responseContentPreviewerFactory() {
-        return responseContentPreviewerFactory;
-    }
-
-    ServiceConfigBuilder responseContentPreviewerFactory(
-            ContentPreviewerFactory responseContentPreviewerFactory) {
-        this.responseContentPreviewerFactory = responseContentPreviewerFactory;
-        return this;
-    }
-
-    @Nullable
-    AccessLogWriter accessLogWriter() {
-        return accessLogWriter;
-    }
-
-    ServiceConfigBuilder accessLogWriter(AccessLogWriter accessLogWriter, boolean shutdownOnStop) {
+    @Override
+    public ServiceConfigBuilder accessLogWriter(AccessLogWriter accessLogWriter, boolean shutdownOnStop) {
         this.accessLogWriter = accessLogWriter;
         shutdownAccessLogWriterOnStop = shutdownOnStop;
         return this;
     }
 
-    ServiceConfig build() {
-        assert requestTimeoutMillis != null;
-        assert maxRequestLength != null;
-        assert verboseResponses != null;
-        assert requestContentPreviewerFactory != null;
-        assert responseContentPreviewerFactory != null;
-        assert accessLogWriter != null;
-        return new ServiceConfig(route, service, loggerName, requestTimeoutMillis,
-                                 maxRequestLength, verboseResponses, requestContentPreviewerFactory,
-                                 responseContentPreviewerFactory, accessLogWriter,
-                                 shutdownAccessLogWriterOnStop);
+    @Override
+    public ServiceConfigBuilder accessLogFormat(String accessLogFormat) {
+        return accessLogWriter(AccessLogWriter.custom(requireNonNull(accessLogFormat, "accessLogFormat")),
+                               true);
+    }
+
+    @Override
+    public ServiceConfigBuilder decorator(Function<? super HttpService, ? extends HttpService> decorator) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    @SafeVarargs
+    public final ServiceConfigBuilder decorators(
+            Function<? super HttpService, ? extends HttpService>... decorators) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public ServiceConfigSetters decorators(
+            Iterable<? extends Function<? super HttpService, ? extends HttpService>> decorators) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public ServiceConfigSetters defaultServiceName(String defaultServiceName) {
+        this.defaultServiceName = requireNonNull(defaultServiceName, "defaultServiceName");
+        return this;
+    }
+
+    @Override
+    public ServiceConfigSetters defaultLogName(String defaultLogName) {
+        this.defaultLogName = requireNonNull(defaultLogName, "defaultLogName");
+        return this;
+    }
+
+    ServiceConfig build(long defaultRequestTimeoutMillis,
+                        long defaultMaxRequestLength,
+                        boolean defaultVerboseResponses,
+                        AccessLogWriter defaultAccessLogWriter,
+                        boolean defaultShutdownAccessLogWriterOnStop) {
+        return new ServiceConfig(
+                route, service, defaultServiceName, defaultLogName,
+                requestTimeoutMillis != null ? requestTimeoutMillis : defaultRequestTimeoutMillis,
+                maxRequestLength != null ? maxRequestLength : defaultMaxRequestLength,
+                verboseResponses != null ? verboseResponses : defaultVerboseResponses,
+                accessLogWriter != null ? accessLogWriter : defaultAccessLogWriter,
+                accessLogWriter != null ? shutdownAccessLogWriterOnStop : defaultShutdownAccessLogWriterOnStop);
     }
 
     @Override
@@ -139,12 +136,9 @@ final class ServiceConfigBuilder {
         return MoreObjects.toStringHelper(this).omitNullValues()
                           .add("route", route)
                           .add("service", service)
-                          .add("loggerName", loggerName)
                           .add("requestTimeoutMillis", requestTimeoutMillis)
                           .add("maxRequestLength", maxRequestLength)
                           .add("verboseResponses", verboseResponses)
-                          .add("requestContentPreviewerFactory", requestContentPreviewerFactory)
-                          .add("responseContentPreviewerFactory", responseContentPreviewerFactory)
                           .add("accessLogWriter", accessLogWriter)
                           .add("shutdownAccessLogWriterOnStop", shutdownAccessLogWriterOnStop)
                           .toString();

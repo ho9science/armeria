@@ -17,9 +17,7 @@
 package com.linecorp.armeria.server;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertTrue;
+import static org.awaitility.Awaitility.await;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -29,25 +27,20 @@ import java.time.Duration;
 import java.util.concurrent.LinkedTransferQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Rule;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 import org.mockito.Mock;
-import org.mockito.junit.MockitoJUnit;
-import org.mockito.junit.MockitoRule;
 
 import com.google.common.base.Ticker;
 
-import com.linecorp.armeria.common.util.EventLoopThreadFactory;
+import com.linecorp.armeria.common.util.ThreadFactories;
 
-public class GracefulShutdownSupportTest {
+class GracefulShutdownSupportTest {
 
     private static final long QUIET_PERIOD_NANOS = 10000;
-
-    @Rule
-    public MockitoRule rule = MockitoJUnit.rule();
 
     @Mock
     private Ticker ticker;
@@ -55,32 +48,37 @@ public class GracefulShutdownSupportTest {
     private GracefulShutdownSupport support;
     private ThreadPoolExecutor executor;
 
-    @Before
-    public void setUp() {
+    @BeforeEach
+    void setUp() {
         executor = new ThreadPoolExecutor(
                 0, 1, 1, TimeUnit.SECONDS, new LinkedTransferQueue<>(),
-                new EventLoopThreadFactory("graceful-shutdown-test", true));
+                ThreadFactories.newEventLoopThreadFactory("graceful-shutdown-test", true));
 
         support = GracefulShutdownSupport.create(Duration.ofNanos(QUIET_PERIOD_NANOS), executor, ticker);
     }
 
-    @After
-    public void tearDown() {
+    @AfterEach
+    void tearDown() {
         executor.shutdownNow();
     }
 
     @Test
-    public void testDisabled() {
+    void testDisabled() {
         final GracefulShutdownSupport support = GracefulShutdownSupport.createDisabled();
         assertThat(support.isShuttingDown()).isFalse();
         assertThat(support.completedQuietPeriod()).isTrue();
         assertThat(support.isShuttingDown()).isTrue();
         support.inc();
+        assertThat(support.pendingResponses()).isOne();
         assertThat(support.completedQuietPeriod()).isTrue();
+
+        // pendingResponses must be updated even if disabled, because it's part of metrics.
+        support.dec();
+        assertThat(support.pendingResponses()).isZero();
     }
 
     @Test
-    public void testIsShutdown() {
+    void testIsShutdown() {
         // completedQuietPeriod() must make isShuttingDown() start to return true.
         assertThat(support.isShuttingDown()).isFalse();
         support.completedQuietPeriod();
@@ -88,17 +86,17 @@ public class GracefulShutdownSupportTest {
     }
 
     @Test
-    public void noRequestsNotPassedQuietPeriod() {
-        assertWithoutPendingTasks(false, 0, 1, QUIET_PERIOD_NANOS - 1);
+    void noRequestsNotPassedQuietPeriod() {
+        assertWithoutPendingTasks(false, 0, 43, QUIET_PERIOD_NANOS - 1);
     }
 
     @Test
-    public void noRequestsPassedQuietPeriod() {
-        assertWithoutPendingTasks(true, 0, -QUIET_PERIOD_NANOS * 2, QUIET_PERIOD_NANOS);
+    void noRequestsPassedQuietPeriod() {
+        assertWithoutPendingTasks(true, 0, -43, QUIET_PERIOD_NANOS);
     }
 
     @Test
-    public void activeRequestsNotPassedQuietPeriod() throws Exception {
+    void activeRequestsNotPassedQuietPeriod() throws Exception {
         support.inc();
         support.inc();
         verify(ticker, never()).read();
@@ -110,7 +108,7 @@ public class GracefulShutdownSupportTest {
     }
 
     @Test
-    public void activeRequestsPassedQuietPeriod() throws Exception {
+    void activeRequestsPassedQuietPeriod() throws Exception {
         support.inc();
         support.inc();
         verify(ticker, never()).read();
@@ -118,11 +116,12 @@ public class GracefulShutdownSupportTest {
         support.dec();
         verify(ticker, times(1)).read();
 
-        assertWithPendingTasks(1, 1);
+        assertWithPendingTasks(1, 3);
     }
 
     @Test
-    public void noActiveRequestsNotPassedQuietPeriod() throws Exception {
+    void noActiveRequestsNotPassedQuietPeriod() throws Exception {
+        when(ticker.read()).thenReturn(1L);
         support.inc();
         support.inc();
         verify(ticker, never()).read();
@@ -133,11 +132,12 @@ public class GracefulShutdownSupportTest {
         support.dec();
         verify(ticker, times(2)).read();
 
-        assertWithoutPendingTasks(false, 2, 1, QUIET_PERIOD_NANOS - 1);
+        assertWithoutPendingTasks(false, 2, 3, QUIET_PERIOD_NANOS - 1);
     }
 
     @Test
-    public void noActiveRequestsPassedQuietPeriod() throws Exception {
+    void noActiveRequestsPassedQuietPeriod() throws Exception {
+        when(ticker.read()).thenReturn(1L);
         support.inc();
         support.inc();
         verify(ticker, never()).read();
@@ -147,28 +147,26 @@ public class GracefulShutdownSupportTest {
         support.dec();
         verify(ticker, times(2)).read();
 
-        assertWithoutPendingTasks(true, 2, QUIET_PERIOD_NANOS, QUIET_PERIOD_NANOS);
+        assertWithoutPendingTasks(true, 2, 3, QUIET_PERIOD_NANOS);
     }
 
     @Test
-    public void activeBlockingTaskNotPassedQuietPeriod() throws Exception {
+    void activeBlockingTaskNotPassedQuietPeriod() throws Exception {
         submitLongTask();
         assertWithPendingTasks(0, -42);
     }
 
     @Test
-    public void activeBlockingTaskPassedQuietPeriod() throws Exception {
+    void activeBlockingTaskPassedQuietPeriod() throws Exception {
         submitLongTask();
         assertWithPendingTasks(0, 42);
     }
 
     @Test
-    public void testQuietPeriodExtensionOnRequest() throws Exception {
-        final long deltaNanos = QUIET_PERIOD_NANOS / 2;
-        long timeNanos = 0;
-
-        when(ticker.read()).thenReturn(timeNanos);
-        assertFalse(support.completedQuietPeriod());
+    void testQuietPeriodExtensionOnRequest() throws Exception {
+        // Shutdown starts at T+1ns.
+        when(ticker.read()).thenReturn(1L);
+        assertThat(support.completedQuietPeriod()).isFalse();
         verify(ticker, times(2)).read();
 
         // Handle a request during the quiet period.
@@ -176,25 +174,23 @@ public class GracefulShutdownSupportTest {
         verify(ticker, times(2)).read();
 
         // Even during the quiet period, pending request will fail the check.
-        assertFalse(support.completedQuietPeriod());
+        assertThat(support.completedQuietPeriod()).isFalse();
         verify(ticker, times(2)).read();
 
         // Handle a response so that there are no pending requests left.
-        timeNanos += deltaNanos;
-        when(ticker.read()).thenReturn(timeNanos);
+        // The quiet period will be extended by 2ns because the response is handled at T+3ns.
+        when(ticker.read()).thenReturn(3L);
         support.dec();
         verify(ticker, times(3)).read();
 
-        // The quiet period should be extended by 'deltaNanos' due to the response handled above.
-        timeNanos += deltaNanos;
-        when(ticker.read()).thenReturn(timeNanos);
-        assertFalse(support.completedQuietPeriod());
+        // The quiet period should not end before 'T+(3ns+QUIET_PERIOD_NANOS)'.
+        when(ticker.read()).thenReturn(QUIET_PERIOD_NANOS + 2);
+        assertThat(support.completedQuietPeriod()).isFalse();
         verify(ticker, times(4)).read();
 
-        // The quiet period should end after 'QUIET_PERIOD_NANOS + deltaNanos'.
-        timeNanos += deltaNanos;
-        when(ticker.read()).thenReturn(timeNanos);
-        assertTrue(support.completedQuietPeriod());
+        // The quiet period should end at 'T+(3ns+QUIET_PERIOD_NANOS)'.
+        when(ticker.read()).thenReturn(QUIET_PERIOD_NANOS + 3);
+        assertThat(support.completedQuietPeriod()).isTrue();
         verify(ticker, times(5)).read();
     }
 
@@ -204,11 +200,11 @@ public class GracefulShutdownSupportTest {
         // First completedQuietPeriod() should always return false,
         // because it considered its first invocation as the beginning of the graceful shutdown.
         when(ticker.read()).thenReturn(shutdownStartTimeNanos);
-        assertFalse(support.completedQuietPeriod());
+        assertThat(support.completedQuietPeriod()).isFalse();
         verify(ticker, times(numTickerReadsSoFar += 2)).read();
 
         when(ticker.read()).thenReturn(shutdownStartTimeNanos + elapsedTimeNanos);
-        assertEquals(expectedReturnValue, support.completedQuietPeriod());
+        assertThat(support.completedQuietPeriod()).isEqualTo(expectedReturnValue);
         verify(ticker, times(numTickerReadsSoFar + 1)).read();
     }
 
@@ -216,20 +212,23 @@ public class GracefulShutdownSupportTest {
         // First completedQuietPeriod() should always return false,
         // because it considered its first invocation as the beginning of the graceful shutdown.
         when(ticker.read()).thenReturn(shutdownStartTimeNanos);
-        assertFalse(support.completedQuietPeriod());
+        assertThat(support.completedQuietPeriod()).isFalse();
         verify(ticker, times(++numTickerReadsSoFar)).read();
 
-        assertFalse(support.completedQuietPeriod());
+        assertThat(support.completedQuietPeriod()).isFalse();
         verify(ticker, times(numTickerReadsSoFar)).read();
     }
 
     private void submitLongTask() {
+        final AtomicBoolean running = new AtomicBoolean();
         executor.execute(() -> {
+            running.set(true);
             try {
-                Thread.sleep(10000);
+                Thread.sleep(100000);
             } catch (InterruptedException ignored) {
                 // Ignored
             }
         });
+        await().untilTrue(running);
     }
 }

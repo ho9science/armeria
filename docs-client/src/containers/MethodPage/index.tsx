@@ -45,6 +45,86 @@ interface OwnProps {
   specification: Specification;
 }
 
+function getExampleHeaders(
+  specification: Specification,
+  service: Service,
+  method: Method,
+): Option[] {
+  const exampleHeaders: Option[] = [];
+  addExampleHeadersIfExists(exampleHeaders, method.exampleHeaders);
+  addExampleHeadersIfExists(exampleHeaders, service.exampleHeaders);
+  addExampleHeadersIfExists(exampleHeaders, specification.getExampleHeaders());
+  return exampleHeaders;
+}
+
+function addExampleHeadersIfExists(
+  dst: Option[],
+  src: { [name: string]: string }[],
+) {
+  if (src.length > 0) {
+    for (const headers of src) {
+      dst.push({
+        value: JSON.stringify(headers, null, 2),
+        label: removeBrackets(JSON.stringify(headers).trim()),
+      });
+    }
+  }
+}
+
+function getExamplePaths(
+  specification: Specification,
+  service: Service,
+  method: Method,
+): Option[] {
+  return (
+    specification
+      .getServiceByName(service.name)
+      ?.methods?.find((m) => m.name === method.name)
+      ?.examplePaths?.map((path) => {
+        return { label: path, value: path };
+      }) || []
+  );
+}
+
+function getExampleQueries(
+  specification: Specification,
+  service: Service,
+  method: Method,
+): Option[] {
+  return (
+    specification
+      .getServiceByName(service.name)
+      ?.methods?.find((m) => m.name === method.name)
+      ?.exampleQueries?.map((queries) => {
+        return { label: queries, value: queries };
+      }) || []
+  );
+}
+
+function removeBrackets(headers: string): string {
+  const length = headers.length;
+  return headers.substring(1, length - 1).trim();
+}
+
+function isSingleExactPathMapping(method: Method): boolean {
+  const endpoints = method.endpoints;
+  return (
+    method.endpoints.length === 1 &&
+    endpoints[0].pathMapping.startsWith('exact:')
+  );
+}
+
+const requestBodyAllowedHttpMethods: string[] = [
+  'POST',
+  'PUT',
+  'PATCH',
+  'DELETE',
+];
+
+function needsToUseRequestBody(httpMethod: string) {
+  return requestBodyAllowedHttpMethods.includes(httpMethod);
+}
+
 type Props = OwnProps &
   RouteComponentProps<{
     serviceName: string;
@@ -52,22 +132,25 @@ type Props = OwnProps &
     httpMethod: string;
   }>;
 
-const MethodPage: React.SFC<Props> = (props) => {
+const MethodPage: React.FunctionComponent<Props> = (props) => {
   const service = props.specification.getServiceByName(
     props.match.params.serviceName,
   );
   if (!service) {
     return <>Not found.</>;
   }
+
   const method = service.methods.find(
-    (m) => m.name === props.match.params.methodName,
+    (m) =>
+      m.name === props.match.params.methodName &&
+      m.httpMethod === props.match.params.httpMethod,
   );
   if (!method) {
     return <>Not found.</>;
   }
 
   const debugTransport = TRANSPORTS.getDebugTransport(method);
-  const isAnnotatedHttpService =
+  const isAnnotatedService =
     debugTransport !== undefined &&
     debugTransport.supportsMimeType(ANNOTATED_HTTP_MIME_TYPE);
 
@@ -84,7 +167,6 @@ const MethodPage: React.SFC<Props> = (props) => {
           key={method.name}
           title="Parameters"
           variables={method.parameters}
-          hasLocation={isAnnotatedHttpService}
           specification={props.specification}
         />
       </Section>
@@ -104,7 +186,7 @@ const MethodPage: React.SFC<Props> = (props) => {
           </TableBody>
         </Table>
       </Section>
-      {!isAnnotatedHttpService && (
+      {!isAnnotatedService && (
         <Exceptions method={method} specification={props.specification} />
       )}
       <Endpoints method={method} />
@@ -112,68 +194,26 @@ const MethodPage: React.SFC<Props> = (props) => {
         <DebugPage
           {...props}
           method={method}
-          isAnnotatedHttpService={isAnnotatedHttpService}
+          isAnnotatedService={isAnnotatedService}
           exampleHeaders={getExampleHeaders(
             props.specification,
             service,
             method,
           )}
+          examplePaths={getExamplePaths(props.specification, service, method)}
+          exampleQueries={getExampleQueries(
+            props.specification,
+            service,
+            method,
+          )}
           exactPathMapping={
-            isAnnotatedHttpService ? isExactPathMapping(method) : false
+            isAnnotatedService ? isSingleExactPathMapping(method) : false
           }
-          useRequestBody={useRequestBody(props.match.params.httpMethod)}
+          useRequestBody={needsToUseRequestBody(props.match.params.httpMethod)}
         />
       )}
     </>
   );
 };
 
-function getExampleHeaders(
-  specification: Specification,
-  service: Service,
-  method: Method,
-): Option[] {
-  const exampleHeaders: Option[] = [];
-  addExampleHeadersIfExists(exampleHeaders, method.exampleHttpHeaders);
-  addExampleHeadersIfExists(exampleHeaders, service.exampleHttpHeaders);
-  addExampleHeadersIfExists(
-    exampleHeaders,
-    specification.getExampleHttpHeaders(),
-  );
-  return exampleHeaders;
-}
-
-function addExampleHeadersIfExists(
-  dst: Option[],
-  src: { [name: string]: string }[],
-) {
-  if (src.length > 0) {
-    for (const headers of src) {
-      dst.push({
-        value: JSON.stringify(headers, null, 2),
-        label: removeBrackets(JSON.stringify(headers).trim()),
-      });
-    }
-  }
-}
-
-function removeBrackets(headers: string): string {
-  const length = headers.length;
-  return headers.substring(1, length - 1).trim();
-}
-
-function isExactPathMapping(method: Method): boolean {
-  const endpoints = method.endpoints;
-  if (endpoints.length !== 1) {
-    throw new Error(`
-    Endpoints size should be 1 to determine prefix or regex. size: ${endpoints.length}`);
-  }
-  const endpoint = endpoints[0];
-  return endpoint.pathMapping.startsWith('exact:');
-}
-
-function useRequestBody(httpMethod: string) {
-  return httpMethod === 'POST' || httpMethod === 'PUT';
-}
-
-export default MethodPage;
+export default React.memo(MethodPage);

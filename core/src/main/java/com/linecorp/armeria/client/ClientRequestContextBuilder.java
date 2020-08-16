@@ -17,8 +17,10 @@ package com.linecorp.armeria.client;
 
 import static java.util.Objects.requireNonNull;
 
-import java.net.InetSocketAddress;
+import java.net.SocketAddress;
 import java.net.URI;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import javax.annotation.Nullable;
 import javax.net.ssl.SSLSession;
@@ -26,12 +28,18 @@ import javax.net.ssl.SSLSession;
 import com.linecorp.armeria.common.AbstractRequestContextBuilder;
 import com.linecorp.armeria.common.HttpMethod;
 import com.linecorp.armeria.common.HttpRequest;
+import com.linecorp.armeria.common.RequestId;
 import com.linecorp.armeria.common.RpcRequest;
 import com.linecorp.armeria.common.SessionProtocol;
+import com.linecorp.armeria.common.logging.ClientConnectionTimings;
+import com.linecorp.armeria.common.util.SystemInfo;
+import com.linecorp.armeria.internal.common.TimeoutScheduler;
+import com.linecorp.armeria.internal.common.TimeoutScheduler.TimeoutTask;
 
 import io.micrometer.core.instrument.MeterRegistry;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.channel.EventLoop;
+import io.netty.util.concurrent.ImmediateEventExecutor;
 
 /**
  * Builds a new {@link ClientRequestContext}. Note that it is not usually required to create a new context by
@@ -40,40 +48,40 @@ import io.netty.channel.EventLoop;
  */
 public final class ClientRequestContextBuilder extends AbstractRequestContextBuilder {
 
-    /**
-     * Returns a new {@link ClientRequestContextBuilder} created from the specified {@link HttpRequest}.
-     */
-    public static ClientRequestContextBuilder of(HttpRequest request) {
-        return new ClientRequestContextBuilder(request);
-    }
+    private static final TimeoutTask noopTimeoutTask = new TimeoutTask() {
+        @Override
+        public boolean canSchedule() {
+            return true;
+        }
+
+        @Override
+        public void run() { /* no-op */ }
+    };
 
     /**
-     * Returns a new {@link ClientRequestContextBuilder} created from the specified {@link RpcRequest} and URI.
+     * A timeout scheduler that has been timed-out.
      */
-    public static ClientRequestContextBuilder of(RpcRequest request, String uri) {
-        return of(request, URI.create(requireNonNull(uri, "uri")));
-    }
+    private static final TimeoutScheduler noopResponseTimeoutScheduler = new TimeoutScheduler(0);
 
-    /**
-     * Returns a new {@link ClientRequestContextBuilder} created from the specified {@link RpcRequest} and
-     * {@link URI}.
-     */
-    public static ClientRequestContextBuilder of(RpcRequest request, URI uri) {
-        return new ClientRequestContextBuilder(request, uri);
+    static {
+        noopResponseTimeoutScheduler.init(ImmediateEventExecutor.INSTANCE, noopTimeoutTask, 0);
+        noopResponseTimeoutScheduler.timeoutNow();
     }
 
     @Nullable
     private final String fragment;
     @Nullable
     private Endpoint endpoint;
-    private ClientOptions options = ClientOptions.DEFAULT;
+    private ClientOptions options = ClientOptions.of();
+    @Nullable
+    private ClientConnectionTimings connectionTimings;
 
-    private ClientRequestContextBuilder(HttpRequest request) {
+    ClientRequestContextBuilder(HttpRequest request) {
         super(false, request);
         fragment = null;
     }
 
-    private ClientRequestContextBuilder(RpcRequest request, URI uri) {
+    ClientRequestContextBuilder(RpcRequest request, URI uri) {
         super(false, request, uri);
         fragment = uri.getRawFragment();
     }
@@ -93,10 +101,18 @@ public final class ClientRequestContextBuilder extends AbstractRequestContextBui
     }
 
     /**
-     * Sets the {@link ClientOptions} of the client. If not set, {@link ClientOptions#DEFAULT} is used.
+     * Sets the {@link ClientOptions} of the client. If not set, {@link ClientOptions#of()} is used.
      */
     public ClientRequestContextBuilder options(ClientOptions options) {
         this.options = requireNonNull(options, "options");
+        return this;
+    }
+
+    /**
+     * Sets the {@link ClientConnectionTimings} of the request.
+     */
+    public ClientRequestContextBuilder connectionTimings(ClientConnectionTimings connectionTimings) {
+        this.connectionTimings = requireNonNull(connectionTimings, "connectionTimings");
         return this;
     }
 
@@ -111,23 +127,41 @@ public final class ClientRequestContextBuilder extends AbstractRequestContextBui
             endpoint = Endpoint.parse(authority());
         }
 
+        final TimeoutScheduler responseTimeoutScheduler;
+        if (timedOut()) {
+            responseTimeoutScheduler = noopResponseTimeoutScheduler;
+        } else {
+            responseTimeoutScheduler = new TimeoutScheduler(0);
+            final CountDownLatch latch = new CountDownLatch(1);
+            eventLoop().execute(() -> {
+                responseTimeoutScheduler.init(eventLoop(), noopTimeoutTask, 0);
+                latch.countDown();
+            });
+
+            try {
+                latch.await(1000, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException ignored) {
+            }
+        }
+
         final DefaultClientRequestContext ctx = new DefaultClientRequestContext(
                 eventLoop(), meterRegistry(), sessionProtocol(),
-                method(), path(), query(), fragment, options, request());
+                id(), method(), path(), query(), fragment, options, request(), rpcRequest(),
+                responseTimeoutScheduler,
+                isRequestStartTimeSet() ? requestStartTimeNanos() : System.nanoTime(),
+                isRequestStartTimeSet() ? requestStartTimeMicros() : SystemInfo.currentTimeMicros());
+
         ctx.init(endpoint);
+        ctx.logBuilder().session(fakeChannel(), sessionProtocol(), sslSession(), connectionTimings);
 
-        if (isRequestStartTimeSet()) {
-            ctx.logBuilder().startRequest(fakeChannel(), sessionProtocol(), sslSession(),
-                                          requestStartTimeNanos(), requestStartTimeMicros());
-        } else {
-            ctx.logBuilder().startRequest(fakeChannel(), sessionProtocol(), sslSession());
+        if (request() != null) {
+            ctx.logBuilder().requestHeaders(request().headers());
         }
 
-        if (request() instanceof HttpRequest) {
-            ctx.logBuilder().requestHeaders(((HttpRequest) request()).headers());
-        } else {
-            ctx.logBuilder().requestContent(request(), null);
+        if (rpcRequest() != null) {
+            ctx.logBuilder().requestContent(rpcRequest(), null);
         }
+
         return ctx;
     }
 
@@ -154,12 +188,17 @@ public final class ClientRequestContextBuilder extends AbstractRequestContextBui
     }
 
     @Override
-    public ClientRequestContextBuilder remoteAddress(InetSocketAddress remoteAddress) {
+    public ClientRequestContextBuilder id(RequestId id) {
+        return (ClientRequestContextBuilder) super.id(id);
+    }
+
+    @Override
+    public ClientRequestContextBuilder remoteAddress(SocketAddress remoteAddress) {
         return (ClientRequestContextBuilder) super.remoteAddress(remoteAddress);
     }
 
     @Override
-    public ClientRequestContextBuilder localAddress(InetSocketAddress localAddress) {
+    public ClientRequestContextBuilder localAddress(SocketAddress localAddress) {
         return (ClientRequestContextBuilder) super.localAddress(localAddress);
     }
 
@@ -173,5 +212,10 @@ public final class ClientRequestContextBuilder extends AbstractRequestContextBui
                                                         long requestStartTimeMicros) {
         return (ClientRequestContextBuilder) super.requestStartTime(requestStartTimeNanos,
                                                                     requestStartTimeMicros);
+    }
+
+    @Override
+    public ClientRequestContextBuilder timedOut(boolean timedOut) {
+        return (ClientRequestContextBuilder) super.timedOut(timedOut);
     }
 }

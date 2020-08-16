@@ -16,18 +16,19 @@
 
 package com.linecorp.armeria.server.brave;
 
-import java.net.SocketAddress;
-
 import com.linecorp.armeria.common.RpcRequest;
 import com.linecorp.armeria.common.logging.RequestLog;
-import com.linecorp.armeria.internal.brave.SpanTags;
+import com.linecorp.armeria.internal.common.brave.SpanTags;
+import com.linecorp.armeria.server.ServiceRequestContext;
 
 import brave.SpanCustomizer;
-import brave.http.HttpAdapter;
-import brave.http.HttpServerParser;
+import brave.http.HttpRequestParser;
+import brave.http.HttpResponse;
+import brave.http.HttpResponseParser;
+import brave.propagation.TraceContext;
 
 /**
- * Default implementation of {@link HttpServerParser}.
+ * Default implementation of {@link HttpRequestParser} and {@link HttpResponseParser} for servers.
  * This parser adds some custom tags and overwrites the name of span if {@link RequestLog#requestContent()}
  * is {@link RpcRequest}.
  * The following tags become available:
@@ -40,7 +41,7 @@ import brave.http.HttpServerParser;
  *   <li>address.local</li>
  * </ul>
  */
-final class ArmeriaHttpServerParser extends HttpServerParser {
+final class ArmeriaHttpServerParser implements HttpRequestParser, HttpResponseParser {
 
     private static final ArmeriaHttpServerParser INSTANCE = new ArmeriaHttpServerParser();
 
@@ -52,34 +53,41 @@ final class ArmeriaHttpServerParser extends HttpServerParser {
     }
 
     @Override
-    public <T> void response(HttpAdapter<?, T> rawAdapter, T res, Throwable error, SpanCustomizer customizer) {
-        super.response(rawAdapter, res, error, customizer);
-        if (res instanceof RequestLog && rawAdapter instanceof ArmeriaHttpServerAdapter) {
-            final RequestLog requestLog = (RequestLog) res;
-            final ArmeriaHttpServerAdapter adapter = (ArmeriaHttpServerAdapter) rawAdapter;
-            customizer.tag(SpanTags.TAG_HTTP_HOST, adapter.authority(requestLog))
-                      .tag(SpanTags.TAG_HTTP_URL, adapter.url(requestLog))
-                      .tag(SpanTags.TAG_HTTP_PROTOCOL, adapter.protocol(requestLog));
+    public void parse(brave.http.HttpRequest request, TraceContext context, SpanCustomizer span) {
+        HttpRequestParser.DEFAULT.parse(request, context, span);
 
-            final String serFmt = adapter.serializationFormat(requestLog);
-            if (serFmt != null) {
-                customizer.tag(SpanTags.TAG_HTTP_SERIALIZATION_FORMAT, serFmt);
-            }
+        final Object unwrapped = request.unwrap();
+        if (!(unwrapped instanceof ServiceRequestContext)) {
+            return;
+        }
 
-            final SocketAddress raddr = requestLog.context().remoteAddress();
-            if (raddr != null) {
-                customizer.tag(SpanTags.TAG_ADDRESS_REMOTE, raddr.toString());
-            }
+        final ServiceRequestContext ctx = (ServiceRequestContext) unwrapped;
+        span.tag(SpanTags.TAG_HTTP_HOST, ctx.request().authority())
+            .tag(SpanTags.TAG_HTTP_URL, ctx.request().uri().toString())
+            .tag(SpanTags.TAG_HTTP_PROTOCOL, ctx.sessionProtocol().uriText())
+            .tag(SpanTags.TAG_ADDRESS_REMOTE, ctx.remoteAddress().toString())
+            .tag(SpanTags.TAG_ADDRESS_LOCAL, ctx.localAddress().toString());
+    }
 
-            final SocketAddress laddr = requestLog.context().localAddress();
-            if (laddr != null) {
-                customizer.tag(SpanTags.TAG_ADDRESS_LOCAL, laddr.toString());
-            }
+    @Override
+    public void parse(HttpResponse response, TraceContext context, SpanCustomizer span) {
+        HttpResponseParser.DEFAULT.parse(response, context, span);
 
-            final String rpcMethod = adapter.rpcMethod(requestLog);
-            if (rpcMethod != null) {
-                customizer.name(rpcMethod);
-            }
+        final Object res = response.unwrap();
+        if (!(res instanceof ServiceRequestContext)) {
+            return;
+        }
+
+        final ServiceRequestContext ctx = (ServiceRequestContext) res;
+        final RequestLog requestLog = ctx.log().ensureComplete();
+        final String serFmt = ServiceRequestContextAdapter.serializationFormat(requestLog);
+        if (serFmt != null) {
+            span.tag(SpanTags.TAG_HTTP_SERIALIZATION_FORMAT, serFmt);
+        }
+
+        final String name = requestLog.name();
+        if (name != null) {
+            span.name(name);
         }
     }
 }

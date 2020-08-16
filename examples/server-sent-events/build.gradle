@@ -1,10 +1,18 @@
-dependencies {
-    compile project(':core')
-    compile 'io.projectreactor:reactor-core'
-    runtime 'org.slf4j:slf4j-simple'
+plugins {
+    id 'application'
+}
 
-    testCompile 'io.projectreactor:reactor-test'
-    testCompile 'junit:junit'
-    testCompile 'net.javacrumbs.json-unit:json-unit-fluent'
-    testCompile 'org.assertj:assertj-core'
+dependencies {
+    implementation project(':core')
+    implementation 'io.projectreactor:reactor-core'
+    runtimeOnly 'org.slf4j:slf4j-simple'
+
+    testImplementation 'io.projectreactor:reactor-test'
+    testImplementation 'net.javacrumbs.json-unit:json-unit-fluent'
+    testImplementation 'org.assertj:assertj-core'
+    testImplementation 'org.junit.jupiter:junit-jupiter-api'
+}
+
+application {
+    mainClassName = 'example.armeria.server.sse.Main'
 }

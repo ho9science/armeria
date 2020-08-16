@@ -16,7 +16,9 @@
 
 package com.linecorp.armeria.server;
 
-import static com.linecorp.armeria.server.RouteCache.wrapCompositeServiceRouter;
+import static com.google.common.collect.ImmutableList.toImmutableList;
+import static com.google.common.collect.ImmutableSet.toImmutableSet;
+import static com.linecorp.armeria.server.RouteCache.wrapRouteDecoratingServiceRouter;
 import static com.linecorp.armeria.server.RouteCache.wrapVirtualHostRouter;
 import static java.util.Objects.requireNonNull;
 
@@ -25,12 +27,15 @@ import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.BiConsumer;
 import java.util.function.Function;
+import java.util.stream.StreamSupport;
 
 import javax.annotation.Nullable;
 
@@ -39,11 +44,6 @@ import org.slf4j.LoggerFactory;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
-
-import com.linecorp.armeria.common.Request;
-import com.linecorp.armeria.common.Response;
-import com.linecorp.armeria.server.RoutingTrie.Builder;
-import com.linecorp.armeria.server.composition.CompositeServiceEntry;
 
 /**
  * A factory that creates a {@link Router} instance.
@@ -70,36 +70,55 @@ public final class Routers {
                             RejectedRouteHandler.class.getSimpleName(), e);
             }
         };
-
-        return wrapVirtualHostRouter(defaultRouter(configs, ServiceConfig::route, rejectionConsumer));
+        final Set<Route> ambiguousRoutes =
+                resolveAmbiguousRoutes(StreamSupport.stream(configs.spliterator(), false)
+                                                    .map(ServiceConfig::route)
+                                                    .collect(toImmutableList()));
+        return wrapVirtualHostRouter(defaultRouter(configs, virtualHost.fallbackServiceConfig(),
+                                                   ServiceConfig::route, rejectionConsumer),
+                                     ambiguousRoutes);
     }
 
     /**
-     * Returns the default implementation of the {@link Router} to find a {@link CompositeServiceEntry}.
+     * Returns the default implementation of the {@link Router} to find a {@link RouteDecoratingService}.
      */
-    public static <I extends Request, O extends Response> Router<Service<I, O>> ofCompositeService(
-            List<CompositeServiceEntry<I, O>> entries) {
-        requireNonNull(entries, "entries");
+    public static Router<RouteDecoratingService> ofRouteDecoratingService(
+            List<RouteDecoratingService> routeDecoratingServices) {
+        return wrapRouteDecoratingServiceRouter(
+                defaultRouter(routeDecoratingServices, null,
+                              RouteDecoratingService::route,
+                              (route1, route2) -> {/* noop */}),
+                resolveAmbiguousRoutes(routeDecoratingServices.stream()
+                                                              .map(RouteDecoratingService::route)
+                                                              .collect(toImmutableList())));
+    }
 
-        final Router<CompositeServiceEntry<I, O>> delegate = wrapCompositeServiceRouter(defaultRouter(
-                entries, CompositeServiceEntry::route,
-                (mapping, existingMapping) -> {
-                    final String a = mapping.toString();
-                    final String b = existingMapping.toString();
-                    if (a.equals(b)) {
-                        throw new IllegalStateException(
-                                "Your composite service has a duplicate path mapping: " + a);
-                    }
-
-                    throw new IllegalStateException(
-                            "Your composite service has path mappings with a conflict: " +
-                            a + " vs. " + b);
-                }));
-
-        return new CompositeRouter<>(delegate, result ->
-                result.isPresent() ? Routed.of(result.route(), result.routingResult(),
-                                               result.value().service())
-                                   : Routed.empty());
+    /**
+     * Finds the {@link Route}s that are not unique based on the following properties.
+     * <ul>
+     *     <li>{@link Route#pathType()}</li>
+     *     <li>{@link Route#paths()}</li>
+     *     <li>{@link Route#methods()}</li>
+     *     <li>{@link Route#consumes()}</li>
+     *     <li>{@link Route#produces()}</li>
+     * </ul>
+     */
+    private static Set<Route> resolveAmbiguousRoutes(List<Route> allRoutes) {
+        final Map<List<Object>, List<Route>> dup = new HashMap<>();
+        allRoutes.forEach(route -> {
+            final List<Object> key = ImmutableList.builder()
+                                                  .add(route.pathType())
+                                                  .addAll(route.paths())
+                                                  .addAll(route.methods())
+                                                  .addAll(route.consumes())
+                                                  .addAll(route.produces())
+                                                  .build();
+            dup.computeIfAbsent(key, unused -> new ArrayList<>())
+               .add(route);
+        });
+        return dup.values().stream()
+                  .filter(routes -> routes.size() > 1)  // ambiguous routes
+                  .flatMap(Collection::stream).collect(toImmutableSet());
     }
 
     /**
@@ -108,10 +127,10 @@ public final class Routers {
      * it is able to produce trie path string or not while traversing the list, then each group would be
      * transformed to a {@link Router}.
      */
-    private static <V> Router<V> defaultRouter(Iterable<V> values,
+    private static <V> Router<V> defaultRouter(Iterable<V> values, @Nullable V fallbackValue,
                                                Function<V, Route> routeResolver,
                                                BiConsumer<Route, Route> rejectionHandler) {
-        return new CompositeRouter<>(routers(values, routeResolver, rejectionHandler),
+        return new CompositeRouter<>(routers(values, fallbackValue, routeResolver, rejectionHandler),
                                      Function.identity());
     }
 
@@ -119,7 +138,8 @@ public final class Routers {
      * Returns a list of {@link Router}s.
      */
     @VisibleForTesting
-    static <V> List<Router<V>> routers(Iterable<V> values, Function<V, Route> routeResolver,
+    static <V> List<Router<V>> routers(Iterable<V> values, @Nullable V fallbackValue,
+                                       Function<V, Route> routeResolver,
                                        BiConsumer<Route, Route> rejectionHandler) {
         rejectDuplicateMapping(values, routeResolver, rejectionHandler);
 
@@ -139,13 +159,13 @@ public final class Routers {
 
             // Changed the router type.
             if (!group.isEmpty()) {
-                builder.add(router(addingTrie, group, routeResolver));
+                builder.add(router(addingTrie, group, fallbackValue, routeResolver));
             }
             addingTrie = !addingTrie;
             group.add(value);
         }
         if (!group.isEmpty()) {
-            builder.add(router(addingTrie, group, routeResolver));
+            builder.add(router(addingTrie, group, fallbackValue, routeResolver));
         }
         return builder.build();
     }
@@ -171,11 +191,6 @@ public final class Routers {
 
                 if (route.getClass() != existingRoute.getClass()) {
                     continue;
-                }
-
-                if (route.complexity() == 0) {
-                    rejectionHandler.accept(route, existingRoute);
-                    return;
                 }
 
                 if (route.methods().stream().noneMatch(
@@ -207,18 +222,31 @@ public final class Routers {
     /**
      * Returns a {@link Router} implementation which is using one of {@link RoutingTrie} and {@link List}.
      */
-    private static <V> Router<V> router(boolean isTrie, List<V> values,
+    private static <V> Router<V> router(boolean isTrie, List<V> values, @Nullable V fallbackValue,
                                         Function<V, Route> routeResolver) {
         final Comparator<V> valueComparator =
                 Comparator.comparingInt(e -> -1 * routeResolver.apply(e).complexity());
 
         final Router<V> router;
         if (isTrie) {
-            final RoutingTrie.Builder<V> builder = new Builder<>();
-            // Set a comparator to sort services by the number of conditions to be checked in a descending
-            // order.
+            final RoutingTrieBuilder<V> builder = new RoutingTrieBuilder<>();
+            // Set a comparator to sort services by the number of conditions to check in a descending order.
             builder.comparator(valueComparator);
-            values.forEach(v -> builder.add(routeResolver.apply(v).paths().get(1), v));
+            for (V v : values) {
+                final Route route = routeResolver.apply(v);
+                builder.add(route.paths().get(1), v);
+
+                if (fallbackValue != null) {
+                    // Add an extra route without a trailing slash for a redirect.
+                    // Note that `path.length()` must be greater than 1 because path is `/` when 1.
+                    final String path = route.paths().get(0);
+                    final int pathLen = path.length();
+                    if (pathLen > 1 && path.charAt(pathLen - 1) == '/') {
+                        builder.add(path.substring(0, pathLen - 1),
+                                    fallbackValue, /* hasHighPrecedence */ false);
+                    }
+                }
+            }
             router = new TrieRouter<>(builder.build(), routeResolver);
         } else {
             values.sort(valueComparator);
@@ -228,10 +256,10 @@ public final class Routers {
         if (logger.isDebugEnabled()) {
             logger.debug("Router created for {} service(s): {}",
                          values.size(), router.getClass().getSimpleName());
-            values.forEach(c -> {
-                final Route route = routeResolver.apply(c);
-                logger.debug("meterTag: {}, complexity: {}", route.meterTag(), route.complexity());
-            });
+            for (V v : values) {
+                final Route route = routeResolver.apply(v);
+                logger.debug("patternString: {}, complexity: {}", route.patternString(), route.complexity());
+            }
         }
         values.clear();
         return router;
@@ -286,6 +314,20 @@ public final class Routers {
         return result;
     }
 
+    private static <V> List<Routed<V>> findAll(RoutingContext routingCtx, List<V> values,
+                                               Function<V, Route> routeResolver) {
+        final ImmutableList.Builder<Routed<V>> builder = ImmutableList.builderWithExpectedSize(values.size());
+
+        for (V value : values) {
+            final Route route = routeResolver.apply(value);
+            final RoutingResult routingResult = route.apply(routingCtx);
+            if (routingResult.isPresent()) {
+                builder.add(Routed.of(route, routingResult, value));
+            }
+        }
+        return builder.build();
+    }
+
     private static final class TrieRouter<V> implements Router<V> {
 
         private final RoutingTrie<V> trie;
@@ -299,6 +341,11 @@ public final class Routers {
         @Override
         public Routed<V> find(RoutingContext routingCtx) {
             return findBest(routingCtx, trie.find(routingCtx.path()), routeResolver);
+        }
+
+        @Override
+        public List<Routed<V>> findAll(RoutingContext routingCtx) {
+            return Routers.findAll(routingCtx, trie.findAll(routingCtx.path()), routeResolver);
         }
 
         @Override
@@ -320,6 +367,11 @@ public final class Routers {
         @Override
         public Routed<V> find(RoutingContext routingCtx) {
             return findBest(routingCtx, values, routeResolver);
+        }
+
+        @Override
+        public List<Routed<V>> findAll(RoutingContext routingCtx) {
+            return Routers.findAll(routingCtx, values, routeResolver);
         }
 
         @Override

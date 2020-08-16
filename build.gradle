@@ -1,11 +1,14 @@
-buildscript {
-    repositories {
-        mavenCentral()
-    }
-    dependencies {
-        classpath 'com.google.gradle:osdetector-gradle-plugin:1.6.2'
-        classpath 'io.spring.gradle:dependency-management-plugin:1.0.8.RELEASE'
-    }
+import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
+
+import java.util.concurrent.atomic.AtomicBoolean
+
+plugins {
+    id 'com.google.osdetector' version '1.6.2' apply false
+    // If you want to change `org.jetbrains.kotlin.jvm` version,
+    // you also need to change `org.jetbrains.kotlin:kotlin-allopen` version in `dependencies.yml`.
+    id 'org.jetbrains.kotlin.jvm' version '1.3.72' apply false
+
+    id 'net.ltgt.errorprone' version '1.2.1' apply false
 }
 
 allprojects {
@@ -21,6 +24,22 @@ ext {
 
 apply from: "${rootDir}/gradle/scripts/build-flags.gradle"
 
+def javaTestHome = System.env.JAVA_TEST_HOME
+if (javaTestHome) {
+    logger.quiet("Overriding JVM for tests with ${javaTestHome}")
+}
+
+// Fail the build if the console contains 'LEAK:'.
+def hasLeak = new AtomicBoolean()
+gradle.buildFinished({ result ->
+    if (hasLeak.get()) {
+        throw new TestExecutionException('Found a leak while testing. ' +
+                "Specify '-Pleak' option to record the detail and " +
+                'find it using the following command: \n\n' +
+                "    find . -type f -name 'TEST-*.xml' -exec grep -Fl 'LEAK: ' {} ';'\n")
+    }
+})
+
 allprojects {
     // Add common JVM options such as max memory and leak detection.
     tasks.withType(JavaForkOptions) {
@@ -29,6 +48,7 @@ allprojects {
         // Enable leak detection when '-Pleak' option is specified.
         if (rootProject.hasProperty('leak')) {
             systemProperties 'io.netty.leakDetectionLevel': 'paranoid'
+            systemProperties 'io.netty.leakDetection.targetRecords': '256'
         }
     }
 
@@ -42,75 +62,128 @@ allprojects {
         if (project.hasFlags('coverage')) {
             systemProperty 'com.linecorp.armeria.testing.coverage', 'true'
         }
+        // Use a different JRE for testing if necessary.
+        if (javaTestHome) {
+            executable "${javaTestHome}/bin/java"
+        }
+        // Parallelize if --parallel is on.
+        if (gradle.startParameter.parallelProjectExecutionEnabled) {
+            maxParallelForks = gradle.startParameter.maxWorkerCount
+        }
+
+        // Fail the build at the end if there was any leak.
+        // We do not fail immediately so that we collect as many leaks as possible.
+        doFirst {
+            addTestOutputListener({ descriptor, event ->
+                if (event.message.contains('LEAK: ')) {
+                    hasLeak.set(true)
+                }
+            })
+        }
+    }
+}
+
+task checkJavaVersion {
+    doLast {
+        if (JavaVersion.current().majorVersion.toInteger() < 12) {
+            throw new GradleException("The Java version used (${JavaVersion.current()}) is too old to " +
+                    "build Armeria. Please use at least JDK 12. You can download a compatible JDK from " +
+                    "https://adoptopenjdk.net/")
+        }
     }
 }
 
 // Configure all Java projects
 configure(projectsWithFlags('java')) {
+
+    // Error Prone compiler
+    if (!rootProject.hasProperty('noLint')) {
+        apply plugin: 'net.ltgt.errorprone'
+
+        dependencies {
+            errorprone 'com.google.errorprone:error_prone_core'
+        }
+
+        tasks.withType(JavaCompile) {
+            options.errorprone.excludedPaths = '.*/gen-src/.*'
+        }
+    }
+
     // Common dependencies
     dependencies {
         // All projects currently require ':core' (except itself)
         if (project != project(':core')) {
-            compile project(':core')
+            api project(':core')
         }
 
         // Testing utilities
-        testCompile project(':testing-internal')
+        testImplementation project(':testing-internal')
 
         // completable-futures
-        compile 'com.spotify:completable-futures'
+        implementation 'com.spotify:completable-futures'
+
+        // Errorprone
+        compileOnly 'com.google.errorprone:error_prone_annotations'
 
         // FastUtil
-        compile 'it.unimi.dsi:fastutil'
+        implementation 'it.unimi.dsi:fastutil'
 
         // Guava
-        compile 'com.google.guava:guava'
+        implementation 'com.google.guava:guava'
 
         // J2ObjC annotations
         compileOnly 'com.google.j2objc:j2objc-annotations'
 
         // JSR305
-        compile 'com.google.code.findbugs:jsr305'
+        implementation 'com.google.code.findbugs:jsr305'
 
         // JCTools
-        compile 'org.jctools:jctools-core'
+        implementation 'org.jctools:jctools-core'
 
         // Jetty ALPN support
         compileOnly 'org.eclipse.jetty.alpn:alpn-api'
 
         // Logging
-        compile 'org.slf4j:slf4j-api'
-        testCompile 'org.slf4j:jul-to-slf4j'
-        testRuntime 'ch.qos.logback:logback-classic'
+        implementation 'org.slf4j:slf4j-api'
+        testImplementation 'org.slf4j:jul-to-slf4j'
+        testImplementation 'ch.qos.logback:logback-classic'
         ['jcl-over-slf4j', 'log4j-over-slf4j'].each {
-            testRuntime "org.slf4j:$it"
+            testRuntimeOnly "org.slf4j:$it"
         }
 
         // Reflections
-        compile 'org.reflections:reflections'
+        implementation 'org.reflections:reflections'
 
         // Test-time dependencies
-        testCompile 'com.google.guava:guava-testlib'
-        testCompile 'junit:junit'
-        testCompile 'org.junit.jupiter:junit-jupiter-api'
-        testCompile 'org.junit.jupiter:junit-jupiter-params'
-        testRuntime 'org.junit.platform:junit-platform-commons'
-        testRuntime 'org.junit.platform:junit-platform-launcher'
-        testRuntime 'org.junit.jupiter:junit-jupiter-engine'
-        testRuntime 'org.junit.vintage:junit-vintage-engine'
-        testCompile 'net.javacrumbs.json-unit:json-unit'
-        testCompile 'net.javacrumbs.json-unit:json-unit-fluent'
-        testCompile 'org.awaitility:awaitility'
-        testRuntime 'org.checkerframework:checker-compat-qual' // Required by guava-testlib
-        testCompile 'org.assertj:assertj-core'
-        testCompile 'org.mockito:mockito-core'
-        testCompile 'org.apache.httpcomponents:httpclient'
+        testImplementation 'com.google.guava:guava-testlib'
+        testImplementation 'junit:junit'
+        testImplementation 'org.junit.jupiter:junit-jupiter-api'
+        testImplementation 'org.junit.jupiter:junit-jupiter-params'
+        testRuntimeOnly 'org.junit.platform:junit-platform-commons'
+        testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+        testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine'
+        testRuntimeOnly 'org.junit.vintage:junit-vintage-engine'
+        testImplementation 'net.javacrumbs.json-unit:json-unit'
+        testImplementation 'net.javacrumbs.json-unit:json-unit-fluent'
+        testImplementation 'org.awaitility:awaitility'
+        testRuntimeOnly 'org.checkerframework:checker-compat-qual' // Required by guava-testlib
+        testImplementation 'org.assertj:assertj-core'
+        testImplementation 'org.mockito:mockito-core'
+        testImplementation 'org.apache.httpcomponents:httpclient'
+        testImplementation 'org.hamcrest:hamcrest'
+        testImplementation 'org.hamcrest:hamcrest-library'
     }
 
     // Target Java 8.
     tasks.withType(JavaCompile) {
-        if (JavaVersion.current() >= JavaVersion.VERSION_1_9) {
-            options.compilerArgs += ['--release', '8']
+        options.compilerArgs += ['--release', '8']
+
+        dependsOn checkJavaVersion
+    }
+
+    tasks.withType(KotlinCompile) {
+        kotlinOptions {
+            jvmTarget = "1.8"
         }
     }
 }
@@ -133,9 +206,9 @@ allprojects {
     }
 }
 
-// Require to use JDK 11 when releasing.
+// Require to use JDK 13 when releasing.
 tasks.release.doFirst {
-    if (JavaVersion.current() != JavaVersion.VERSION_11) {
-        throw new IllegalStateException("You must release using JDK 11.");
+    if (JavaVersion.current() != JavaVersion.VERSION_13) {
+        throw new IllegalStateException("You must release using JDK 13.");
     }
 }

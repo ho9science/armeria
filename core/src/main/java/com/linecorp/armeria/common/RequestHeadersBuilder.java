@@ -15,7 +15,11 @@
  */
 package com.linecorp.armeria.common;
 
+import static java.util.Objects.requireNonNull;
+
 import java.util.Map.Entry;
+
+import com.linecorp.armeria.client.Endpoint;
 
 /**
  * Builds a {@link RequestHeaders}.
@@ -39,19 +43,52 @@ public interface RequestHeadersBuilder extends HttpHeadersBuilder, RequestHeader
     RequestHeadersBuilder method(HttpMethod method);
 
     /**
-     * Sets the {@code ":path"} headers.
+     * Sets the {@code ":path"} header.
      */
     RequestHeadersBuilder path(String path);
 
     /**
-     * Sets the {@code ":scheme"} headers.
+     * Sets the {@code ":scheme"} header.
      */
     RequestHeadersBuilder scheme(String scheme);
 
     /**
-     * Sets the {@code ":authority"} headers.
+     * Sets the {@code ":scheme"} header from the specified {@link SessionProtocol}.
+     */
+    default RequestHeadersBuilder scheme(SessionProtocol sessionProtocol) {
+        requireNonNull(sessionProtocol, "sessionProtocol");
+        switch (sessionProtocol) {
+            case HTTPS:
+            case H2:
+            case H1:
+                scheme("https");
+                break;
+            case HTTP:
+            case H2C:
+            case H1C:
+                scheme("http");
+                break;
+            default:
+                throw new IllegalArgumentException("sessionProtocol: " + sessionProtocol +
+                                                   " (expected: HTTPS, H2, H1, HTTP, H2C or H1C)");
+        }
+        return this;
+    }
+
+    /**
+     * Sets the {@code ":authority"} header.
      */
     RequestHeadersBuilder authority(String authority);
+
+    /**
+     * Sets the {@code ":authority"} header from the specified {@link Endpoint}.
+     *
+     * @throws IllegalArgumentException if the specified {@link Endpoint} refers to a group
+     */
+    default RequestHeadersBuilder authority(Endpoint endpoint) {
+        requireNonNull(endpoint, "endpoint");
+        return authority(endpoint.authority());
+    }
 
     // Override the return type of the chaining methods in the superclass.
 
@@ -74,7 +111,7 @@ public interface RequestHeadersBuilder extends HttpHeadersBuilder, RequestHeader
     RequestHeadersBuilder add(CharSequence name, String... values);
 
     @Override
-    RequestHeadersBuilder add(Iterable<? extends Entry<? extends CharSequence, String>> headers);
+    RequestHeadersBuilder add(Iterable<? extends Entry<? extends CharSequence, String>> entries);
 
     @Override
     RequestHeadersBuilder addObject(CharSequence name, Object value);
@@ -86,7 +123,7 @@ public interface RequestHeadersBuilder extends HttpHeadersBuilder, RequestHeader
     RequestHeadersBuilder addObject(CharSequence name, Object... values);
 
     @Override
-    RequestHeadersBuilder addObject(Iterable<? extends Entry<? extends CharSequence, ?>> headers);
+    RequestHeadersBuilder addObject(Iterable<? extends Entry<? extends CharSequence, ?>> entries);
 
     @Override
     RequestHeadersBuilder addInt(CharSequence name, int value);
@@ -113,11 +150,10 @@ public interface RequestHeadersBuilder extends HttpHeadersBuilder, RequestHeader
     RequestHeadersBuilder set(CharSequence name, String... values);
 
     @Override
-    RequestHeadersBuilder set(Iterable<? extends Entry<? extends CharSequence, String>> headers);
+    RequestHeadersBuilder set(Iterable<? extends Entry<? extends CharSequence, String>> entries);
 
     @Override
-    RequestHeadersBuilder setIfAbsent(
-            Iterable<? extends Entry<? extends CharSequence, String>> headers);
+    RequestHeadersBuilder setIfAbsent(Iterable<? extends Entry<? extends CharSequence, String>> entries);
 
     @Override
     RequestHeadersBuilder setObject(CharSequence name, Object value);
@@ -129,7 +165,7 @@ public interface RequestHeadersBuilder extends HttpHeadersBuilder, RequestHeader
     RequestHeadersBuilder setObject(CharSequence name, Object... values);
 
     @Override
-    RequestHeadersBuilder setObject(Iterable<? extends Entry<? extends CharSequence, ?>> headers);
+    RequestHeadersBuilder setObject(Iterable<? extends Entry<? extends CharSequence, ?>> entries);
 
     @Override
     RequestHeadersBuilder setInt(CharSequence name, int value);

@@ -1,8 +1,16 @@
-dependencies {
-    compile project(':core')
-    runtime 'org.slf4j:slf4j-simple'
+plugins {
+    id 'application'
+}
 
-    testCompile 'junit:junit'
-    testCompile 'net.javacrumbs.json-unit:json-unit-fluent'
-    testCompile 'org.assertj:assertj-core'
+dependencies {
+    implementation project(':core')
+    runtimeOnly 'org.slf4j:slf4j-simple'
+
+    testImplementation 'net.javacrumbs.json-unit:json-unit-fluent'
+    testImplementation 'org.assertj:assertj-core'
+    testImplementation 'org.junit.jupiter:junit-jupiter-api'
+}
+
+application {
+    mainClassName = 'example.armeria.server.annotated.Main'
 }

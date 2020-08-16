@@ -23,33 +23,18 @@ import java.util.function.Consumer;
 
 import org.junit.jupiter.api.Test;
 
+import com.linecorp.armeria.client.endpoint.EmptyEndpointGroupException;
 import com.linecorp.armeria.client.endpoint.EndpointGroup;
-import com.linecorp.armeria.client.endpoint.EndpointGroupException;
-import com.linecorp.armeria.client.endpoint.EndpointGroupRegistry;
-import com.linecorp.armeria.client.endpoint.EndpointSelectionStrategy;
-import com.linecorp.armeria.common.logging.RequestLogAvailability;
+import com.linecorp.armeria.common.SessionProtocol;
+import com.linecorp.armeria.common.logging.RequestLog;
 import com.linecorp.armeria.common.util.SafeCloseable;
 
 class ClientRequestContextInitFailureTest {
     @Test
-    void missingEndpointGroup() {
-        assertFailure("group:none", actualCause -> {
-            assertThat(actualCause).isInstanceOf(EndpointGroupException.class)
-                                   .hasMessageContaining("non-existent");
-        });
-    }
-
-    @Test
     void endpointSelectionFailure() {
-        EndpointGroupRegistry.register("foo", EndpointGroup.empty(), EndpointSelectionStrategy.ROUND_ROBIN);
-        try {
-            assertFailure("group:foo", actualCause -> {
-                assertThat(actualCause).isInstanceOf(EndpointGroupException.class)
-                                       .hasMessageContaining("empty");
-            });
-        } finally {
-            EndpointGroupRegistry.unregister("foo");
-        }
+        assertFailure(EndpointGroup.of(), actualCause -> {
+            assertThat(actualCause).isInstanceOf(EmptyEndpointGroupException.class);
+        });
     }
 
     @Test
@@ -58,28 +43,31 @@ class ClientRequestContextInitFailureTest {
         try (SafeCloseable ignored = Clients.withContextCustomizer(ctx -> {
             throw cause;
         })) {
-            assertFailure("127.0.0.1:1", actualCause -> {
+            assertFailure(Endpoint.of("127.0.0.1", 1), actualCause -> {
                 assertThat(actualCause).isSameAs(cause);
             });
         }
+
+        // Thread-local state must be cleaned up.
+        assertThat(ClientThreadLocalState.get()).isNull();
     }
 
-    private static void assertFailure(String authority, Consumer<Throwable> requirements) {
+    private static void assertFailure(EndpointGroup endpointGroup, Consumer<Throwable> requirements) {
         final AtomicReference<ClientRequestContext> capturedCtx = new AtomicReference<>();
-        final HttpClient client = new HttpClientBuilder("http://" + authority)
-                .decorator((delegate, ctx, req) -> {
-                    capturedCtx.set(ctx);
-                    return delegate.execute(ctx, req);
-                }).build();
+        final WebClient client = WebClient.builder(SessionProtocol.HTTP, endpointGroup)
+                                          .decorator((delegate, ctx, req) -> {
+                                              capturedCtx.set(ctx);
+                                              return delegate.execute(ctx, req);
+                                          }).build();
 
         final Throwable actualCause = catchThrowable(() -> client.get("/").aggregate().join()).getCause();
         assertThat(actualCause).isInstanceOf(UnprocessedRequestException.class);
         assertThat(actualCause.getCause()).satisfies((Consumer) requirements);
 
         assertThat(capturedCtx.get()).satisfies(ctx -> {
-            ctx.log().ensureAvailability(RequestLogAvailability.COMPLETE);
-            assertThat(ctx.log().requestCause()).isSameAs(actualCause);
-            assertThat(ctx.log().responseCause()).isSameAs(actualCause);
+            final RequestLog log = ctx.log().ensureComplete();
+            assertThat(log.requestCause()).isSameAs(actualCause);
+            assertThat(log.responseCause()).isSameAs(actualCause);
         });
     }
 }

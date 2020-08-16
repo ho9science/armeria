@@ -48,8 +48,8 @@ import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.MediaType;
 import com.linecorp.armeria.common.util.Exceptions;
+import com.linecorp.armeria.server.HttpService;
 import com.linecorp.armeria.server.Server;
-import com.linecorp.armeria.server.Service;
 import com.linecorp.armeria.server.ServiceConfig;
 import com.linecorp.armeria.server.ServiceRequestContext;
 import com.linecorp.armeria.server.SimpleDecoratingHttpService;
@@ -75,7 +75,7 @@ final class SamlDecorator extends SimpleDecoratingHttpService {
     @Nullable
     private Server server;
 
-    SamlDecorator(SamlServiceProvider sp, Service<HttpRequest, HttpResponse> delegate) {
+    SamlDecorator(SamlServiceProvider sp, HttpService delegate) {
         super(delegate);
         this.sp = sp;
         portConfigHolder = sp.portConfigAutoFiller();
@@ -111,7 +111,7 @@ final class SamlDecorator extends SimpleDecoratingHttpService {
             if (cause == null && result) {
                 // Already authenticated.
                 try {
-                    return delegate().serve(ctx, req);
+                    return unwrap().serve(ctx, req);
                 } catch (Exception e) {
                     return Exceptions.throwUnsafely(e);
                 }
@@ -129,7 +129,8 @@ final class SamlDecorator extends SimpleDecoratingHttpService {
                 if (idp == null) {
                     throw new RuntimeException("cannot find a suitable identity provider from configurations");
                 }
-                final String defaultHostname = firstNonNull(sp.hostname(), ctx.virtualHost().defaultHostname());
+                final String defaultHostname =
+                        firstNonNull(sp.hostname(), ctx.config().virtualHost().defaultHostname());
                 final AuthnRequest request = createAuthRequest(idp, defaultHostname);
                 final MessageContext<AuthnRequest> messageContext = new MessageContext<>();
                 messageContext.setMessage(request);
@@ -196,9 +197,9 @@ final class SamlDecorator extends SimpleDecoratingHttpService {
 
         // The ProtocolBinding attribute is mutually exclusive with the AssertionConsumerServiceIndex attribute
         // and is typically accompanied by the AssertionConsumerServiceURL attribute.
-        final SamlPortConfig portConfig = portConfigHolder.config().get();
-        final SamlEndpoint acsEndpoint = idp.acsEndpoint()
-                                            .orElse(sp.defaultAcsConfig().endpoint());
+        final SamlPortConfig portConfig = portConfigHolder.config();
+        final SamlEndpoint acsEndpoint = idp.acsEndpoint() != null ? idp.acsEndpoint()
+                                                                   : sp.defaultAcsConfig().endpoint();
         authnRequest.setAssertionConsumerServiceURL(acsEndpoint.toUriString(portConfig.scheme().uriText(),
                                                                             defaultHostname,
                                                                             portConfig.port()));

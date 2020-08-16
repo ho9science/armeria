@@ -16,6 +16,10 @@
 
 package com.linecorp.armeria.server;
 
+import static com.linecorp.armeria.common.SessionProtocol.H1;
+import static com.linecorp.armeria.common.SessionProtocol.H1C;
+import static com.linecorp.armeria.common.SessionProtocol.H2;
+import static com.linecorp.armeria.common.SessionProtocol.H2C;
 import static com.linecorp.armeria.common.SessionProtocol.HTTP;
 import static com.linecorp.armeria.common.SessionProtocol.HTTPS;
 import static com.linecorp.armeria.common.SessionProtocol.PROXY;
@@ -27,6 +31,7 @@ import java.util.EnumSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 import javax.annotation.Nullable;
 import javax.net.ssl.SSLException;
@@ -34,13 +39,18 @@ import javax.net.ssl.SSLException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.linecorp.armeria.common.SessionProtocol;
-import com.linecorp.armeria.common.util.Exceptions;
-import com.linecorp.armeria.internal.ChannelUtil;
-import com.linecorp.armeria.internal.Http1ObjectEncoder;
-import com.linecorp.armeria.internal.ReadSuppressingHandler;
-import com.linecorp.armeria.internal.TrafficLoggingHandler;
+import com.google.common.collect.ImmutableList;
 
+import com.linecorp.armeria.common.SessionProtocol;
+import com.linecorp.armeria.common.metric.MoreMeters;
+import com.linecorp.armeria.common.util.Exceptions;
+import com.linecorp.armeria.internal.common.KeepAliveHandler;
+import com.linecorp.armeria.internal.common.ReadSuppressingHandler;
+import com.linecorp.armeria.internal.common.TrafficLoggingHandler;
+import com.linecorp.armeria.internal.common.util.ChannelUtil;
+
+import io.micrometer.core.instrument.Tag;
+import io.micrometer.core.instrument.Timer;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandler;
@@ -53,20 +63,11 @@ import io.netty.handler.codec.DecoderException;
 import io.netty.handler.codec.MessageToMessageDecoder;
 import io.netty.handler.codec.haproxy.HAProxyMessage;
 import io.netty.handler.codec.haproxy.HAProxyMessageDecoder;
+import io.netty.handler.codec.haproxy.HAProxyProxiedProtocol.AddressFamily;
 import io.netty.handler.codec.http.HttpServerCodec;
 import io.netty.handler.codec.http.HttpServerUpgradeHandler;
-import io.netty.handler.codec.http2.DefaultHttp2Connection;
-import io.netty.handler.codec.http2.DefaultHttp2ConnectionDecoder;
-import io.netty.handler.codec.http2.DefaultHttp2ConnectionEncoder;
-import io.netty.handler.codec.http2.DefaultHttp2FrameReader;
-import io.netty.handler.codec.http2.DefaultHttp2FrameWriter;
 import io.netty.handler.codec.http2.Http2CodecUtil;
-import io.netty.handler.codec.http2.Http2Connection;
-import io.netty.handler.codec.http2.Http2ConnectionDecoder;
-import io.netty.handler.codec.http2.Http2ConnectionEncoder;
 import io.netty.handler.codec.http2.Http2ConnectionHandler;
-import io.netty.handler.codec.http2.Http2FrameReader;
-import io.netty.handler.codec.http2.Http2FrameWriter;
 import io.netty.handler.codec.http2.Http2ServerUpgradeCodec;
 import io.netty.handler.codec.http2.Http2Settings;
 import io.netty.handler.flush.FlushConsolidationHandler;
@@ -76,8 +77,9 @@ import io.netty.handler.ssl.SniHandler;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslHandler;
 import io.netty.util.AsciiString;
-import io.netty.util.DomainNameMapping;
+import io.netty.util.Mapping;
 import io.netty.util.NetUtil;
+import io.netty.util.concurrent.ScheduledFuture;
 
 /**
  * Configures Netty {@link ChannelPipeline} to serve HTTP/1 and 2 requests.
@@ -105,7 +107,7 @@ final class HttpServerPipelineConfigurator extends ChannelInitializer<Channel> {
     private final ServerConfig config;
     private final ServerPort port;
     @Nullable
-    private final DomainNameMapping<SslContext> sslContexts;
+    private final Mapping<String, SslContext> sslContexts;
     private final GracefulShutdownSupport gracefulShutdownSupport;
 
     /**
@@ -113,7 +115,7 @@ final class HttpServerPipelineConfigurator extends ChannelInitializer<Channel> {
      */
     HttpServerPipelineConfigurator(
             ServerConfig config, ServerPort port,
-            @Nullable DomainNameMapping<SslContext> sslContexts,
+            @Nullable Mapping<String, SslContext> sslContexts,
             GracefulShutdownSupport gracefulShutdownSupport) {
 
         this.config = requireNonNull(config, "config");
@@ -150,22 +152,45 @@ final class HttpServerPipelineConfigurator extends ChannelInitializer<Channel> {
         }
 
         // More than one protocol were specified. Detect the protocol.
-        p.addLast(new ProtocolDetectionHandler(protocols, proxiedAddresses));
+
+        final ScheduledFuture<?> protocolDetectionTimeoutFuture;
+        // FIXME(trustin): Add a dedicated timeout option to ServerConfig.
+        final long requestTimeoutMillis = config.defaultVirtualHost().requestTimeoutMillis();
+        if (requestTimeoutMillis > 0) {
+            // Close the connection if the protocol detection is not finished in time.
+            final Channel ch = p.channel();
+            protocolDetectionTimeoutFuture = ch.eventLoop().schedule(
+                    (Runnable) ch::close, requestTimeoutMillis, TimeUnit.MILLISECONDS);
+        } else {
+            protocolDetectionTimeoutFuture = null;
+        }
+
+        p.addLast(new ProtocolDetectionHandler(protocols, proxiedAddresses, protocolDetectionTimeoutFuture));
     }
 
     private void configureHttp(ChannelPipeline p, @Nullable ProxiedAddresses proxiedAddresses) {
-        final Http1ObjectEncoder responseEncoder = new Http1ObjectEncoder(p.channel(), true, false);
+        final long idleTimeoutMillis = config.idleTimeoutMillis();
+        final KeepAliveHandler keepAliveHandler;
+        if (idleTimeoutMillis > 0) {
+            final Timer keepAliveTimer = newKeepAliveTimer(H1C);
+            keepAliveHandler = new Http1ServerKeepAliveHandler(
+                    p.channel(), keepAliveTimer, idleTimeoutMillis, config.maxConnectionAgeMillis());
+        } else {
+            keepAliveHandler = null;
+        }
+        final ServerHttp1ObjectEncoder responseEncoder = new ServerHttp1ObjectEncoder(
+                p.channel(), H1C, keepAliveHandler,
+                config.isDateHeaderEnabled(), config.isServerHeaderEnabled()
+        );
         p.addLast(TrafficLoggingHandler.SERVER);
         p.addLast(new Http2PrefaceOrHttpHandler(responseEncoder));
-        configureIdleTimeoutHandler(p);
         p.addLast(new HttpServerHandler(config, gracefulShutdownSupport, responseEncoder,
-                                        SessionProtocol.H1C, proxiedAddresses));
+                                        H1C, proxiedAddresses));
     }
 
-    private void configureIdleTimeoutHandler(ChannelPipeline p) {
-        if (config.idleTimeoutMillis() > 0) {
-            p.addFirst(new HttpServerIdleTimeoutHandler(config.idleTimeoutMillis()));
-        }
+    private Timer newKeepAliveTimer(SessionProtocol protocol) {
+        return MoreMeters.newTimer(config.meterRegistry(), "armeria.server.connections.lifespan",
+                                   ImmutableList.of(Tag.of("protocol", protocol.uriText())));
     }
 
     private void configureHttps(ChannelPipeline p, @Nullable ProxiedAddresses proxiedAddresses) {
@@ -176,17 +201,12 @@ final class HttpServerPipelineConfigurator extends ChannelInitializer<Channel> {
     }
 
     private Http2ConnectionHandler newHttp2ConnectionHandler(ChannelPipeline pipeline, AsciiString scheme) {
-
-        final Http2Connection conn = new DefaultHttp2Connection(true);
-        final Http2FrameReader reader = new DefaultHttp2FrameReader(true);
-        final Http2FrameWriter writer = new DefaultHttp2FrameWriter();
-
-        final Http2ConnectionEncoder encoder = new DefaultHttp2ConnectionEncoder(conn, writer);
-        final Http2ConnectionDecoder decoder = new DefaultHttp2ConnectionDecoder(conn, encoder, reader);
-
-        return new Http2ServerConnectionHandler(
-                decoder, encoder, http2Settings(), pipeline.channel(),
-                config, gracefulShutdownSupport, scheme.toString());
+        final Timer keepAliveTimer = newKeepAliveTimer(scheme == SCHEME_HTTP ? H2C : H2);
+        return new Http2ServerConnectionHandlerBuilder(pipeline.channel(), config, keepAliveTimer,
+                                                       gracefulShutdownSupport, scheme.toString())
+                .server(true)
+                .initialSettings(http2Settings())
+                .build();
     }
 
     private Http2Settings http2Settings() {
@@ -215,8 +235,11 @@ final class HttpServerPipelineConfigurator extends ChannelInitializer<Channel> {
         private final EnumSet<SessionProtocol> proxiedCandidates;
         @Nullable
         private final ProxiedAddresses proxiedAddresses;
+        @Nullable
+        private final ScheduledFuture<?> timeoutFuture;
 
-        ProtocolDetectionHandler(Set<SessionProtocol> protocols, @Nullable ProxiedAddresses proxiedAddresses) {
+        ProtocolDetectionHandler(Set<SessionProtocol> protocols, @Nullable ProxiedAddresses proxiedAddresses,
+                                 @Nullable ScheduledFuture<?> timeoutFuture) {
             candidates = EnumSet.copyOf(protocols);
             if (protocols.contains(PROXY)) {
                 proxiedCandidates = EnumSet.copyOf(candidates);
@@ -225,6 +248,7 @@ final class HttpServerPipelineConfigurator extends ChannelInitializer<Channel> {
                 proxiedCandidates = null;
             }
             this.proxiedAddresses = proxiedAddresses;
+            this.timeoutFuture = timeoutFuture;
         }
 
         @Override
@@ -285,6 +309,10 @@ final class HttpServerPipelineConfigurator extends ChannelInitializer<Channel> {
                 }
             }
 
+            if (timeoutFuture != null) {
+                timeoutFuture.cancel(false);
+            }
+
             final ChannelPipeline p = ctx.pipeline();
             switch (detected) {
                 case HTTP:
@@ -315,6 +343,14 @@ final class HttpServerPipelineConfigurator extends ChannelInitializer<Channel> {
             }
             return true;
         }
+
+        @Override
+        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+            if (!Exceptions.isExpected(cause)) {
+                logger.warn("{} Unexpected exception while detecting the session protocol.", ctx, cause);
+            }
+            ctx.close();
+        }
     }
 
     private final class ProxiedPipelineConfigurator extends MessageToMessageDecoder<HAProxyMessage> {
@@ -335,14 +371,20 @@ final class HttpServerPipelineConfigurator extends ChannelInitializer<Channel> {
                              msg.destinationAddress(), msg.destinationPort(),
                              proxiedCandidates);
             }
+
+            final ProxiedAddresses proxiedAddresses;
+            if (msg.proxiedProtocol().addressFamily() == AddressFamily.AF_UNSPEC) {
+                proxiedAddresses = null;
+            } else {
+                final InetAddress src = InetAddress.getByAddress(
+                        NetUtil.createByteArrayFromIpAddressString(msg.sourceAddress()));
+                final InetAddress dst = InetAddress.getByAddress(
+                        NetUtil.createByteArrayFromIpAddressString(msg.destinationAddress()));
+                proxiedAddresses = ProxiedAddresses.of(new InetSocketAddress(src, msg.sourcePort()),
+                                                       new InetSocketAddress(dst, msg.destinationPort()));
+            }
+
             final ChannelPipeline p = ctx.pipeline();
-            final InetAddress src = InetAddress.getByAddress(
-                    NetUtil.createByteArrayFromIpAddressString(msg.sourceAddress()));
-            final InetAddress dst = InetAddress.getByAddress(
-                    NetUtil.createByteArrayFromIpAddressString(msg.destinationAddress()));
-            final ProxiedAddresses proxiedAddresses =
-                    ProxiedAddresses.of(new InetSocketAddress(src, msg.sourcePort()),
-                                        new InetSocketAddress(dst, msg.destinationPort()));
             configurePipeline(p, proxiedCandidates, proxiedAddresses);
             p.remove(this);
         }
@@ -376,23 +418,29 @@ final class HttpServerPipelineConfigurator extends ChannelInitializer<Channel> {
         private void addHttp2Handlers(ChannelHandlerContext ctx) {
             final ChannelPipeline p = ctx.pipeline();
             p.addLast(newHttp2ConnectionHandler(p, SCHEME_HTTPS));
-            configureIdleTimeoutHandler(p);
-            p.addLast(new HttpServerHandler(config, gracefulShutdownSupport, null,
-                                            SessionProtocol.H2, proxiedAddresses));
+            p.addLast(new HttpServerHandler(config, gracefulShutdownSupport, null, H2, proxiedAddresses));
         }
 
         private void addHttpHandlers(ChannelHandlerContext ctx) {
             final Channel ch = ctx.channel();
             final ChannelPipeline p = ctx.pipeline();
-            final Http1ObjectEncoder writer = new Http1ObjectEncoder(ch, true, true);
+            final long idleTimeoutMillis = config.idleTimeoutMillis();
+            final KeepAliveHandler keepAliveHandler;
+            if (idleTimeoutMillis > 0) {
+                keepAliveHandler = new Http1ServerKeepAliveHandler(
+                        ch, newKeepAliveTimer(H1), idleTimeoutMillis, config.maxConnectionAgeMillis());
+            } else {
+                keepAliveHandler = null;
+            }
+
+            final ServerHttp1ObjectEncoder writer = new ServerHttp1ObjectEncoder(
+                    ch, H1, keepAliveHandler, config.isDateHeaderEnabled(), config.isServerHeaderEnabled());
             p.addLast(new HttpServerCodec(
                     config.http1MaxInitialLineLength(),
                     config.http1MaxHeaderSize(),
                     config.http1MaxChunkSize()));
             p.addLast(new Http1RequestDecoder(config, ch, SCHEME_HTTPS, writer));
-            configureIdleTimeoutHandler(p);
-            p.addLast(new HttpServerHandler(config, gracefulShutdownSupport, writer,
-                                            SessionProtocol.H1, proxiedAddresses));
+            p.addLast(new HttpServerHandler(config, gracefulShutdownSupport, writer, H1, proxiedAddresses));
         }
 
         @Override
@@ -427,22 +475,40 @@ final class HttpServerPipelineConfigurator extends ChannelInitializer<Channel> {
 
     private final class Http2PrefaceOrHttpHandler extends ByteToMessageDecoder {
 
-        private final Http1ObjectEncoder responseEncoder;
+        private final ServerHttp1ObjectEncoder responseEncoder;
+        @Nullable
+        private final KeepAliveHandler keepAliveHandler;
         @Nullable
         private String name;
 
-        Http2PrefaceOrHttpHandler(Http1ObjectEncoder responseEncoder) {
+        Http2PrefaceOrHttpHandler(ServerHttp1ObjectEncoder responseEncoder) {
             this.responseEncoder = responseEncoder;
+            keepAliveHandler = responseEncoder.keepAliveHandler();
         }
 
         @Override
         public void handlerAdded(ChannelHandlerContext ctx) throws Exception {
+            if (keepAliveHandler != null) {
+                keepAliveHandler.initialize(ctx);
+            }
             super.handlerAdded(ctx);
             name = ctx.name();
         }
 
         @Override
+        public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+            if (keepAliveHandler != null) {
+                keepAliveHandler.destroy();
+            }
+            super.channelInactive(ctx);
+        }
+
+        @Override
         protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) throws Exception {
+            if (keepAliveHandler != null) {
+                keepAliveHandler.onReadOrWrite();
+            }
+
             if (in.readableBytes() < 4) {
                 return;
             }

@@ -9,20 +9,21 @@ buildscript {
 
 apply plugin: 'org.springframework.boot'
 
-springBoot {
-    mainClassName = 'example.springframework.boot.armeria.Main'
-}
-
 dependencies {
-    compile project(':spring:boot-starter')
-    compile 'org.hibernate.validator:hibernate-validator'
+    implementation project(':spring:boot2-starter')
+    implementation 'org.hibernate.validator:hibernate-validator'
 
-    compileOnly 'org.springframework.boot:spring-boot-configuration-processor'
+    // Preprocessor that enables you to use JavaDoc to add description to REST API parameters.
+    // If you don't want to use it, you can use the annotation
+    // com.linecorp.armeria.server.annotation.Description otherwise.
+    compileOnly project(':annotation-processor')
+    annotationProcessor project(':annotation-processor')
+
     annotationProcessor 'org.springframework.boot:spring-boot-configuration-processor'
 
-    runtime project(':spring:boot-actuator-starter')
+    runtimeOnly project(':spring:boot2-actuator-starter')
 
-    testCompile 'junit:junit'
-    testCompile 'net.javacrumbs.json-unit:json-unit-fluent'
-    testCompile 'org.springframework.boot:spring-boot-starter-test'
+    testImplementation 'net.javacrumbs.json-unit:json-unit-fluent'
+    testImplementation 'org.junit.jupiter:junit-jupiter-api'
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
 }

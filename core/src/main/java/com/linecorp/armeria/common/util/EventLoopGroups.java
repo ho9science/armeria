@@ -22,7 +22,7 @@ import static java.util.Objects.requireNonNull;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 
-import com.linecorp.armeria.internal.TransportType;
+import com.linecorp.armeria.internal.common.util.TransportType;
 
 import io.netty.bootstrap.Bootstrap;
 import io.netty.channel.AbstractEventLoop;
@@ -39,7 +39,7 @@ import io.netty.util.concurrent.Future;
 /**
  * Provides methods that are useful for creating an {@link EventLoopGroup}.
  *
- * @see EventLoopThreadFactory
+ * @see ThreadFactories#newEventLoopThreadFactory(String, boolean)
  */
 public final class EventLoopGroups {
 
@@ -89,7 +89,8 @@ public final class EventLoopGroups {
 
         final TransportType type = TransportType.detectTransportType();
         final String prefix = threadNamePrefix + '-' + type.lowerCasedName();
-        return newEventLoopGroup(numThreads, new EventLoopThreadFactory(prefix, useDaemonThreads));
+        return newEventLoopGroup(numThreads, ThreadFactories.newEventLoopThreadFactory(prefix,
+                                                                                       useDaemonThreads));
     }
 
     /**
@@ -122,17 +123,6 @@ public final class EventLoopGroups {
      */
     public static Class<? extends ServerChannel> serverChannelType(EventLoopGroup eventLoopGroup) {
         return TransportType.serverChannelType(requireNonNull(eventLoopGroup, "eventLoopGroup"));
-    }
-
-    /**
-     * Returns the {@link ServerChannel} class that is available for this {@code eventLoopGroup}, for use in
-     * configuring a custom {@link Bootstrap}.
-     *
-     * @deprecated Use {@link #serverChannelType(EventLoopGroup)}.
-     */
-    @Deprecated
-    public static Class<? extends ServerChannel> serverChannelClass(EventLoopGroup eventLoopGroup) {
-        return serverChannelType(eventLoopGroup);
     }
 
     /**

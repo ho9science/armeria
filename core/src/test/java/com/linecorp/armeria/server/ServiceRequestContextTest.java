@@ -20,28 +20,37 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.util.function.Function;
 
+import javax.annotation.Nullable;
+
 import org.junit.jupiter.api.Test;
 
 import com.linecorp.armeria.client.ClientRequestContext;
 import com.linecorp.armeria.common.HttpMethod;
 import com.linecorp.armeria.common.HttpRequest;
+import com.linecorp.armeria.common.RequestContext;
 import com.linecorp.armeria.common.util.SafeCloseable;
 
 class ServiceRequestContextTest {
-
-    private static final HttpRequest req = HttpRequest.of(HttpMethod.GET, "/");
 
     @Test
     void current() {
         assertThatThrownBy(ServiceRequestContext::current).isInstanceOf(IllegalStateException.class)
                                                           .hasMessageContaining("unavailable");
 
-        final ServiceRequestContext ctx = ServiceRequestContext.of(req);
-        try (SafeCloseable unused = ctx.push()) {
-            assertThat(ServiceRequestContext.current()).isSameAs(ctx);
+        final ServiceRequestContext sctx = serviceRequestContext();
+        try (SafeCloseable unused = sctx.push()) {
+            assertThat(ServiceRequestContext.current()).isSameAs(sctx);
+            final ClientRequestContext cctx = clientRequestContext();
+            try (SafeCloseable unused1 = cctx.push()) {
+                assertThat(ServiceRequestContext.current()).isSameAs(sctx);
+                assertThat(ClientRequestContext.current()).isSameAs(cctx);
+                assertThat((ClientRequestContext) RequestContext.current()).isSameAs(cctx);
+            }
+            assertCurrentCtx(sctx);
         }
+        assertCurrentCtx(null);
 
-        try (SafeCloseable unused = ClientRequestContext.of(req).push()) {
+        try (SafeCloseable unused = clientRequestContext().push()) {
             assertThatThrownBy(ServiceRequestContext::current)
                     .isInstanceOf(IllegalStateException.class)
                     .hasMessageContaining("not a server-side context");
@@ -52,33 +61,123 @@ class ServiceRequestContextTest {
     void currentOrNull() {
         assertThat(ServiceRequestContext.currentOrNull()).isNull();
 
-        final ServiceRequestContext ctx = ServiceRequestContext.of(req);
-        try (SafeCloseable unused = ctx.push()) {
-            assertThat(ServiceRequestContext.currentOrNull()).isSameAs(ctx);
+        final ServiceRequestContext sctx = serviceRequestContext();
+        try (SafeCloseable unused = sctx.push()) {
+            assertThat(ServiceRequestContext.currentOrNull()).isSameAs(sctx);
+            final ClientRequestContext cctx = clientRequestContext();
+            try (SafeCloseable unused1 = cctx.push()) {
+                assertThat(ServiceRequestContext.currentOrNull()).isSameAs(sctx);
+                assertThat(ClientRequestContext.current()).isSameAs(cctx);
+                assertThat((ClientRequestContext) RequestContext.current()).isSameAs(cctx);
+            }
+            assertCurrentCtx(sctx);
         }
+        assertCurrentCtx(null);
 
-        try (SafeCloseable unused = ClientRequestContext.of(req).push()) {
-            assertThatThrownBy(ServiceRequestContext::currentOrNull)
+        try (SafeCloseable unused = clientRequestContext().push()) {
+            assertThat(ServiceRequestContext.currentOrNull()).isNull();
+        }
+    }
+
+    @Test
+    void mapCurrent() {
+        assertThat(ServiceRequestContext.mapCurrent(ctx -> "foo", () -> "defaultValue"))
+                .isEqualTo("defaultValue");
+        assertThat(ServiceRequestContext.mapCurrent(Function.identity(), null)).isNull();
+
+        final ServiceRequestContext sctx = serviceRequestContext();
+        try (SafeCloseable unused = sctx.push()) {
+            assertThat(ServiceRequestContext.mapCurrent(c -> c == sctx ? "foo" : "bar",
+                                                        () -> "defaultValue"))
+                    .isEqualTo("foo");
+            assertThat(ServiceRequestContext.mapCurrent(Function.identity(), null)).isSameAs(sctx);
+            final ClientRequestContext cctx = clientRequestContext();
+            try (SafeCloseable unused1 = cctx.push()) {
+                assertThat(ServiceRequestContext.mapCurrent(c -> c == sctx ? "foo" : "bar",
+                                                            () -> "defaultValue"))
+                        .isEqualTo("foo");
+                assertThat(ClientRequestContext.mapCurrent(c -> c == cctx ? "baz" : "qux",
+                                                           () -> "defaultValue"))
+                        .isEqualTo("baz");
+                assertThat(ServiceRequestContext.mapCurrent(Function.identity(), null)).isSameAs(sctx);
+                assertThat(ClientRequestContext.mapCurrent(Function.identity(), null)).isSameAs(cctx);
+                assertThat(RequestContext.mapCurrent(Function.identity(), null)).isSameAs(cctx);
+            }
+            assertCurrentCtx(sctx);
+        }
+        assertCurrentCtx(null);
+
+        try (SafeCloseable unused = clientRequestContext().push()) {
+            assertThatThrownBy(() -> ServiceRequestContext.mapCurrent(c -> "foo", () -> "bar"))
                     .isInstanceOf(IllegalStateException.class)
                     .hasMessageContaining("not a server-side context");
         }
     }
 
     @Test
-    void mapCurrent() {
-        assertThat(ServiceRequestContext.mapCurrent(ctx -> "foo", () -> "bar")).isEqualTo("bar");
-        assertThat(ServiceRequestContext.mapCurrent(Function.identity(), null)).isNull();
-
-        final ServiceRequestContext ctx = ServiceRequestContext.of(req);
-        try (SafeCloseable unused = ctx.push()) {
-            assertThat(ServiceRequestContext.mapCurrent(c -> "foo", () -> "bar")).isEqualTo("foo");
-            assertThat(ServiceRequestContext.mapCurrent(Function.identity(), null)).isSameAs(ctx);
+    void pushReentrance() {
+        final ServiceRequestContext ctx = serviceRequestContext();
+        try (SafeCloseable ignored = ctx.push()) {
+            assertCurrentCtx(ctx);
+            try (SafeCloseable ignored2 = ctx.push()) {
+                assertCurrentCtx(ctx);
+            }
+            assertCurrentCtx(ctx);
         }
+        assertCurrentCtx(null);
+    }
 
-        try (SafeCloseable unused = ClientRequestContext.of(req).push()) {
-            assertThatThrownBy(() -> ServiceRequestContext.mapCurrent(c -> "foo", () -> "bar"))
-                    .isInstanceOf(IllegalStateException.class)
-                    .hasMessageContaining("not a server-side context");
+    @Test
+    void pushWithOldClientCtxWhoseRootIsThisServiceCtx() {
+        final ServiceRequestContext sctx = serviceRequestContext();
+        try (SafeCloseable ignored = sctx.push()) {
+            assertCurrentCtx(sctx);
+            // The root of ClientRequestContext is sctx.
+            final ClientRequestContext cctx = clientRequestContext();
+            try (SafeCloseable ignored1 = cctx.push()) {
+                assertCurrentCtx(cctx);
+                try (SafeCloseable ignored2 = sctx.push()) {
+                    assertCurrentCtx(sctx);
+                }
+                assertCurrentCtx(cctx);
+            }
+            assertCurrentCtx(sctx);
         }
+        assertCurrentCtx(null);
+    }
+
+    @Test
+    void pushWithOldIrrelevantClientCtx() {
+        final ClientRequestContext cctx = clientRequestContext();
+        try (SafeCloseable ignored = cctx.push()) {
+            assertCurrentCtx(cctx);
+            final ServiceRequestContext sctx = serviceRequestContext();
+            assertThatThrownBy(sctx::push).isInstanceOf(IllegalStateException.class);
+        }
+        assertCurrentCtx(null);
+    }
+
+    @Test
+    void pushWithOldIrrelevantServiceCtx() {
+        final ServiceRequestContext sctx1 = serviceRequestContext();
+        final ServiceRequestContext sctx2 = serviceRequestContext();
+        try (SafeCloseable ignored = sctx1.push()) {
+            assertCurrentCtx(sctx1);
+            assertThatThrownBy(sctx2::push).isInstanceOf(IllegalStateException.class);
+        }
+        assertCurrentCtx(null);
+    }
+
+    private static void assertCurrentCtx(@Nullable RequestContext ctx) {
+        final RequestContext current = RequestContext.currentOrNull();
+        assertThat(current).isSameAs(ctx);
+    }
+
+    private static ServiceRequestContext serviceRequestContext() {
+        return ServiceRequestContext.of(HttpRequest.of(HttpMethod.GET, "/"));
+    }
+
+    private static ClientRequestContext clientRequestContext() {
+        return ClientRequestContext.of(HttpRequest.of(HttpMethod.GET, "/"));
     }
 }

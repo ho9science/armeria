@@ -35,7 +35,6 @@ import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.MediaType;
 import com.linecorp.armeria.common.ResponseHeaders;
 import com.linecorp.armeria.common.sse.ServerSentEvent;
-import com.linecorp.armeria.common.sse.ServerSentEventBuilder;
 import com.linecorp.armeria.server.ServiceRequestContext;
 
 import reactor.core.publisher.Flux;
@@ -88,9 +87,10 @@ public class ServerSentEventResponseConverterFunctionTest {
     @Test
     public void escapeLineFeedFromMultilineString() throws Exception {
         final HttpResponse response = doConvert(
-                Mono.just(new ServerSentEventBuilder().id("1\n2").event("add\nadd")
-                                                      .comment("additional\ndescription")
-                                                      .data("foo\nbar").build()));
+                Mono.just(ServerSentEvent.builder()
+                                         .id("1\n2").event("add\nadd")
+                                         .comment("additional\ndescription")
+                                         .data("foo\nbar").build()));
         StepVerifier.create(response)
                     .expectNext(EVENT_STREAM_HEADER)
                     .expectNext(HttpData.ofUtf8(":additional\n:description\nid:1\nid:2\n" +
@@ -108,7 +108,7 @@ public class ServerSentEventResponseConverterFunctionTest {
                           ServerSentEvent.ofData("")));
         StepVerifier.create(response)
                     .expectNext(EVENT_STREAM_HEADER)
-                    .expectNext(HttpData.EMPTY_DATA)
+                    .expectNext(HttpData.empty())
                     .expectNext(HttpData.ofUtf8("id\n\n"))
                     .expectNext(HttpData.ofUtf8("event\n\n"))
                     .expectNext(HttpData.ofUtf8("data\n\n"))

@@ -15,136 +15,80 @@
  */
 package com.linecorp.armeria.client;
 
+import static com.google.common.base.Preconditions.checkArgument;
 import static java.util.Objects.requireNonNull;
 
 import java.net.URI;
+import java.time.Duration;
+import java.util.Map.Entry;
+import java.util.function.Function;
+import java.util.function.Supplier;
 
 import javax.annotation.Nullable;
 
+import com.linecorp.armeria.client.endpoint.EndpointGroup;
+import com.linecorp.armeria.common.RequestId;
 import com.linecorp.armeria.common.Scheme;
-import com.linecorp.armeria.common.SerializationFormat;
-import com.linecorp.armeria.common.SessionProtocol;
+import com.linecorp.armeria.common.auth.BasicToken;
+import com.linecorp.armeria.common.auth.OAuth1aToken;
+import com.linecorp.armeria.common.auth.OAuth2Token;
 
 /**
  * Creates a new client that connects to the specified {@link URI} using the builder pattern. Use the factory
  * methods in {@link Clients} if you do not have many options to override. If you are creating an
- * {@link HttpClient}, it is recommended to use the {@link HttpClientBuilder} or
- * factory methods in {@link HttpClient}.
+ * {@link WebClient}, it is recommended to use the {@link WebClientBuilder} or
+ * factory methods in {@link WebClient}.
  *
  * <h3>How are decorators and HTTP headers configured?</h3>
  *
  * <p>Unlike other options, when a user calls {@link #option(ClientOption, Object)} or {@code options()} with
- * a {@link ClientOption#DECORATION} or a {@link ClientOption#HTTP_HEADERS}, this builder will not simply
+ * a {@link ClientOptions#DECORATION} or a {@link ClientOptions#HEADERS}, this builder will not simply
  * replace the old option but <em>merge</em> the specified option into the previous option value. For example:
  * <pre>{@code
- * ClientOptionsBuilder b = new ClientOptionsBuilder();
- * b.option(ClientOption.HTTP_HEADERS, headersA);
- * b.option(ClientOption.HTTP_HEADERS, headersB);
+ * ClientOptionsBuilder b = ClientOptions.builder();
+ * b.option(ClientOption.HEADERS, headersA);
+ * b.option(ClientOption.HEADERS, headersB);
  * b.option(ClientOption.DECORATION, decorationA);
  * b.option(ClientOption.DECORATION, decorationB);
  *
  * ClientOptions opts = b.build();
- * HttpHeaders httpHeaders = opts.httpHeaders();
+ * HttpHeaders headers = opts.headers();
  * ClientDecoration decorations = opts.decoration();
  * }</pre>
- * {@code httpHeaders} will contain all HTTP headers of {@code headersA} and {@code headersB}.
+ * {@code headers} will contain all HTTP headers of {@code headersA} and {@code headersB}.
  * If {@code headersA} and {@code headersB} have the headers with the same name, the duplicate header in
  * {@code headerB} will replace the one with the same name in {@code headerA}.
  * Similarly, {@code decorations} will contain all decorators of {@code decorationA} and {@code decorationB},
  * but there will be no replacement but only addition.
  */
-public final class ClientBuilder extends AbstractClientOptionsBuilder<ClientBuilder> {
+public final class ClientBuilder extends AbstractClientOptionsBuilder {
 
     @Nullable
     private final URI uri;
     @Nullable
-    private final Endpoint endpoint;
+    private final EndpointGroup endpointGroup;
     @Nullable
+    private final String path;
     private final Scheme scheme;
-    @Nullable
-    private final SessionProtocol protocol;
-    @Nullable
-    private String path;
 
-    private SerializationFormat format = SerializationFormat.NONE;
-
-    private ClientFactory factory = ClientFactory.DEFAULT;
-
-    /**
-     * Creates a new {@link ClientBuilder} that builds the client that connects to the specified {@code uri}.
-     */
-    public ClientBuilder(String uri) {
-        this(URI.create(requireNonNull(uri, "uri")));
-    }
-
-    /**
-     * Creates a new {@link ClientBuilder} that builds the client that connects to the specified {@link URI}.
-     */
-    public ClientBuilder(URI uri) {
-        this(requireNonNull(uri, "uri"), null, null, null);
-    }
-
-    /**
-     * Creates a new {@link ClientBuilder} that builds the client that connects to the specified
-     * {@link Endpoint} with the {@code scheme}.
-     */
-    public ClientBuilder(String scheme, Endpoint endpoint) {
-        this(Scheme.parse(requireNonNull(scheme, "scheme")), requireNonNull(endpoint, "endpoint"));
-    }
-
-    /**
-     * Creates a new {@link ClientBuilder} that builds the client that connects to the specified
-     * {@link Endpoint} with the {@link Scheme}.
-     */
-    public ClientBuilder(Scheme scheme, Endpoint endpoint) {
-        this(null, requireNonNull(scheme, "scheme"), null, requireNonNull(endpoint, "endpoint"));
-    }
-
-    /**
-     * Creates a new {@link ClientBuilder} that builds the client that connects to the specified
-     * {@link Endpoint} with the {@link SessionProtocol}.
-     */
-    public ClientBuilder(SessionProtocol protocol, Endpoint endpoint) {
-        this(null, null, requireNonNull(protocol, "protocol"), requireNonNull(endpoint, "endpoint"));
-    }
-
-    private ClientBuilder(@Nullable URI uri, @Nullable Scheme scheme, @Nullable SessionProtocol protocol,
-                          @Nullable Endpoint endpoint) {
+    ClientBuilder(URI uri) {
+        checkArgument(uri.getScheme() != null, "uri must have scheme: %s", uri);
+        checkArgument(uri.getRawAuthority() != null, "uri must have authority: %s", uri);
         this.uri = uri;
-        this.scheme = scheme;
-        this.protocol = protocol;
-        this.endpoint = endpoint;
+        endpointGroup = null;
+        path = null;
+        scheme = Scheme.parse(uri.getScheme());
     }
 
-    /**
-     * Sets the {@link ClientFactory} of the client. The default is {@link ClientFactory#DEFAULT}.
-     */
-    public ClientBuilder factory(ClientFactory factory) {
-        this.factory = requireNonNull(factory, "factory");
-        return this;
-    }
-
-    /**
-     * Sets the {@code path} of the client.
-     */
-    public ClientBuilder path(String path) {
-        ensureEndpoint();
-
-        this.path = requireNonNull(path, "path");
-        return this;
-    }
-
-    /**
-     * Sets the {@link SerializationFormat} of the client. The default is {@link SerializationFormat#NONE}.
-     */
-    public ClientBuilder serializationFormat(SerializationFormat format) {
-        ensureEndpoint();
-        if (scheme != null) {
-            throw new IllegalStateException("scheme is already given");
+    ClientBuilder(Scheme scheme, EndpointGroup endpointGroup, @Nullable String path) {
+        if (path != null) {
+            checkArgument(path.startsWith("/"),
+                          "path: %s (expected: an absolute path starting with '/')", path);
         }
-
-        this.format = requireNonNull(format, "format");
-        return this;
+        uri = null;
+        this.endpointGroup = endpointGroup;
+        this.path = path;
+        this.scheme = scheme;
     }
 
     /**
@@ -152,30 +96,157 @@ public final class ClientBuilder extends AbstractClientOptionsBuilder<ClientBuil
      * properties of this builder.
      *
      * @throws IllegalArgumentException if the scheme of the {@code uri} specified in
-     *                                  {@link #ClientBuilder(String)} or the specified {@code clientType} is
+     *                                  {@link Clients#builder(String)} or the specified {@code clientType} is
      *                                  unsupported for the scheme
      */
     public <T> T build(Class<T> clientType) {
         requireNonNull(clientType, "clientType");
 
+        final Object client;
+        final ClientOptions options = buildOptions();
+        final ClientFactory factory = options.factory();
         if (uri != null) {
-            return factory.newClient(uri, clientType, buildOptions());
-        } else if (path != null) {
-            return factory.newClient(scheme(), endpoint, path, clientType, buildOptions());
+            client = factory.newClient(ClientBuilderParams.of(uri, clientType, options));
         } else {
-            return factory.newClient(scheme(), endpoint, clientType, buildOptions());
+            assert endpointGroup != null;
+            client = factory.newClient(ClientBuilderParams.of(scheme, endpointGroup,
+                                                              path, clientType, options));
         }
+
+        @SuppressWarnings("unchecked")
+        final T cast = (T) client;
+        return cast;
     }
 
-    private Scheme scheme() {
-        return scheme == null ? Scheme.of(format, protocol) : scheme;
+    // Override the return type of the chaining methods in the superclass.
+
+    @Override
+    public ClientBuilder options(ClientOptions options) {
+        return (ClientBuilder) super.options(options);
     }
 
-    private void ensureEndpoint() {
-        if (endpoint == null) {
-            throw new IllegalStateException(
-                    getClass().getSimpleName() + " must be created with an " + Endpoint.class.getSimpleName() +
-                    " to call this method.");
-        }
+    @Override
+    public ClientBuilder options(ClientOptionValue<?>... options) {
+        return (ClientBuilder) super.options(options);
+    }
+
+    @Override
+    public ClientBuilder options(Iterable<ClientOptionValue<?>> options) {
+        return (ClientBuilder) super.options(options);
+    }
+
+    @Override
+    public <T> ClientBuilder option(ClientOption<T> option, T value) {
+        return (ClientBuilder) super.option(option, value);
+    }
+
+    @Override
+    public <T> ClientBuilder option(ClientOptionValue<T> optionValue) {
+        return (ClientBuilder) super.option(optionValue);
+    }
+
+    @Override
+    public ClientBuilder factory(ClientFactory factory) {
+        return (ClientBuilder) super.factory(factory);
+    }
+
+    @Override
+    public ClientBuilder writeTimeout(Duration writeTimeout) {
+        return (ClientBuilder) super.writeTimeout(writeTimeout);
+    }
+
+    @Override
+    public ClientBuilder writeTimeoutMillis(long writeTimeoutMillis) {
+        return (ClientBuilder) super.writeTimeoutMillis(writeTimeoutMillis);
+    }
+
+    @Override
+    public ClientBuilder responseTimeout(Duration responseTimeout) {
+        return (ClientBuilder) super.responseTimeout(responseTimeout);
+    }
+
+    @Override
+    public ClientBuilder responseTimeoutMillis(long responseTimeoutMillis) {
+        return (ClientBuilder) super.responseTimeoutMillis(responseTimeoutMillis);
+    }
+
+    @Override
+    public ClientBuilder maxResponseLength(long maxResponseLength) {
+        return (ClientBuilder) super.maxResponseLength(maxResponseLength);
+    }
+
+    @Override
+    public ClientBuilder requestIdGenerator(Supplier<RequestId> requestIdGenerator) {
+        return (ClientBuilder) super.requestIdGenerator(requestIdGenerator);
+    }
+
+    @Override
+    public ClientBuilder endpointRemapper(
+            Function<? super Endpoint, ? extends EndpointGroup> endpointRemapper) {
+        return (ClientBuilder) super.endpointRemapper(endpointRemapper);
+    }
+
+    @Override
+    public ClientBuilder decorator(
+            Function<? super HttpClient, ? extends HttpClient> decorator) {
+        return (ClientBuilder) super.decorator(decorator);
+    }
+
+    @Override
+    public ClientBuilder decorator(DecoratingHttpClientFunction decorator) {
+        return (ClientBuilder) super.decorator(decorator);
+    }
+
+    @Override
+    public ClientBuilder clearDecorators() {
+        return (ClientBuilder) super.clearDecorators();
+    }
+
+    @Override
+    public ClientBuilder rpcDecorator(
+            Function<? super RpcClient, ? extends RpcClient> decorator) {
+        return (ClientBuilder) super.rpcDecorator(decorator);
+    }
+
+    @Override
+    public ClientBuilder rpcDecorator(DecoratingRpcClientFunction decorator) {
+        return (ClientBuilder) super.rpcDecorator(decorator);
+    }
+
+    @Override
+    public ClientBuilder addHeader(CharSequence name, Object value) {
+        return (ClientBuilder) super.addHeader(name, value);
+    }
+
+    @Override
+    public ClientBuilder addHeaders(
+            Iterable<? extends Entry<? extends CharSequence, ?>> headers) {
+        return (ClientBuilder) super.addHeaders(headers);
+    }
+
+    @Override
+    public ClientBuilder setHeader(CharSequence name, Object value) {
+        return (ClientBuilder) super.setHeader(name, value);
+    }
+
+    @Override
+    public ClientBuilder setHeaders(
+            Iterable<? extends Entry<? extends CharSequence, ?>> headers) {
+        return (ClientBuilder) super.setHeaders(headers);
+    }
+
+    @Override
+    public ClientBuilder auth(BasicToken token) {
+        return (ClientBuilder) super.auth(token);
+    }
+
+    @Override
+    public ClientBuilder auth(OAuth1aToken token) {
+        return (ClientBuilder) super.auth(token);
+    }
+
+    @Override
+    public ClientBuilder auth(OAuth2Token token) {
+        return (ClientBuilder) super.auth(token);
     }
 }

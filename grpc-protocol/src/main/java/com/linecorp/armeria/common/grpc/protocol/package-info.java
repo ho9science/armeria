@@ -13,17 +13,20 @@
  * License for the specific language governing permissions and limitations
  * under the License.
  */
-
 /**
- * Logic for handling the gRPC wire protocol, without support for gRPC generated code stubs. This package is
- * separated for advanced users that would like to use the gRPC wire protocol without depending on gRPC itself.
- * This package must not depend on any dependencies outside of armeria-core.
+ * Common classes for handling the gRPC wire protocol without support for gRPC generated code stubs.
+ * This package is separated for advanced users that would like to use the gRPC wire protocol without
+ * depending on gRPC itself. This package must not depend on any dependencies outside of {@code armeria-core}.
  *
- * <p>Don't use this package unless you know what you're doing, it is generally recommended to use normal gRPC
- * stubs and {@link com.linecorp.armeria.server.grpc.GrpcServiceBuilder} or making a client with the
- * "gproto+" prefix.
+ * <p>Don't use this package unless you know what you're doing, it is generally recommended to use
+ * the {@code armeria-grpc} module instead of this package.</p>
+ *
+ * <p>The classes in this package, unlike other packages, are not guaranteed to be backward compatible since
+ * it's an advanced API.</p>
  */
+@UnstableApi
 @NonNullByDefault
 package com.linecorp.armeria.common.grpc.protocol;
 
-import com.linecorp.armeria.common.util.NonNullByDefault;
+import com.linecorp.armeria.common.annotation.NonNullByDefault;
+import com.linecorp.armeria.common.annotation.UnstableApi;

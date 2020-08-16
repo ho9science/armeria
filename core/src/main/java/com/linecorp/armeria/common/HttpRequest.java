@@ -19,6 +19,7 @@ package com.linecorp.armeria.common;
 import static com.linecorp.armeria.common.HttpHeaderNames.CONTENT_LENGTH;
 import static java.util.Objects.requireNonNull;
 
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.Formatter;
 import java.util.Locale;
@@ -29,12 +30,19 @@ import javax.annotation.Nullable;
 import org.reactivestreams.Publisher;
 import org.reactivestreams.Subscriber;
 
+import com.google.errorprone.annotations.FormatMethod;
+import com.google.errorprone.annotations.FormatString;
+
 import com.linecorp.armeria.common.FixedHttpRequest.EmptyFixedHttpRequest;
 import com.linecorp.armeria.common.FixedHttpRequest.OneElementFixedHttpRequest;
 import com.linecorp.armeria.common.FixedHttpRequest.RegularFixedHttpRequest;
 import com.linecorp.armeria.common.FixedHttpRequest.TwoElementFixedHttpRequest;
+import com.linecorp.armeria.common.annotation.UnstableApi;
 import com.linecorp.armeria.common.stream.StreamMessage;
 import com.linecorp.armeria.common.stream.SubscriptionOption;
+import com.linecorp.armeria.common.util.EventLoopCheckingFuture;
+import com.linecorp.armeria.internal.common.DefaultHttpRequest;
+import com.linecorp.armeria.unsafe.PooledObjects;
 
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.util.concurrent.EventExecutor;
@@ -93,7 +101,7 @@ public interface HttpRequest extends Request, StreamMessage<HttpObject> {
         requireNonNull(content, "content");
         requireNonNull(mediaType, "mediaType");
         return of(method, path, mediaType,
-                  HttpData.of(mediaType.charset().orElse(StandardCharsets.UTF_8), content));
+                  HttpData.of(mediaType.charset(StandardCharsets.UTF_8), content));
     }
 
     /**
@@ -108,7 +116,7 @@ public interface HttpRequest extends Request, StreamMessage<HttpObject> {
         requireNonNull(content, "content");
         requireNonNull(mediaType, "mediaType");
         return of(method, path, mediaType,
-                  HttpData.of(mediaType.charset().orElse(StandardCharsets.UTF_8), content));
+                  HttpData.of(mediaType.charset(StandardCharsets.UTF_8), content));
     }
 
     /**
@@ -121,12 +129,14 @@ public interface HttpRequest extends Request, StreamMessage<HttpObject> {
      * @param format {@linkplain Formatter the format string} of the request content
      * @param args the arguments referenced by the format specifiers in the format string
      */
-    static HttpRequest of(HttpMethod method, String path, MediaType mediaType, String format, Object... args) {
+    @FormatMethod
+    static HttpRequest of(HttpMethod method, String path, MediaType mediaType,
+                          @FormatString String format, Object... args) {
         requireNonNull(method, "method");
         requireNonNull(path, "path");
         requireNonNull(mediaType, "mediaType");
         return of(method, path, mediaType,
-                  HttpData.of(mediaType.charset().orElse(StandardCharsets.UTF_8), format, args));
+                  HttpData.of(mediaType.charset(StandardCharsets.UTF_8), format, args));
     }
 
     /**
@@ -179,7 +189,7 @@ public interface HttpRequest extends Request, StreamMessage<HttpObject> {
      * Creates a new {@link HttpRequest} with empty content and closes the stream.
      */
     static HttpRequest of(RequestHeaders headers) {
-        return of(headers, HttpData.EMPTY_DATA);
+        return of(headers, HttpData.empty());
     }
 
     /**
@@ -199,26 +209,30 @@ public interface HttpRequest extends Request, StreamMessage<HttpObject> {
         requireNonNull(content, "content");
         requireNonNull(trailers, "trailers");
 
-        if (content.isEmpty()) {
-            final RequestHeadersBuilder builder = headers.toBuilder();
-            builder.remove(CONTENT_LENGTH);
-            headers = builder.build();
-        } else {
+        final int contentLength = content.length();
+        if (contentLength == 0) {
+            content.close();
+
             headers = headers.toBuilder()
-                             .setInt(CONTENT_LENGTH, content.length())
+                             .removeAndThen(CONTENT_LENGTH)
                              .build();
+
+            if (!trailers.isEmpty()) {
+                return new OneElementFixedHttpRequest(headers, trailers);
+            } else {
+                return new EmptyFixedHttpRequest(headers);
+            }
         }
 
-        if (!content.isEmpty()) {
-            if (trailers.isEmpty()) {
-                return new OneElementFixedHttpRequest(headers, content);
-            } else {
-                return new TwoElementFixedHttpRequest(headers, content, trailers);
-            }
-        } else if (!trailers.isEmpty()) {
-            return new OneElementFixedHttpRequest(headers, trailers);
+        // `content` is not empty.
+        headers = headers.toBuilder()
+                         .setInt(CONTENT_LENGTH, contentLength)
+                         .build();
+
+        if (trailers.isEmpty()) {
+            return new OneElementFixedHttpRequest(headers, content);
         } else {
-            return new EmptyFixedHttpRequest(headers);
+            return new TwoElementFixedHttpRequest(headers, content, trailers);
         }
     }
 
@@ -241,34 +255,86 @@ public interface HttpRequest extends Request, StreamMessage<HttpObject> {
     }
 
     /**
-     * Converts the {@link AggregatedHttpRequest} into a new {@link HttpRequest} and closes the stream.
-     */
-    static HttpRequest of(AggregatedHttpRequest request) {
-        return of(request.headers(), request.content(), request.trailers());
-    }
-
-    /**
      * Creates a new instance from an existing {@link RequestHeaders} and {@link Publisher}.
      */
     static HttpRequest of(RequestHeaders headers, Publisher<? extends HttpObject> publisher) {
+        requireNonNull(headers, "headers");
         requireNonNull(publisher, "publisher");
-        return new PublisherBasedHttpRequest(headers, publisher);
+        if (publisher instanceof HttpRequest) {
+            return ((HttpRequest) publisher).withHeaders(headers);
+        } else {
+            return new PublisherBasedHttpRequest(headers, publisher);
+        }
     }
 
     /**
-     * Creates a new instance from an existing {@link HttpRequest} replacing its {@link RequestHeaders}
-     * with the specified {@code newHeaders}. Make sure to update {@link RequestContext#request()} with
-     * {@link RequestContext#updateRequest(Request)} if you are intercepting an {@link HttpRequest}
-     * in a decorator. For example:
+     * Returns the initial HTTP/2 headers of this request.
+     */
+    RequestHeaders headers();
+
+    /**
+     * Returns the URI of this request. This method is a shortcut for {@code headers().uri()}.
+     */
+    default URI uri() {
+        return headers().uri();
+    }
+
+    /**
+     * Returns the scheme of this request. This method is a shortcut for {@code headers().scheme()}.
+     */
+    @Nullable
+    default String scheme() {
+        return headers().scheme();
+    }
+
+    /**
+     * Returns the method of this request. This method is a shortcut for {@code headers().method()}.
+     */
+    default HttpMethod method() {
+        return headers().method();
+    }
+
+    /**
+     * Returns the path of this request. This method is a shortcut for {@code headers().path()}.
+     */
+    default String path() {
+        return headers().path();
+    }
+
+    /**
+     * Returns the authority of this request. This method is a shortcut for {@code headers().authority()}.
+     */
+    @Nullable
+    default String authority() {
+        return headers().authority();
+    }
+
+    /**
+     * Returns the value of the {@code 'content-type'} header.
+     * @return the valid header value if present, or {@code null} otherwise.
+     */
+    @Nullable
+    default MediaType contentType() {
+        return headers().contentType();
+    }
+
+    /**
+     * Returns a new {@link HttpRequest} derived from this {@link HttpRequest} by replacing its
+     * {@link RequestHeaders} with the specified {@code newHeaders}. Note that the content stream and trailers
+     * of this {@link HttpRequest} is not duplicated, which means you can subscribe to only one of the two
+     * {@link HttpRequest}s.
+     *
+     * <p>If you are using this method for intercepting an {@link HttpRequest} in a decorator, make sure to
+     * update {@link RequestContext#request()} with {@link RequestContext#updateRequest(HttpRequest)}, e.g.
      * <pre>{@code
-     * > public class MyService extends SimpleDecoratingService<HttpRequest, HttpResponse> {
+     * > public class MyService extends SimpleDecoratingHttpService {
      * >     @Override
      * >     public HttpResponse serve(ServiceRequestContext ctx, HttpRequest req) {
      * >         // Create a new request with an additional header.
-     * >         final HttpRequest newReq = HttpRequest.of(
-     * >                 req, req.headers().toBuilder()
-     * >                         .set("x-custom-header", "value")
-     * >                         .build());
+     * >         final HttpRequest newReq =
+     * >                 req.withHeaders(req.headers().toBuilder()
+     * >                                    .set("x-custom-header", "value")
+     * >                                    .build());
      * >
      * >         // Update the ctx.request.
      * >         ctx.updateRequest(newReq);
@@ -279,67 +345,45 @@ public interface HttpRequest extends Request, StreamMessage<HttpObject> {
      * > }
      * }</pre>
      */
-    static HttpRequest of(HttpRequest request, RequestHeaders newHeaders) {
-        requireNonNull(request, "request");
+    default HttpRequest withHeaders(RequestHeaders newHeaders) {
         requireNonNull(newHeaders, "newHeaders");
-        if (request.headers() == newHeaders) {
+        if (headers() == newHeaders) {
             // Just check the reference only to avoid heavy comparison.
-            return request;
+            return this;
         }
 
-        if (request instanceof HeaderOverridingHttpRequest) {
-            request = ((HeaderOverridingHttpRequest) request).unwrap();
-        }
-
-        if (request.headers() == newHeaders) {
-            return request;
-        }
-
-        return new HeaderOverridingHttpRequest(request, newHeaders);
+        return new HeaderOverridingHttpRequest(this, newHeaders);
     }
 
     /**
-     * Returns the initial HTTP/2 headers of this request.
+     * Returns a new {@link HttpRequest} derived from this {@link HttpRequest} by replacing its
+     * {@link RequestHeaders} with what's built from the specified {@code newHeadersBuilder}.
+     * Note that the content stream and trailers of this {@link HttpRequest} is not duplicated,
+     * which means you can subscribe to only one of the two {@link HttpRequest}s.
+     *
+     * <p>If you are using this method for intercepting an {@link HttpRequest} in a decorator, make sure to
+     * update {@link RequestContext#request()} with {@link RequestContext#updateRequest(HttpRequest)}, e.g.
+     * <pre>{@code
+     * > public class MyService extends SimpleDecoratingHttpService {
+     * >     @Override
+     * >     public HttpResponse serve(ServiceRequestContext ctx, HttpRequest req) {
+     * >         // Create a new request with an additional header.
+     * >         final HttpRequest newReq =
+     * >                 req.withHeaders(req.headers().toBuilder()
+     * >                                    .set("x-custom-header", "value"));
+     * >
+     * >         // Update the ctx.request.
+     * >         ctx.updateRequest(newReq);
+     * >
+     * >         // Delegate the new request with the updated context.
+     * >         return delegate().serve(ctx, newReq);
+     * >     }
+     * > }
+     * }</pre>
      */
-    RequestHeaders headers();
-
-    /**
-     * Returns the scheme of this request. This method is a shortcut of {@code headers().scheme()}.
-     */
-    @Nullable
-    default String scheme() {
-        return headers().scheme();
-    }
-
-    /**
-     * Returns the method of this request. This method is a shortcut of {@code headers().method()}.
-     */
-    default HttpMethod method() {
-        return headers().method();
-    }
-
-    /**
-     * Returns the path of this request. This method is a shortcut of {@code headers().path()}.
-     */
-    default String path() {
-        return headers().path();
-    }
-
-    /**
-     * Returns the authority of this request. This method is a shortcut of {@code headers().authority()}.
-     */
-    @Nullable
-    default String authority() {
-        return headers().authority();
-    }
-
-    /**
-     * Returns the value of the {@code 'content-type'} header.
-     * @return the valid header value if present. {@code null} otherwise.
-     */
-    @Nullable
-    default MediaType contentType() {
-        return headers().contentType();
+    default HttpRequest withHeaders(RequestHeadersBuilder newHeadersBuilder) {
+        requireNonNull(newHeadersBuilder, "newHeadersBuilder");
+        return withHeaders(newHeadersBuilder.build());
     }
 
     /**
@@ -347,10 +391,7 @@ public interface HttpRequest extends Request, StreamMessage<HttpObject> {
      * the trailers of the request is received fully.
      */
     default CompletableFuture<AggregatedHttpRequest> aggregate() {
-        final CompletableFuture<AggregatedHttpRequest> future = new CompletableFuture<>();
-        final HttpRequestAggregator aggregator = new HttpRequestAggregator(this, future, null);
-        subscribe(aggregator);
-        return future;
+        return aggregate(defaultSubscriberExecutor());
     }
 
     /**
@@ -359,24 +400,23 @@ public interface HttpRequest extends Request, StreamMessage<HttpObject> {
      */
     default CompletableFuture<AggregatedHttpRequest> aggregate(EventExecutor executor) {
         requireNonNull(executor, "executor");
-        final CompletableFuture<AggregatedHttpRequest> future = new CompletableFuture<>();
+        final CompletableFuture<AggregatedHttpRequest> future = new EventLoopCheckingFuture<>();
         final HttpRequestAggregator aggregator = new HttpRequestAggregator(this, future, null);
         subscribe(aggregator, executor);
         return future;
     }
 
     /**
-     * Aggregates this request. The returned {@link CompletableFuture} will be notified when the content and
-     * the trailers of the request is received fully. {@link AggregatedHttpRequest#content()} will
-     * return a pooled object, and the caller must ensure to release it. If you don't know what this means,
-     * use {@link #aggregate()}.
+     * (Advanced users only) Aggregates this request. The returned {@link CompletableFuture} will be notified
+     * when the content and the trailers of the request is received fully.
+     * {@link AggregatedHttpRequest#content()} will return a pooled object, and the caller must ensure
+     * to release it. If you don't know what this means, use {@link #aggregate()}.
+     *
+     * @see PooledObjects
      */
+    @UnstableApi
     default CompletableFuture<AggregatedHttpRequest> aggregateWithPooledObjects(ByteBufAllocator alloc) {
-        requireNonNull(alloc, "alloc");
-        final CompletableFuture<AggregatedHttpRequest> future = new CompletableFuture<>();
-        final HttpRequestAggregator aggregator = new HttpRequestAggregator(this, future, alloc);
-        subscribe(aggregator, SubscriptionOption.WITH_POOLED_OBJECTS);
-        return future;
+        return aggregateWithPooledObjects(defaultSubscriberExecutor(), alloc);
     }
 
     /**
@@ -389,9 +429,67 @@ public interface HttpRequest extends Request, StreamMessage<HttpObject> {
             EventExecutor executor, ByteBufAllocator alloc) {
         requireNonNull(executor, "executor");
         requireNonNull(alloc, "alloc");
-        final CompletableFuture<AggregatedHttpRequest> future = new CompletableFuture<>();
+        final CompletableFuture<AggregatedHttpRequest> future = new EventLoopCheckingFuture<>();
         final HttpRequestAggregator aggregator = new HttpRequestAggregator(this, future, alloc);
         subscribe(aggregator, executor, SubscriptionOption.WITH_POOLED_OBJECTS);
         return future;
+    }
+
+    /**
+     * Returns a new {@link HttpRequestDuplicator} that duplicates this {@link HttpRequest} into one or
+     * more {@link HttpRequest}s, which publish the same elements.
+     * Note that you cannot subscribe to this {@link HttpRequest} anymore after you call this method.
+     * To subscribe, call {@link HttpRequestDuplicator#duplicate()} from the returned
+     * {@link HttpRequestDuplicator}.
+     */
+    @Override
+    default HttpRequestDuplicator toDuplicator() {
+        return toDuplicator(Flags.defaultMaxRequestLength());
+    }
+
+    /**
+     * Returns a new {@link HttpRequestDuplicator} that duplicates this {@link HttpRequest} into one or
+     * more {@link HttpRequest}s, which publish the same elements.
+     * Note that you cannot subscribe to this {@link HttpRequest} anymore after you call this method.
+     * To subscribe, call {@link HttpRequestDuplicator#duplicate()} from the returned
+     * {@link HttpRequestDuplicator}.
+     *
+     * @param executor the executor to duplicate
+     */
+    @Override
+    default HttpRequestDuplicator toDuplicator(EventExecutor executor) {
+        return toDuplicator(executor, Flags.defaultMaxRequestLength());
+    }
+
+    /**
+     * Returns a new {@link HttpRequestDuplicator} that duplicates this {@link HttpRequest} into one or
+     * more {@link HttpRequest}s, which publish the same elements.
+     * Note that you cannot subscribe to this {@link HttpRequest} anymore after you call this method.
+     * To subscribe, call {@link HttpRequestDuplicator#duplicate()} from the returned
+     * {@link HttpRequestDuplicator}.
+     *
+     * @param maxRequestLength the maximum request length that the duplicator can hold in its buffer.
+     *                         {@link ContentTooLargeException} is raised if the length of the buffered
+     *                         {@link HttpData} is greater than this value.
+     */
+    default HttpRequestDuplicator toDuplicator(long maxRequestLength) {
+        return toDuplicator(defaultSubscriberExecutor(), maxRequestLength);
+    }
+
+    /**
+     * Returns a new {@link HttpRequestDuplicator} that duplicates this {@link HttpRequest} into one or
+     * more {@link HttpRequest}s, which publish the same elements.
+     * Note that you cannot subscribe to this {@link HttpRequest} anymore after you call this method.
+     * To subscribe, call {@link HttpRequestDuplicator#duplicate()} from the returned
+     * {@link HttpRequestDuplicator}.
+     *
+     * @param executor the executor to duplicate
+     * @param maxRequestLength the maximum request length that the duplicator can hold in its buffer.
+     *                         {@link ContentTooLargeException} is raised if the length of the buffered
+     *                         {@link HttpData} is greater than this value.
+     */
+    default HttpRequestDuplicator toDuplicator(EventExecutor executor, long maxRequestLength) {
+        requireNonNull(executor, "executor");
+        return new DefaultHttpRequestDuplicator(this, executor, maxRequestLength);
     }
 }

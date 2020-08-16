@@ -353,6 +353,8 @@ public final class HttpStatus implements Comparable<HttpStatus> {
      * Returns the {@link HttpStatus} represented by the specified status text.
      *
      * @return the parsed {@link HttpStatus}, or {@link #UNKNOWN} if failed to parse.
+     *
+     * @see #isContentAlwaysEmpty()
      */
     public static HttpStatus valueOf(String statusText) {
         requireNonNull(statusText, "statusText");
@@ -371,6 +373,21 @@ public final class HttpStatus implements Comparable<HttpStatus> {
         }
 
         return valueOf(statusCode);
+    }
+
+    /**
+     * Returns {@code true} if the content of the response for the specified status code is expected to
+     * be always empty (204, 205 and 304 responses.)
+     */
+    @SuppressWarnings("checkstyle:OverloadMethodsDeclarationOrder")
+    public static boolean isContentAlwaysEmpty(int statusCode) {
+        switch (statusCode) {
+            case /* NO_CONTENT */ 204:
+            case /* RESET_CONTENT */ 205:
+            case /* NOT_MODIFIED */ 304:
+                return true;
+        }
+        return false;
     }
 
     private final int code;
@@ -404,10 +421,11 @@ public final class HttpStatus implements Comparable<HttpStatus> {
             final char c = reasonPhrase.charAt(i);
             // Check prohibited characters.
             switch (c) {
-                case '\n': case '\r':
+                case '\n':
+                case '\r':
                     throw new IllegalArgumentException(
                             "reasonPhrase contains one of the following prohibited characters: " +
-                                    "\\r\\n: " + reasonPhrase);
+                            "\\r\\n: " + reasonPhrase);
             }
         }
 
@@ -457,6 +475,59 @@ public final class HttpStatus implements Comparable<HttpStatus> {
      */
     public HttpData toHttpData() {
         return httpData;
+    }
+
+    /**
+     * Returns {@code true} if the content of the response for this {@link HttpStatus} is expected to
+     * be always empty (204, 205 and 304 responses.)
+     *
+     * @see #isContentAlwaysEmpty(int)
+     */
+    @SuppressWarnings("checkstyle:OverloadMethodsDeclarationOrder")
+    public boolean isContentAlwaysEmpty() {
+        return isContentAlwaysEmpty(code);
+    }
+
+    /**
+     * Returns whether the {@link HttpStatus} is an information, with a status code of 1XX.
+     */
+    public boolean isInformational() {
+        return codeClass == HttpStatusClass.INFORMATIONAL;
+    }
+
+    /**
+     * Returns whether the {@link HttpStatus} is a success, with a status code of 2XX.
+     */
+    public boolean isSuccess() {
+        return codeClass == HttpStatusClass.SUCCESS;
+    }
+
+    /**
+     * Returns whether the {@link HttpStatus} is a redirection, with a status code of 3XX.
+     */
+    public boolean isRedirection() {
+        return codeClass == HttpStatusClass.REDIRECTION;
+    }
+
+    /**
+     * Returns whether the {@link HttpStatus} is a client error, with a status code of 4XX.
+     */
+    public boolean isClientError() {
+        return codeClass == HttpStatusClass.CLIENT_ERROR;
+    }
+
+    /**
+     * Returns whether the {@link HttpStatus} is a server error, with a status code of 5XX.
+     */
+    public boolean isServerError() {
+        return codeClass == HttpStatusClass.SERVER_ERROR;
+    }
+
+    /**
+     * Returns whether the {@link HttpStatus} is an error.
+     */
+    public boolean isError() {
+        return isClientError() || isServerError();
     }
 
     @Override

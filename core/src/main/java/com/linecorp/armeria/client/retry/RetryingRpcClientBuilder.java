@@ -19,39 +19,32 @@ package com.linecorp.armeria.client.retry;
 import java.time.Duration;
 import java.util.function.Function;
 
-import com.linecorp.armeria.client.Client;
-import com.linecorp.armeria.common.RpcRequest;
+import com.linecorp.armeria.client.RpcClient;
 import com.linecorp.armeria.common.RpcResponse;
 
 /**
  * Builds a new {@link RetryingRpcClient} or its decorator function.
  */
-public class RetryingRpcClientBuilder
-        extends RetryingClientBuilder<RetryingRpcClient, RpcRequest, RpcResponse> {
+public final class RetryingRpcClientBuilder extends AbstractRetryingClientBuilder<RpcResponse> {
 
-    /**
-     * Creates a new builder with the specified {@link RetryStrategyWithContent}.
-     */
-    public RetryingRpcClientBuilder(RetryStrategyWithContent<RpcResponse> retryStrategyWithContent) {
-        super(retryStrategyWithContent);
+    RetryingRpcClientBuilder(RetryRuleWithContent<RpcResponse> retryRuleWithContent) {
+        super(retryRuleWithContent);
     }
 
     /**
      * Returns a newly-created {@link RetryingRpcClient} based on the properties of this builder.
      */
-    @Override
-    public RetryingRpcClient build(Client<RpcRequest, RpcResponse> delegate) {
+    public RetryingRpcClient build(RpcClient delegate) {
         return new RetryingRpcClient(
-                delegate, retryStrategyWithContent(), maxTotalAttempts(),
+                delegate, retryRuleWithContent(), maxTotalAttempts(),
                 responseTimeoutMillisForEachAttempt());
     }
 
     /**
-     * Returns a newly-created decorator that decorates a {@link Client} with a new {@link RetryingRpcClient}
-     * based on the properties of this builder.
+     * Returns a newly-created decorator that decorates an {@link RpcClient} with a new
+     * {@link RetryingRpcClient} based on the properties of this builder.
      */
-    @Override
-    public Function<Client<RpcRequest, RpcResponse>, RetryingRpcClient> newDecorator() {
+    public Function<? super RpcClient, RetryingRpcClient> newDecorator() {
         return this::build;
     }
 

@@ -59,7 +59,6 @@ import java.nio.charset.UnsupportedCharsetException;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Map;
-import java.util.Optional;
 
 import org.junit.Test;
 
@@ -100,12 +99,12 @@ public class MediaTypeTest {
 
     @Test // reflection
     public void testConstants_charset() throws Exception {
-        for (Field field : getConstantFields()) {
-            Optional<Charset> charset = ((MediaType) field.get(null)).charset();
+        for (Field field : getConstantFields(MediaType.class)) {
+            final Charset charset = ((MediaType) field.get(null)).charset();
             if (field.getName().endsWith("_UTF_8")) {
-                assertThat(charset).hasValue(UTF_8);
+                assertThat(charset).isEqualTo(UTF_8);
             } else {
-                assertThat(charset).isEmpty();
+                assertThat(charset).isNull();
             }
         }
     }
@@ -117,20 +116,21 @@ public class MediaTypeTest {
 
     // reflection
     @SuppressWarnings("Guava")
-    private static FluentIterable<Field> getConstantFields() {
-        return FluentIterable.from(asList(MediaType.class.getDeclaredFields())).filter(input -> {
-            int modifiers = input.getModifiers();
+    static <T, R> FluentIterable<Field> getConstantFields(Class<T> clazz, Class<R>... filterClazz) {
+        return FluentIterable.from(asList(clazz.getDeclaredFields())).filter(input -> {
+            final int modifiers = input.getModifiers();
             return isPublic(modifiers) &&
                    isStatic(modifiers) &&
                    isFinal(modifiers) &&
-                   MediaType.class.equals(input.getType());
+                   filterClazz.length == 1 ?
+                   filterClazz[0].equals(input.getType()) : clazz.equals(input.getType());
         });
     }
 
     // reflection
     @SuppressWarnings("Guava")
     private static FluentIterable<MediaType> getConstants() {
-        return getConstantFields().transform(input -> {
+        return getConstantFields(MediaType.class).transform(input -> {
             try {
                 return (MediaType) input.get(null);
             } catch (Exception e) {
@@ -168,35 +168,35 @@ public class MediaTypeTest {
 
     @Test
     public void testCreateApplicationType() {
-        MediaType newType = MediaType.createApplicationType("yams");
+        final MediaType newType = MediaType.createApplicationType("yams");
         assertEquals("application", newType.type());
         assertEquals("yams", newType.subtype());
     }
 
     @Test
     public void testCreateAudioType() {
-        MediaType newType = MediaType.createAudioType("yams");
+        final MediaType newType = MediaType.createAudioType("yams");
         assertEquals("audio", newType.type());
         assertEquals("yams", newType.subtype());
     }
 
     @Test
     public void testCreateImageType() {
-        MediaType newType = MediaType.createImageType("yams");
+        final MediaType newType = MediaType.createImageType("yams");
         assertEquals("image", newType.type());
         assertEquals("yams", newType.subtype());
     }
 
     @Test
     public void testCreateTextType() {
-        MediaType newType = MediaType.createTextType("yams");
+        final MediaType newType = MediaType.createTextType("yams");
         assertEquals("text", newType.type());
         assertEquals("yams", newType.subtype());
     }
 
     @Test
     public void testCreateVideoType() {
-        MediaType newType = MediaType.createVideoType("yams");
+        final MediaType newType = MediaType.createVideoType("yams");
         assertEquals("video", newType.type());
         assertEquals("yams", newType.subtype());
     }
@@ -244,8 +244,8 @@ public class MediaTypeTest {
 
     @Test
     public void testWithParameters_invalidAttribute() {
-        MediaType mediaType = MediaType.parse("text/plain");
-        ImmutableListMultimap<String, String> parameters =
+        final MediaType mediaType = MediaType.parse("text/plain");
+        final ImmutableListMultimap<String, String> parameters =
                 ImmutableListMultimap.of("a", "1", "@", "2", "b", "3");
         try {
             mediaType.withParameters(parameters.asMap());
@@ -271,7 +271,7 @@ public class MediaTypeTest {
 
     @Test
     public void testWithParameter_invalidAttribute() {
-        MediaType mediaType = MediaType.parse("text/plain");
+        final MediaType mediaType = MediaType.parse("text/plain");
         try {
             mediaType.withParameter("@", "2");
             fail();
@@ -300,7 +300,7 @@ public class MediaTypeTest {
 
     @Test
     public void testWithParametersIterable_invalidAttribute() {
-        MediaType mediaType = MediaType.parse("text/plain");
+        final MediaType mediaType = MediaType.parse("text/plain");
         try {
             mediaType.withParameters("@", ImmutableSet.of("2"));
             fail();
@@ -310,7 +310,7 @@ public class MediaTypeTest {
 
     @Test
     public void testWithParametersIterable_nullValue() {
-        MediaType mediaType = MediaType.parse("text/plain");
+        final MediaType mediaType = MediaType.parse("text/plain");
         try {
             mediaType.withParameters("a", Collections.singletonList(null));
             fail();
@@ -462,18 +462,18 @@ public class MediaTypeTest {
 
     @Test
     public void testGetCharset() {
-        assertThat(MediaType.parse("text/plain").charset()).isEmpty();
-        assertThat(MediaType.parse("text/plain; charset=utf-8").charset()).hasValue(UTF_8);
+        assertThat(MediaType.parse("text/plain").charset()).isNull();
+        assertThat(MediaType.parse("text/plain; charset=utf-8").charset()).isEqualTo(UTF_8);
     }
 
     @Test // Non-UTF-8 Charset
     public void testGetCharset_utf16() {
-        assertThat(MediaType.parse("text/plain; charset=utf-16").charset()).hasValue(UTF_16);
+        assertThat(MediaType.parse("text/plain; charset=utf-16").charset()).isEqualTo(UTF_16);
     }
 
     @Test
     public void testGetCharset_tooMany() {
-        MediaType mediaType = MediaType.parse("text/plain; charset=utf-8; charset=utf-16");
+        final MediaType mediaType = MediaType.parse("text/plain; charset=utf-8; charset=utf-16");
         try {
             mediaType.charset();
             fail();
@@ -483,7 +483,7 @@ public class MediaTypeTest {
 
     @Test
     public void testGetCharset_illegalCharset() {
-        MediaType mediaType = MediaType.parse("text/plain; charset=\"!@#$%^&*()\"");
+        final MediaType mediaType = MediaType.parse("text/plain; charset=\"!@#$%^&*()\"");
         try {
             mediaType.charset();
             fail();
@@ -493,7 +493,7 @@ public class MediaTypeTest {
 
     @Test
     public void testGetCharset_unsupportedCharset() {
-        MediaType mediaType = MediaType.parse("text/plain; charset=utf-wtf");
+        final MediaType mediaType = MediaType.parse("text/plain; charset=utf-wtf");
         try {
             mediaType.charset();
             fail();
@@ -553,7 +553,7 @@ public class MediaTypeTest {
 
     @Test // com.google.common.testing.NullPointerTester
     public void testNullPointer() {
-        NullPointerTester tester = new NullPointerTester();
+        final NullPointerTester tester = new NullPointerTester();
         tester.testAllPublicConstructors(MediaType.class);
         tester.testAllPublicStaticMethods(MediaType.class);
         tester.testAllPublicInstanceMethods(MediaType.parse("text/plain"));

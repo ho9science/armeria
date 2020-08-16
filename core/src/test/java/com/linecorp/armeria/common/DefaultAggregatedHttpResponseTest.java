@@ -24,11 +24,12 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.nio.charset.StandardCharsets;
-import java.util.List;
 
 import org.junit.jupiter.api.Test;
 
 import com.google.common.collect.ImmutableList;
+
+import reactor.test.StepVerifier;
 
 class DefaultAggregatedHttpResponseTest {
 
@@ -36,27 +37,27 @@ class DefaultAggregatedHttpResponseTest {
     void toHttpResponse() {
         final AggregatedHttpResponse aRes = AggregatedHttpResponse.of(
                 HttpStatus.OK, PLAIN_TEXT_UTF_8, "alice");
-        final HttpResponse res = HttpResponse.of(aRes);
-        final List<HttpObject> drained = res.drainAll().join();
-
-        assertThat(drained).containsExactly(
-                ResponseHeaders.of(HttpStatus.OK,
-                                   CONTENT_TYPE, PLAIN_TEXT_UTF_8,
-                                   CONTENT_LENGTH, 5),
-                HttpData.of(StandardCharsets.UTF_8, "alice"));
+        final HttpResponse res = aRes.toHttpResponse();
+        StepVerifier.create(res)
+                    .expectNext(ResponseHeaders.of(HttpStatus.OK,
+                                                   CONTENT_TYPE, PLAIN_TEXT_UTF_8,
+                                                   CONTENT_LENGTH, 5))
+                    .expectNext(HttpData.of(StandardCharsets.UTF_8, "alice"))
+                    .expectComplete()
+                    .verify();
     }
 
     @Test
     void toHttpResponseWithoutContent() {
         final AggregatedHttpResponse aRes = AggregatedHttpResponse.of(HttpStatus.OK, PLAIN_TEXT_UTF_8,
-                                                                      HttpData.EMPTY_DATA);
-        final HttpResponse res = HttpResponse.of(aRes);
-        final List<HttpObject> drained = res.drainAll().join();
-
-        assertThat(drained).containsExactly(
-                ResponseHeaders.of(HttpStatus.OK,
-                                   CONTENT_TYPE, PLAIN_TEXT_UTF_8,
-                                   CONTENT_LENGTH, 0));
+                                                                      HttpData.empty());
+        final HttpResponse res = aRes.toHttpResponse();
+        StepVerifier.create(res)
+                    .expectNext(ResponseHeaders.of(HttpStatus.OK,
+                                                   CONTENT_TYPE, PLAIN_TEXT_UTF_8,
+                                                   CONTENT_LENGTH, 0))
+                    .expectComplete()
+                    .verify();
     }
 
     @Test
@@ -64,63 +65,51 @@ class DefaultAggregatedHttpResponseTest {
         final AggregatedHttpResponse aRes = AggregatedHttpResponse.of(
                 HttpStatus.OK, PLAIN_TEXT_UTF_8, HttpData.ofUtf8("bob"),
                 HttpHeaders.of(CONTENT_MD5, "9f9d51bc70ef21ca5c14f307980a29d8"));
-        final HttpResponse res = HttpResponse.of(aRes);
-        final List<HttpObject> drained = res.drainAll().join();
-
-        assertThat(drained).containsExactly(
-                ResponseHeaders.of(HttpStatus.OK,
-                                   CONTENT_TYPE, PLAIN_TEXT_UTF_8),
-                HttpData.of(StandardCharsets.UTF_8, "bob"),
-                HttpHeaders.of(CONTENT_MD5, "9f9d51bc70ef21ca5c14f307980a29d8"));
+        final HttpResponse res = aRes.toHttpResponse();
+        StepVerifier.create(res)
+                    .expectNext(ResponseHeaders.of(HttpStatus.OK, CONTENT_TYPE, PLAIN_TEXT_UTF_8))
+                    .expectNext(HttpData.of(StandardCharsets.UTF_8, "bob"))
+                    .expectNext(HttpHeaders.of(CONTENT_MD5, "9f9d51bc70ef21ca5c14f307980a29d8"))
+                    .expectComplete()
+                    .verify();
     }
 
     @Test
     void toHttpResponseWithInformationals() {
         final AggregatedHttpResponse aRes = AggregatedHttpResponse.of(
                 ImmutableList.of(ResponseHeaders.of(HttpStatus.CONTINUE)),
-                ResponseHeaders.of(HttpStatus.OK), HttpData.EMPTY_DATA, HttpHeaders.of());
+                ResponseHeaders.of(HttpStatus.OK), HttpData.empty(), HttpHeaders.of());
 
-        final HttpResponse res = HttpResponse.of(aRes);
-        final List<HttpObject> drained = res.drainAll().join();
-
-        assertThat(drained).containsExactly(
-                ResponseHeaders.of(HttpStatus.CONTINUE),
-                ResponseHeaders.of(HttpStatus.OK, CONTENT_LENGTH, 0));
+        final HttpResponse res = aRes.toHttpResponse();
+        StepVerifier.create(res)
+                    .expectNext(ResponseHeaders.of(HttpStatus.CONTINUE))
+                    .expectNext(ResponseHeaders.of(HttpStatus.OK, CONTENT_LENGTH, 0))
+                    .expectComplete()
+                    .verify();
     }
 
     @Test
-    void errorWhenContentOrTrailersExistsShouldBeEmpty() {
-        contentAndTrailersShouldBeEmpty(HttpStatus.CONTINUE, HttpData.ofUtf8("bob"),
-                                        HttpHeaders.of());
-        contentAndTrailersShouldBeEmpty(HttpStatus.NO_CONTENT, HttpData.ofUtf8("bob"),
-                                        HttpHeaders.of());
-        contentAndTrailersShouldBeEmpty(HttpStatus.RESET_CONTENT, HttpData.ofUtf8("bob"),
-                                        HttpHeaders.of());
-        contentAndTrailersShouldBeEmpty(HttpStatus.NOT_MODIFIED, HttpData.ofUtf8("bob"),
-                                        HttpHeaders.of());
-
-        contentAndTrailersShouldBeEmpty(HttpStatus.CONTINUE, HttpData.EMPTY_DATA,
-                                        HttpHeaders.of(CONTENT_MD5, "9f9d51bc70ef21ca5c14f307980a29d8"));
-        contentAndTrailersShouldBeEmpty(HttpStatus.NO_CONTENT, HttpData.EMPTY_DATA,
-                                        HttpHeaders.of(CONTENT_MD5, "9f9d51bc70ef21ca5c14f307980a29d8"));
-        contentAndTrailersShouldBeEmpty(HttpStatus.RESET_CONTENT, HttpData.EMPTY_DATA,
-                                        HttpHeaders.of(CONTENT_MD5, "9f9d51bc70ef21ca5c14f307980a29d8"));
-        contentAndTrailersShouldBeEmpty(HttpStatus.NOT_MODIFIED, HttpData.EMPTY_DATA,
-                                        HttpHeaders.of(CONTENT_MD5, "9f9d51bc70ef21ca5c14f307980a29d8"));
+    void errorWhenContentShouldBeEmpty() {
+        contentShouldBeEmpty(HttpStatus.NO_CONTENT, HttpData.ofUtf8("bob"));
+        contentShouldBeEmpty(HttpStatus.RESET_CONTENT, HttpData.ofUtf8("bob"));
+        contentShouldBeEmpty(HttpStatus.NOT_MODIFIED, HttpData.ofUtf8("bob"));
     }
 
-    private static void contentAndTrailersShouldBeEmpty(HttpStatus status, HttpData content,
-                                                        HttpHeaders trailers) {
-        assertThatThrownBy(() -> AggregatedHttpResponse.of(status, PLAIN_TEXT_UTF_8, content, trailers))
+    private static void contentShouldBeEmpty(HttpStatus status, HttpData content) {
+        assertThatThrownBy(() -> AggregatedHttpResponse.of(status, PLAIN_TEXT_UTF_8, content))
                 .isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test
-    void contentLengthIsNotSetWhen1xxOr204Or205() {
-        ResponseHeaders headers = ResponseHeaders.of(HttpStatus.CONTINUE, CONTENT_LENGTH, 100);
-        assertThat(AggregatedHttpResponse.of(headers).headers().get(CONTENT_LENGTH)).isNull();
+    void statusOfResponseHeadersShouldNotBeInformational() {
+        assertThatThrownBy(() -> AggregatedHttpResponse.of(HttpStatus.CONTINUE, PLAIN_TEXT_UTF_8,
+                                                           HttpData.ofUtf8("bob")))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("non-1xx");
+    }
 
-        headers = ResponseHeaders.of(HttpStatus.NO_CONTENT, CONTENT_LENGTH, 100);
+    @Test
+    void contentLengthIsNotSetWhen204Or205() {
+        ResponseHeaders headers = ResponseHeaders.of(HttpStatus.NO_CONTENT, CONTENT_LENGTH, 100);
         assertThat(AggregatedHttpResponse.of(headers).headers().get(CONTENT_LENGTH)).isNull();
 
         headers = ResponseHeaders.of(HttpStatus.RESET_CONTENT, CONTENT_LENGTH, 100);

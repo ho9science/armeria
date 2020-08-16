@@ -20,7 +20,6 @@ import static java.util.Objects.requireNonNull;
 
 import io.micrometer.core.instrument.Clock;
 import io.micrometer.core.instrument.config.NamingConvention;
-import io.micrometer.core.instrument.distribution.pause.NoPauseDetector;
 import io.micrometer.prometheus.PrometheusConfig;
 import io.micrometer.prometheus.PrometheusMeterRegistry;
 import io.prometheus.client.CollectorRegistry;
@@ -31,11 +30,15 @@ import io.prometheus.client.CollectorRegistry;
  */
 public final class PrometheusMeterRegistries {
 
-    /**
-     * The default {@link PrometheusMeterRegistry} that uses {@link CollectorRegistry#defaultRegistry}.
-     */
-    public static final PrometheusMeterRegistry defaultRegistry =
+    private static final PrometheusMeterRegistry defaultRegistry =
             newRegistry(CollectorRegistry.defaultRegistry);
+
+    /**
+     * Returns the default {@link PrometheusMeterRegistry} that uses {@link CollectorRegistry#defaultRegistry}.
+     */
+    public static PrometheusMeterRegistry defaultRegistry() {
+        return defaultRegistry;
+    }
 
     /**
      * Returns a newly-created {@link PrometheusMeterRegistry} instance with a new {@link CollectorRegistry}.
@@ -68,10 +71,8 @@ public final class PrometheusMeterRegistries {
      * @return the specified {@link PrometheusMeterRegistry}
      */
     public static <T extends PrometheusMeterRegistry> T configureRegistry(T meterRegistry) {
-        requireNonNull(meterRegistry, "meterRegistry");
-        meterRegistry.config().namingConvention(MoreNamingConventions.prometheus());
-        meterRegistry.config().pauseDetector(new NoPauseDetector());
-        return meterRegistry;
+        // This method currently does nothing, but we may do something in the future.
+        return requireNonNull(meterRegistry, "meterRegistry");
     }
 
     private PrometheusMeterRegistries() {}

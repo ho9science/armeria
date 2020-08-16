@@ -33,10 +33,8 @@ import javax.annotation.Nullable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
-import com.linecorp.armeria.client.Client;
 import com.linecorp.armeria.client.ClientRequestContext;
-import com.linecorp.armeria.client.ClientRequestContextBuilder;
-import com.linecorp.armeria.client.Endpoint;
+import com.linecorp.armeria.client.HttpClient;
 import com.linecorp.armeria.common.HttpHeaderNames;
 import com.linecorp.armeria.common.HttpMethod;
 import com.linecorp.armeria.common.HttpRequest;
@@ -48,17 +46,17 @@ import com.linecorp.armeria.common.RpcRequest;
 import com.linecorp.armeria.common.RpcResponse;
 import com.linecorp.armeria.common.brave.HelloService;
 import com.linecorp.armeria.common.brave.RequestContextCurrentTraceContext;
-import com.linecorp.armeria.common.brave.SpanCollectingReporter;
+import com.linecorp.armeria.common.brave.SpanCollector;
 import com.linecorp.armeria.common.logging.RequestLog;
 import com.linecorp.armeria.common.util.SafeCloseable;
 
+import brave.Span.Kind;
 import brave.Tracing;
+import brave.handler.MutableSpan;
 import brave.http.HttpTracing;
 import brave.propagation.CurrentTraceContext;
 import brave.propagation.CurrentTraceContext.ScopeDecorator;
 import brave.sampler.Sampler;
-import zipkin2.Span;
-import zipkin2.Span.Kind;
 
 class BraveClientTest {
 
@@ -86,24 +84,25 @@ class BraveClientTest {
 
     @Test
     void shouldSubmitSpanWhenSampled() throws Exception {
-        final SpanCollectingReporter reporter = new SpanCollectingReporter();
+        final SpanCollector collector = new SpanCollector();
 
         final Tracing tracing = Tracing.newBuilder()
                                        .localServiceName(TEST_SERVICE)
-                                       .spanReporter(reporter)
+                                       .addSpanHandler(collector)
                                        .sampler(Sampler.create(1.0f))
                                        .build();
         final RequestLog requestLog = testRemoteInvocation(tracing, null);
 
         // check span name
-        final Span span = reporter.spans().take();
+        final MutableSpan span = collector.spans().poll(10, TimeUnit.SECONDS);
+        assertThat(span).isNotNull();
         assertThat(span.name()).isEqualTo(TEST_SPAN);
 
         // check kind
         assertThat(span.kind()).isSameAs(Kind.CLIENT);
 
         // only one span should be submitted
-        assertThat(reporter.spans().poll(1, TimeUnit.SECONDS)).isNull();
+        assertThat(collector.spans().poll(1, TimeUnit.SECONDS)).isNull();
 
         // check # of annotations (we add wire annotations)
         assertThat(span.annotations()).hasSize(2);
@@ -112,7 +111,7 @@ class BraveClientTest {
         assertThat(span.traceId().length()).isEqualTo(16);
 
         // check duration is correct from request log
-        assertThat(span.durationAsLong())
+        assertThat(span.finishTimestamp() - span.startTimestamp())
                 .isEqualTo(requestLog.totalDurationNanos() / 1000);
 
         // check service name
@@ -124,19 +123,20 @@ class BraveClientTest {
 
     @Test
     void shouldSubmitSpanWithCustomRemoteName() throws Exception {
-        final SpanCollectingReporter reporter = new SpanCollectingReporter();
+        final SpanCollector collector = new SpanCollector();
 
         final Tracing tracing = Tracing.newBuilder()
                                        .localServiceName(TEST_SERVICE)
-                                       .spanReporter(reporter)
+                                       .addSpanHandler(collector)
                                        .sampler(Sampler.create(1.0f))
                                        .build();
         testRemoteInvocation(tracing, "fooService");
 
         // check span name
-        final Span span = reporter.spans().take();
+        final MutableSpan span = collector.spans().poll(10, TimeUnit.SECONDS);
 
         // check tags
+        assertThat(span).isNotNull();
         assertThat(span.tags()).containsEntry("http.host", "foo.com")
                                .containsEntry("http.method", "POST")
                                .containsEntry("http.path", "/hello/armeria")
@@ -146,13 +146,13 @@ class BraveClientTest {
         // check service name
         assertThat(span.localServiceName()).isEqualTo(TEST_SERVICE);
 
-        // check remote service name, lower-cased
-        assertThat(span.remoteServiceName()).isEqualTo("fooservice");
+        // check remote service name
+        assertThat(span.remoteServiceName()).isEqualTo("fooService");
     }
 
     @Test
     void scopeDecorator() throws Exception {
-        final SpanCollectingReporter reporter = new SpanCollectingReporter();
+        final SpanCollector collector = new SpanCollector();
         final AtomicInteger scopeDecoratorCallingCounter = new AtomicInteger();
         final ScopeDecorator scopeDecorator = (currentSpan, scope) -> {
             scopeDecoratorCallingCounter.getAndIncrement();
@@ -166,40 +166,42 @@ class BraveClientTest {
         final Tracing tracing = Tracing.newBuilder()
                                        .localServiceName(TEST_SERVICE)
                                        .currentTraceContext(traceContext)
-                                       .spanReporter(reporter)
+                                       .addSpanHandler(collector)
                                        .sampler(Sampler.create(1.0f))
                                        .build();
         testRemoteInvocation(tracing, null);
 
         // check span name
-        final Span span = reporter.spans().take();
+        final MutableSpan span = collector.spans().poll(10, TimeUnit.SECONDS);
 
         // check tags
         assertTags(span);
 
         // check service name
         assertThat(span.localServiceName()).isEqualTo(TEST_SERVICE);
-        assertThat(scopeDecoratorCallingCounter.get()).isEqualTo(3);
+        // check the client invocation had the current span in scope.
+        assertThat(scopeDecoratorCallingCounter.get()).isOne();
     }
 
     @Test
     void shouldNotSubmitSpanWhenNotSampled() throws Exception {
-        final SpanCollectingReporter reporter = new SpanCollectingReporter();
+        final SpanCollector collector = new SpanCollector();
         final Tracing tracing = Tracing.newBuilder()
                                        .localServiceName(TEST_SERVICE)
-                                       .spanReporter(reporter)
+                                       .addSpanHandler(collector)
                                        .sampler(Sampler.create(0.0f))
                                        .build();
         testRemoteInvocation(tracing, null);
 
-        assertThat(reporter.spans().poll(1, TimeUnit.SECONDS)).isNull();
+        assertThat(collector.spans().poll(1, TimeUnit.SECONDS)).isNull();
     }
 
     private static RequestLog testRemoteInvocation(Tracing tracing, @Nullable String remoteServiceName)
             throws Exception {
 
         HttpTracing httpTracing = HttpTracing.newBuilder(tracing)
-                                             .clientParser(ArmeriaHttpClientParser.get())
+                                             .clientRequestParser(ArmeriaHttpClientParser.get())
+                                             .clientResponseParser(ArmeriaHttpClientParser.get())
                                              .build();
         if (remoteServiceName != null) {
             httpTracing = httpTracing.clientOf(remoteServiceName);
@@ -207,27 +209,26 @@ class BraveClientTest {
 
         // prepare parameters
         final HttpRequest req = HttpRequest.of(RequestHeaders.of(HttpMethod.POST, "/hello/armeria",
+                                                                 HttpHeaderNames.SCHEME, "http",
                                                                  HttpHeaderNames.AUTHORITY, "foo.com"));
         final RpcRequest rpcReq = RpcRequest.of(HelloService.Iface.class, "hello", "Armeria");
         final HttpResponse res = HttpResponse.of(HttpStatus.OK);
         final RpcResponse rpcRes = RpcResponse.of("Hello, Armeria!");
-        final ClientRequestContext ctx =
-                ClientRequestContextBuilder.of(req)
-                                           .endpoint(Endpoint.of("localhost", 8080))
-                                           .build();
+        final ClientRequestContext ctx = ClientRequestContext.builder(req).build();
+        final HttpRequest actualReq = ctx.request();
+        assertThat(actualReq).isNotNull();
 
         ctx.logBuilder().requestFirstBytesTransferred();
-        ctx.logBuilder().requestContent(rpcReq, req);
+        ctx.logBuilder().requestContent(rpcReq, actualReq);
         ctx.logBuilder().endRequest();
 
         try (SafeCloseable ignored = ctx.push()) {
-            @SuppressWarnings("unchecked")
-            final Client<HttpRequest, HttpResponse> delegate = mock(Client.class);
+            final HttpClient delegate = mock(HttpClient.class);
             when(delegate.execute(any(), any())).thenReturn(res);
 
             final BraveClient stub = BraveClient.newDecorator(httpTracing).apply(delegate);
             // do invoke
-            final HttpResponse actualRes = stub.execute(ctx, req);
+            final HttpResponse actualRes = stub.execute(ctx, actualReq);
 
             assertThat(actualRes).isEqualTo(res);
 
@@ -243,10 +244,11 @@ class BraveClientTest {
         ctx.logBuilder().responseFirstBytesTransferred();
         ctx.logBuilder().responseContent(rpcRes, res);
         ctx.logBuilder().endResponse();
-        return ctx.log();
+        return ctx.log().ensureComplete();
     }
 
-    private static void assertTags(Span span) {
+    private static void assertTags(@Nullable MutableSpan span) {
+        assertThat(span).isNotNull();
         assertThat(span.tags()).containsEntry("http.host", "foo.com")
                                .containsEntry("http.method", "POST")
                                .containsEntry("http.path", "/hello/armeria")

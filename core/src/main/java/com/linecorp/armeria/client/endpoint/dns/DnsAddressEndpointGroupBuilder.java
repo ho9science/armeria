@@ -17,31 +17,31 @@ package com.linecorp.armeria.client.endpoint.dns;
 
 import static com.google.common.base.Preconditions.checkArgument;
 
+import java.net.InetSocketAddress;
+import java.time.Duration;
+
 import javax.annotation.Nullable;
 
 import com.google.common.annotations.VisibleForTesting;
 
 import com.linecorp.armeria.client.Endpoint;
+import com.linecorp.armeria.client.endpoint.EndpointSelectionStrategy;
+import com.linecorp.armeria.client.retry.Backoff;
 
+import io.netty.channel.EventLoop;
 import io.netty.resolver.ResolvedAddressTypes;
 
 /**
  * Builds a new {@link DnsAddressEndpointGroup} that sources its {@link Endpoint} list from the {@code A} or
  * {@code AAAA} DNS records of a certain hostname.
  */
-public final class DnsAddressEndpointGroupBuilder
-        extends DnsEndpointGroupBuilder<DnsAddressEndpointGroupBuilder> {
+public final class DnsAddressEndpointGroupBuilder extends DnsEndpointGroupBuilder {
 
     private int port;
     @Nullable
     private ResolvedAddressTypes resolvedAddressTypes;
 
-    /**
-     * Creates a new instance that builds a {@link DnsAddressEndpointGroup} for the specified {@code hostname}.
-     *
-     * @param hostname the hostname to query DNS queries for
-     */
-    public DnsAddressEndpointGroupBuilder(String hostname) {
+    DnsAddressEndpointGroupBuilder(String hostname) {
         super(hostname);
     }
 
@@ -66,8 +66,50 @@ public final class DnsAddressEndpointGroupBuilder
      * Returns a newly created {@link DnsAddressEndpointGroup}.
      */
     public DnsAddressEndpointGroup build() {
-        return new DnsAddressEndpointGroup(eventLoop(), minTtl(), maxTtl(),
-                                           serverAddressStreamProvider(), backoff(),
+        return new DnsAddressEndpointGroup(selectionStrategy(), eventLoop(), minTtl(), maxTtl(),
+                                           queryTimeoutMillis(), serverAddressStreamProvider(), backoff(),
                                            resolvedAddressTypes, hostname(), port);
+    }
+
+    // Override the return type of the chaining methods in the superclass.
+
+    @Override
+    public DnsAddressEndpointGroupBuilder eventLoop(EventLoop eventLoop) {
+        return (DnsAddressEndpointGroupBuilder) super.eventLoop(eventLoop);
+    }
+
+    @Override
+    public DnsAddressEndpointGroupBuilder ttl(int minTtl, int maxTtl) {
+        return (DnsAddressEndpointGroupBuilder) super.ttl(minTtl, maxTtl);
+    }
+
+    @Override
+    public DnsAddressEndpointGroupBuilder queryTimeout(Duration queryTimeout) {
+        return (DnsAddressEndpointGroupBuilder) super.queryTimeout(queryTimeout);
+    }
+
+    @Override
+    public DnsAddressEndpointGroupBuilder queryTimeoutMillis(long queryTimeoutMillis) {
+        return (DnsAddressEndpointGroupBuilder) super.queryTimeoutMillis(queryTimeoutMillis);
+    }
+
+    @Override
+    public DnsAddressEndpointGroupBuilder serverAddresses(InetSocketAddress... serverAddresses) {
+        return (DnsAddressEndpointGroupBuilder) super.serverAddresses(serverAddresses);
+    }
+
+    @Override
+    public DnsAddressEndpointGroupBuilder serverAddresses(Iterable<InetSocketAddress> serverAddresses) {
+        return (DnsAddressEndpointGroupBuilder) super.serverAddresses(serverAddresses);
+    }
+
+    @Override
+    public DnsAddressEndpointGroupBuilder backoff(Backoff backoff) {
+        return (DnsAddressEndpointGroupBuilder) super.backoff(backoff);
+    }
+
+    @Override
+    public DnsAddressEndpointGroupBuilder selectionStrategy(EndpointSelectionStrategy selectionStrategy) {
+        return (DnsAddressEndpointGroupBuilder) super.selectionStrategy(selectionStrategy);
     }
 }

@@ -15,9 +15,9 @@
  */
 package com.linecorp.armeria.common;
 
-import static com.linecorp.armeria.common.stream.SubscriptionOption.WITH_POOLED_OBJECTS;
+import static java.util.Objects.requireNonNull;
 
-import java.util.List;
+import java.net.URI;
 import java.util.concurrent.CompletableFuture;
 
 import javax.annotation.Nullable;
@@ -44,8 +44,18 @@ final class HeaderOverridingHttpRequest implements HttpRequest {
         this.headers = headers;
     }
 
-    HttpRequest unwrap() {
-        return delegate;
+    @Override
+    public HttpRequest withHeaders(RequestHeaders newHeaders) {
+        requireNonNull(newHeaders, "newHeaders");
+        if (headers == newHeaders) {
+            return this;
+        }
+
+        if (delegate.headers() == newHeaders) {
+            return delegate;
+        }
+
+        return delegate.withHeaders(newHeaders);
     }
 
     @Override
@@ -64,32 +74,8 @@ final class HeaderOverridingHttpRequest implements HttpRequest {
     }
 
     @Override
-    public CompletableFuture<Void> completionFuture() {
-        return delegate.completionFuture();
-    }
-
-    @Override
-    public CompletableFuture<Void> closeFuture() {
-        return delegate.closeFuture();
-    }
-
-    @Override
-    public void subscribe(Subscriber<? super HttpObject> subscriber) {
-        delegate.subscribe(subscriber);
-    }
-
-    @Override
-    public void subscribe(Subscriber<? super HttpObject> subscriber, boolean withPooledObjects) {
-        if (withPooledObjects) {
-            delegate.subscribe(subscriber, WITH_POOLED_OBJECTS);
-        } else {
-            delegate.subscribe(subscriber);
-        }
-    }
-
-    @Override
-    public void subscribe(Subscriber<? super HttpObject> subscriber, SubscriptionOption... options) {
-        delegate.subscribe(subscriber, options);
+    public CompletableFuture<Void> whenComplete() {
+        return delegate.whenComplete();
     }
 
     @Override
@@ -99,56 +85,13 @@ final class HeaderOverridingHttpRequest implements HttpRequest {
 
     @Override
     public void subscribe(Subscriber<? super HttpObject> subscriber, EventExecutor executor,
-                          boolean withPooledObjects) {
-        if (withPooledObjects) {
-            delegate.subscribe(subscriber, executor, WITH_POOLED_OBJECTS);
-        } else {
-            delegate.subscribe(subscriber, executor);
-        }
-    }
-
-    @Override
-    public void subscribe(Subscriber<? super HttpObject> subscriber, EventExecutor executor,
                           SubscriptionOption... options) {
         delegate.subscribe(subscriber, executor, options);
     }
 
     @Override
-    public CompletableFuture<List<HttpObject>> drainAll() {
-        return delegate.drainAll();
-    }
-
-    @Override
-    public CompletableFuture<List<HttpObject>> drainAll(boolean withPooledObjects) {
-        if (withPooledObjects) {
-            return drainAll(WITH_POOLED_OBJECTS);
-        } else {
-            return drainAll();
-        }
-    }
-
-    @Override
-    public CompletableFuture<List<HttpObject>> drainAll(SubscriptionOption... options) {
-        return delegate.drainAll(options);
-    }
-
-    @Override
-    public CompletableFuture<List<HttpObject>> drainAll(EventExecutor executor) {
-        return delegate.drainAll(executor);
-    }
-
-    @Override
-    public CompletableFuture<List<HttpObject>> drainAll(EventExecutor executor, boolean withPooledObjects) {
-        if (withPooledObjects) {
-            return drainAll(executor, WITH_POOLED_OBJECTS);
-        } else {
-            return drainAll(executor);
-        }
-    }
-
-    @Override
-    public CompletableFuture<List<HttpObject>> drainAll(EventExecutor executor, SubscriptionOption... options) {
-        return delegate.drainAll(executor, options);
+    public EventExecutor defaultSubscriberExecutor() {
+        return delegate.defaultSubscriberExecutor();
     }
 
     @Override
@@ -157,8 +100,18 @@ final class HeaderOverridingHttpRequest implements HttpRequest {
     }
 
     @Override
+    public void abort(Throwable cause) {
+        delegate.abort(requireNonNull(cause, "cause"));
+    }
+
+    @Override
     public RequestHeaders headers() {
         return headers;
+    }
+
+    @Override
+    public URI uri() {
+        return headers.uri();
     }
 
     @Override

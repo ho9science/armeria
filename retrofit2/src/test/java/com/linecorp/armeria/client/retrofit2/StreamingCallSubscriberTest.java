@@ -140,7 +140,7 @@ public class StreamingCallSubscriberTest {
 
         await().untilAsserted(() -> assertThat(callback.callbackCallingCount).isEqualTo(1));
 
-        // TODO(minwoox) Remove after we can retreive trailers.
+        // TODO(minwoox) Remove after we can retrieve trailers.
         TimeUnit.SECONDS.sleep(2);
 
         assertThat(callback.response.header("foo")).isNull(); // Currently, there's no way to retrieve trailers.
@@ -205,7 +205,7 @@ public class StreamingCallSubscriberTest {
 
         verify(subscription, times(2)).request(1L);
         await().untilAsserted(() -> assertThat(callback.callbackCallingCount).isEqualTo(1));
-        assertThat(callback.exception).hasMessage("foo");
+        assertThat(callback.exception).hasMessageEndingWith("foo");
     }
 
     @Test

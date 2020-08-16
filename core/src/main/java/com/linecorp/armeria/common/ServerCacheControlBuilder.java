@@ -24,11 +24,11 @@ import javax.annotation.Nullable;
  *
  * <pre>{@code
  * ServerCacheControl cacheControl =
- *     new ServerCacheControlBuilder()
- *         .noCache()
- *         .noStore()
- *         .mustRevalidate()
- *         .build();
+ *     ServerCacheControl.builder()
+ *                       .noCache()
+ *                       .noStore()
+ *                       .mustRevalidate()
+ *                       .build();
  * }</pre>
  *
  * @see ClientCacheControlBuilder
@@ -44,10 +44,7 @@ public final class ServerCacheControlBuilder extends CacheControlBuilder {
     private boolean proxyRevalidate;
     private long sMaxAgeSeconds = -1;
 
-    /**
-     * Creates a new builder with all directives disabled initially.
-     */
-    public ServerCacheControlBuilder() {}
+    ServerCacheControlBuilder() {}
 
     ServerCacheControlBuilder(ServerCacheControl c) {
         super(c);

@@ -13,25 +13,36 @@
  * License for the specific language governing permissions and limitations
  * under the License.
  */
-
 package com.linecorp.armeria.client;
 
-import static com.linecorp.armeria.internal.ClientUtil.initContextAndExecuteWithFallback;
+import static com.linecorp.armeria.internal.client.ClientUtil.initContextAndExecuteWithFallback;
 
 import java.net.URI;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
 import java.util.function.BiFunction;
+import java.util.function.Function;
 
 import javax.annotation.Nullable;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.linecorp.armeria.client.endpoint.EndpointGroup;
 import com.linecorp.armeria.common.HttpMethod;
+import com.linecorp.armeria.common.HttpRequest;
+import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.Request;
+import com.linecorp.armeria.common.RequestId;
 import com.linecorp.armeria.common.Response;
+import com.linecorp.armeria.common.RpcRequest;
+import com.linecorp.armeria.common.RpcResponse;
+import com.linecorp.armeria.common.Scheme;
 import com.linecorp.armeria.common.SessionProtocol;
-import com.linecorp.armeria.common.logging.RequestLogAvailability;
-import com.linecorp.armeria.common.util.ReleasableHolder;
+import com.linecorp.armeria.common.util.AbstractUnwrappable;
+import com.linecorp.armeria.common.util.SystemInfo;
 
 import io.micrometer.core.instrument.MeterRegistry;
-import io.netty.channel.EventLoop;
 
 /**
  * A base class for implementing a user's entry point for sending a {@link Request}.
@@ -43,13 +54,17 @@ import io.netty.channel.EventLoop;
  * @param <I> the request type
  * @param <O> the response type
  */
-public abstract class UserClient<I extends Request, O extends Response> implements ClientBuilderParams {
+public abstract class UserClient<I extends Request, O extends Response>
+        extends AbstractUnwrappable<Client<I, O>>
+        implements ClientBuilderParams {
+
+    private static final Logger logger = LoggerFactory.getLogger(UserClient.class);
+    private static boolean warnedNullRequestId;
 
     private final ClientBuilderParams params;
-    private final Client<I, O> delegate;
     private final MeterRegistry meterRegistry;
-    private final SessionProtocol sessionProtocol;
-    private final Endpoint endpoint;
+    private final Function<CompletableFuture<O>, O> futureConverter;
+    private final BiFunction<ClientRequestContext, Throwable, O> errorResponseFactory;
 
     /**
      * Creates a new instance.
@@ -57,30 +72,44 @@ public abstract class UserClient<I extends Request, O extends Response> implemen
      * @param params the parameters used for constructing the client
      * @param delegate the {@link Client} that will process {@link Request}s
      * @param meterRegistry the {@link MeterRegistry} that collects various stats
-     * @param sessionProtocol the {@link SessionProtocol} of the {@link Client}
-     * @param endpoint the {@link Endpoint} of the {@link Client}
+     * @param futureConverter the {@link Function} that converts a {@link CompletableFuture} of response
+     *                        into a response, e.g. {@link HttpResponse#from(CompletionStage)}
+     *                        and {@link RpcResponse#from(CompletionStage)}
+     * @param errorResponseFactory the {@link BiFunction} that returns a new response failed with
+     *                             the given exception
      */
     protected UserClient(ClientBuilderParams params, Client<I, O> delegate, MeterRegistry meterRegistry,
-                         SessionProtocol sessionProtocol, Endpoint endpoint) {
+                         Function<CompletableFuture<O>, O> futureConverter,
+                         BiFunction<ClientRequestContext, Throwable, O> errorResponseFactory) {
+        super(delegate);
         this.params = params;
-        this.delegate = delegate;
         this.meterRegistry = meterRegistry;
-        this.sessionProtocol = sessionProtocol;
-        this.endpoint = endpoint;
+        this.futureConverter = futureConverter;
+        this.errorResponseFactory = errorResponseFactory;
     }
 
     @Override
-    public ClientFactory factory() {
-        return params.factory();
+    public final Scheme scheme() {
+        return params.scheme();
     }
 
     @Override
-    public URI uri() {
+    public final EndpointGroup endpointGroup() {
+        return params.endpointGroup();
+    }
+
+    @Override
+    public final String absolutePathRef() {
+        return params.absolutePathRef();
+    }
+
+    @Override
+    public final URI uri() {
         return params.uri();
     }
 
     @Override
-    public Class<?> clientType() {
+    public final Class<?> clientType() {
         return params.clientType();
     }
 
@@ -90,72 +119,65 @@ public abstract class UserClient<I extends Request, O extends Response> implemen
     }
 
     /**
-     * Returns the {@link Client} that will process {@link Request}s.
-     */
-    @SuppressWarnings("unchecked")
-    protected final <U extends Client<I, O>> U delegate() {
-        return (U) delegate;
-    }
-
-    /**
-     * Returns the {@link SessionProtocol} of the {@link #delegate()}.
-     */
-    protected final SessionProtocol sessionProtocol() {
-        return sessionProtocol;
-    }
-
-    /**
-     * Returns the {@link Endpoint} of the {@link #delegate()}.
-     */
-    protected final Endpoint endpoint() {
-        return endpoint;
-    }
-
-    /**
-     * Executes the specified {@link Request} via {@link #delegate()}.
+     * Executes the specified {@link Request} via the delegate.
      *
+     * @param protocol the {@link SessionProtocol} to use
      * @param method the method of the {@link Request}
      * @param path the path part of the {@link Request} URI
      * @param query the query part of the {@link Request} URI
      * @param fragment the fragment part of the {@link Request} URI
      * @param req the {@link Request}
-     * @param fallback the fallback response {@link BiFunction} to use when
-     *                 {@link Client#execute(ClientRequestContext, Request)} of {@link #delegate()} throws
-     *                 an exception instead of returning an error response
      */
-    protected final O execute(HttpMethod method, String path, @Nullable String query, @Nullable String fragment,
-                              I req, BiFunction<ClientRequestContext, Throwable, O> fallback) {
-        return execute(null, endpoint, method, path, query, fragment, req, fallback);
+    protected final O execute(SessionProtocol protocol, HttpMethod method, String path,
+                              @Nullable String query, @Nullable String fragment, I req) {
+        return execute(protocol, endpointGroup(), method, path, query, fragment, req);
     }
 
     /**
-     * Executes the specified {@link Request} via {@link #delegate()}.
+     * Executes the specified {@link Request} via the delegate.
      *
-     * @param eventLoop the {@link EventLoop} to execute the {@link Request}
-     * @param endpoint the {@link Endpoint} of the {@link Request}
+     * @param protocol the {@link SessionProtocol} to use
+     * @param endpointGroup the {@link EndpointGroup} of the {@link Request}
      * @param method the method of the {@link Request}
      * @param path the path part of the {@link Request} URI
      * @param query the query part of the {@link Request} URI
      * @param fragment the fragment part of the {@link Request} URI
      * @param req the {@link Request}
-     * @param fallback the fallback response {@link BiFunction} to use when
-     *                 {@link Client#execute(ClientRequestContext, Request)} of {@link #delegate()} throws
      */
-    protected final O execute(@Nullable EventLoop eventLoop, Endpoint endpoint,
-                              HttpMethod method, String path, @Nullable String query, @Nullable String fragment,
-                              I req, BiFunction<ClientRequestContext, Throwable, O> fallback) {
-        final DefaultClientRequestContext ctx;
-        if (eventLoop == null) {
-            final ReleasableHolder<EventLoop> releasableEventLoop = factory().acquireEventLoop(endpoint);
-            ctx = new DefaultClientRequestContext(
-                    releasableEventLoop.get(), meterRegistry, sessionProtocol,
-                    method, path, query, fragment, options(), req);
-            ctx.log().addListener(log -> releasableEventLoop.release(), RequestLogAvailability.COMPLETE);
+    protected final O execute(SessionProtocol protocol, EndpointGroup endpointGroup, HttpMethod method,
+                              String path, @Nullable String query, @Nullable String fragment, I req) {
+
+        final HttpRequest httpReq;
+        final RpcRequest rpcReq;
+        final RequestId id = nextRequestId();
+
+        if (req instanceof HttpRequest) {
+            httpReq = (HttpRequest) req;
+            rpcReq = null;
         } else {
-            ctx = new DefaultClientRequestContext(eventLoop, meterRegistry, sessionProtocol,
-                                                  method, path, query, fragment, options(), req);
+            httpReq = null;
+            rpcReq = (RpcRequest) req;
         }
 
-        return initContextAndExecuteWithFallback(delegate(), ctx, endpoint, fallback);
+        final DefaultClientRequestContext ctx =
+                new DefaultClientRequestContext(meterRegistry, protocol,
+                                                id, method, path, query, fragment, options(), httpReq, rpcReq,
+                                                System.nanoTime(), SystemInfo.currentTimeMicros());
+
+        return initContextAndExecuteWithFallback(unwrap(), ctx, endpointGroup,
+                                                 futureConverter, errorResponseFactory);
+    }
+
+    private RequestId nextRequestId() {
+        final RequestId id = options().requestIdGenerator().get();
+        if (id == null) {
+            if (!warnedNullRequestId) {
+                warnedNullRequestId = true;
+                logger.warn("requestIdGenerator.get() returned null; using RequestId.random()");
+            }
+            return RequestId.random();
+        } else {
+            return id;
+        }
     }
 }

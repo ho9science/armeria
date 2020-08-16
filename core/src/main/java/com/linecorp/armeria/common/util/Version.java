@@ -34,21 +34,26 @@
  */
 package com.linecorp.armeria.common.util;
 
+import static java.util.Objects.requireNonNull;
+
 import java.io.InputStream;
 import java.net.URL;
-import java.security.AccessController;
-import java.security.PrivilegedAction;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
 import java.util.Enumeration;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
 
-import javax.annotation.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSortedMap;
+import com.google.common.collect.MapMaker;
 import com.google.common.io.Closeables;
 
 /**
@@ -63,6 +68,8 @@ public final class Version {
 
     // Forked from Netty 4.1.34 at d0912f27091e4548466df81f545c017a25c9d256
 
+    private static final Logger logger = LoggerFactory.getLogger(Version.class);
+
     private static final String PROP_RESOURCE_PATH = "META-INF/com.linecorp.armeria.versions.properties";
 
     private static final String PROP_VERSION = ".version";
@@ -71,14 +78,45 @@ public final class Version {
     private static final String PROP_LONG_COMMIT_HASH = ".longCommitHash";
     private static final String PROP_REPO_STATUS = ".repoStatus";
 
+    private static final Map<ClassLoader, Map<String, Version>> VERSIONS =
+            new MapMaker().weakKeys().makeMap();
+
     /**
-     * Retrieves the version information of Armeria artifacts using the current
-     * {@linkplain Thread#getContextClassLoader() context class loader}.
+     * Returns the version information for the Armeria artifact named {@code artifactId}. If information for
+     * the artifact can't be found, a default value is returned with arbitrary {@code unknown} values.
+     */
+    public static Version get(String artifactId) {
+        return get(artifactId, Version.class.getClassLoader());
+    }
+
+    /**
+     * Returns the version information for the Armeria artifact named {@code artifactId} using the specified
+     * {@link ClassLoader}. If information for the artifact can't be found, a default value is returned
+     * with arbitrary {@code unknown} values.
+     */
+    public static Version get(String artifactId, ClassLoader classLoader) {
+        requireNonNull(artifactId, "artifactId");
+        final Version version = getAll(classLoader).get(artifactId);
+        if (version != null) {
+            return version;
+        }
+        return new Version(
+                artifactId,
+                "unknown",
+                0,
+                "unknown",
+                "unknown",
+                "unknown");
+    }
+
+    /**
+     * Retrieves the version information of Armeria artifacts.
+     * This method is a shortcut for {@code identify(Version.class.getClassLoader())}.
      *
      * @return A {@link Map} whose keys are Maven artifact IDs and whose values are {@link Version}s
      */
-    public static Map<String, Version> identify() {
-        return identify(null);
+    public static Map<String, Version> getAll() {
+        return getAll(Version.class.getClassLoader());
     }
 
     /**
@@ -86,75 +124,79 @@ public final class Version {
      *
      * @return A {@link Map} whose keys are Maven artifact IDs and whose values are {@link Version}s
      */
-    public static Map<String, Version> identify(@Nullable ClassLoader classLoader) {
-        if (classLoader == null) {
-            classLoader = getContextClassLoader();
-        }
+    public static Map<String, Version> getAll(ClassLoader classLoader) {
+        requireNonNull(classLoader, "classLoader");
 
-        // Collect all properties.
-        final Properties props = new Properties();
-        try {
-            final Enumeration<URL> resources = classLoader.getResources(PROP_RESOURCE_PATH);
-            while (resources.hasMoreElements()) {
-                final URL url = resources.nextElement();
-                final InputStream in = url.openStream();
-                try {
-                    props.load(in);
-                } finally {
-                    Closeables.closeQuietly(in);
+        return VERSIONS.computeIfAbsent(classLoader, cl -> {
+            boolean foundProperties = false;
+
+            // Collect all properties.
+            final Properties props = new Properties();
+            try {
+                final Enumeration<URL> resources = cl.getResources(PROP_RESOURCE_PATH);
+                while (resources.hasMoreElements()) {
+                    foundProperties = true;
+                    final URL url = resources.nextElement();
+                    final InputStream in = url.openStream();
+                    try {
+                        props.load(in);
+                    } finally {
+                        Closeables.closeQuietly(in);
+                    }
                 }
-            }
-        } catch (Exception ignore) {
-            // Not critical. Just ignore.
-        }
-
-        // Collect all artifactIds.
-        final Set<String> artifactIds = new HashSet<>();
-        for (Object o: props.keySet()) {
-            final String k = (String) o;
-
-            final int dotIndex = k.indexOf('.');
-            if (dotIndex <= 0) {
-                continue;
+            } catch (Exception ignore) {
+                // Not critical. Just ignore.
             }
 
-            final String artifactId = k.substring(0, dotIndex);
-
-            // Skip the entries without required information.
-            if (!props.containsKey(artifactId + PROP_VERSION) ||
-                !props.containsKey(artifactId + PROP_COMMIT_DATE) ||
-                !props.containsKey(artifactId + PROP_SHORT_COMMIT_HASH) ||
-                !props.containsKey(artifactId + PROP_LONG_COMMIT_HASH) ||
-                !props.containsKey(artifactId + PROP_REPO_STATUS)) {
-                continue;
+            if (!foundProperties) {
+                logger.info(
+                        "Could not find any property files at " +
+                        "META-INF/com.linecorp.armeria.versions.properties. " +
+                        "This usually indicates an issue with your application packaging, for example using " +
+                        "a fat JAR method that only keeps one copy of any file. For maximum functionality, " +
+                        "it is recommended to fix your packaging to include these files.");
+                return ImmutableMap.of();
             }
 
-            artifactIds.add(artifactId);
-        }
+            // Collect all artifactIds.
+            final Set<String> artifactIds = new HashSet<>();
+            for (Object o : props.keySet()) {
+                final String k = (String) o;
 
-        final Map<String, Version> versions = new HashMap<>();
-        for (String artifactId: artifactIds) {
-            versions.put(
-                    artifactId,
-                    new Version(
-                            artifactId,
-                            props.getProperty(artifactId + PROP_VERSION),
-                            parseIso8601(props.getProperty(artifactId + PROP_COMMIT_DATE)),
-                            props.getProperty(artifactId + PROP_SHORT_COMMIT_HASH),
-                            props.getProperty(artifactId + PROP_LONG_COMMIT_HASH),
-                            props.getProperty(artifactId + PROP_REPO_STATUS)));
-        }
+                final int dotIndex = k.indexOf('.');
+                if (dotIndex <= 0) {
+                    continue;
+                }
 
-        return versions;
-    }
+                final String artifactId = k.substring(0, dotIndex);
 
-    private static ClassLoader getContextClassLoader() {
-        if (System.getSecurityManager() == null) {
-            return Thread.currentThread().getContextClassLoader();
-        } else {
-            return AccessController.doPrivileged(
-                    (PrivilegedAction<ClassLoader>) () -> Thread.currentThread().getContextClassLoader());
-        }
+                // Skip the entries without required information.
+                if (!props.containsKey(artifactId + PROP_VERSION) ||
+                    !props.containsKey(artifactId + PROP_COMMIT_DATE) ||
+                    !props.containsKey(artifactId + PROP_SHORT_COMMIT_HASH) ||
+                    !props.containsKey(artifactId + PROP_LONG_COMMIT_HASH) ||
+                    !props.containsKey(artifactId + PROP_REPO_STATUS)) {
+                    continue;
+                }
+
+                artifactIds.add(artifactId);
+            }
+
+            final ImmutableSortedMap.Builder<String, Version> versions = ImmutableSortedMap.naturalOrder();
+            for (String artifactId : artifactIds) {
+                versions.put(
+                        artifactId,
+                        new Version(
+                                artifactId,
+                                props.getProperty(artifactId + PROP_VERSION),
+                                parseIso8601(props.getProperty(artifactId + PROP_COMMIT_DATE)),
+                                props.getProperty(artifactId + PROP_SHORT_COMMIT_HASH),
+                                props.getProperty(artifactId + PROP_LONG_COMMIT_HASH),
+                                props.getProperty(artifactId + PROP_REPO_STATUS)));
+            }
+
+            return versions.build();
+        });
     }
 
     private static long parseIso8601(String value) {
@@ -183,40 +225,68 @@ public final class Version {
         this.repositoryStatus = repositoryStatus;
     }
 
+    /**
+     * Returns the Maven artifact ID of the component, such as {@code "armeria-grpc"}.
+     */
+    @JsonProperty
     public String artifactId() {
         return artifactId;
     }
 
+    /**
+     * Returns the Maven artifact version of the component, such as {@code "1.0.0"}.
+     */
+    @JsonProperty
     public String artifactVersion() {
         return artifactVersion;
     }
 
+    /**
+     * Returns when the release commit was created.
+     */
+    @JsonProperty
     public long commitTimeMillis() {
         return commitTimeMillis;
     }
 
+    /**
+     * Returns the short hash of the release commit.
+     */
+    @JsonProperty
     public String shortCommitHash() {
         return shortCommitHash;
     }
 
+    /**
+     * Returns the long hash of the release commit.
+     */
+    @JsonProperty
     public String longCommitHash() {
         return longCommitHash;
     }
 
+    /**
+     * Returns the status of the repository when performing the release process.
+     *
+     * @return {@code "clean"} if the repository was clean. {@code "dirty"} otherwise.
+     */
+    @JsonProperty
     public String repositoryStatus() {
         return repositoryStatus;
+    }
+
+    /**
+     * Returns whether the repository was clean when performing the release process.
+     * This method is a shortcut for {@code "clean".equals(repositoryStatus())}.
+     */
+    @JsonIgnore
+    public boolean isRepositoryClean() {
+        return "clean".equals(repositoryStatus);
     }
 
     @Override
     public String toString() {
         return artifactId + '-' + artifactVersion + '.' + shortCommitHash +
-                (isClean() ? "" : "(repository: " + repositoryStatus + ')');
-    }
-
-    /**
-     * Returns true if repository status is not dirty.
-     */
-    public boolean isClean() {
-        return "clean".equals(repositoryStatus);
+               (isRepositoryClean() ? "" : "(repository: " + repositoryStatus + ')');
     }
 }

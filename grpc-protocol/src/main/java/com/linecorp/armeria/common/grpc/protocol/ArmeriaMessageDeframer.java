@@ -56,83 +56,129 @@ import java.io.InputStream;
 import java.util.ArrayDeque;
 import java.util.Objects;
 import java.util.Queue;
+import java.util.concurrent.CompletableFuture;
 
 import javax.annotation.Nullable;
 
 import com.google.common.annotations.VisibleForTesting;
 
 import com.linecorp.armeria.common.HttpData;
+import com.linecorp.armeria.common.annotation.UnstableApi;
+import com.linecorp.armeria.common.util.UnmodifiableFuture;
+import com.linecorp.armeria.internal.common.grpc.protocol.Base64Decoder;
+import com.linecorp.armeria.internal.common.grpc.protocol.StatusCodes;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
-import io.netty.buffer.ByteBufHolder;
 import io.netty.buffer.ByteBufInputStream;
 import io.netty.buffer.Unpooled;
 
 /**
  * A deframer of messages transported in the gRPC wire format. See
- * <a href="https://grpc.io/docs/guides/wire.html">gRPC Wire Protocol</a> for more detail on the protocol.
+ * <a href="https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md">gRPC Wire Format</a>
+ * for more detail on the protocol.
  *
  * <p>The logic has been mostly copied from {@code io.grpc.internal.MessageDeframer}, while removing the buffer
  * abstraction in favor of using {@link ByteBuf} directly, and allowing the delivery of uncompressed frames as
  * a {@link ByteBuf} to optimize message parsing.
  */
+@UnstableApi
 public class ArmeriaMessageDeframer implements AutoCloseable {
+
+    public static final int NO_MAX_INBOUND_MESSAGE_SIZE = -1;
+
+    private static final CloseFuture CLOSED_FUTURE;
+
+    static {
+        CLOSED_FUTURE = new CloseFuture();
+        CLOSED_FUTURE.doComplete();
+    }
 
     private static final String DEBUG_STRING = ArmeriaMessageDeframer.class.getName();
 
     private static final int HEADER_LENGTH = 5;
     private static final int COMPRESSED_FLAG_MASK = 1;
-    private static final int RESERVED_MASK = 0xFE;
+    private static final int RESERVED_MASK = 0x7E;
+    // Valid type is always positive.
+    private static final int UNINITIALIED_TYPE = -1;
 
     /**
      * A deframed message. For uncompressed messages, we have the entire buffer available and return it
      * as is in {@code buf} to optimize parsing. For compressed messages, we will parse incrementally
      * and thus return a {@link InputStream} in {@code stream}.
      */
-    public static class ByteBufOrStream {
+    @UnstableApi
+    public static final class DeframedMessage {
+        private final int type;
+
         @Nullable
         private final ByteBuf buf;
         @Nullable
         private final InputStream stream;
 
+        /**
+         * Creates a new instance with the specified {@link ByteBuf} and {@code type}.
+         */
         @VisibleForTesting
-        public ByteBufOrStream(ByteBuf buf) {
-            this(requireNonNull(buf, "buf"), null);
+        public DeframedMessage(ByteBuf buf, int type) {
+            this(requireNonNull(buf, "buf"), null, type);
         }
 
+        /**
+         * Creates a new instance with the specified {@link InputStream} and {@code type}.
+         */
         @VisibleForTesting
-        public ByteBufOrStream(InputStream stream) {
-            this(null, requireNonNull(stream, "stream"));
+        public DeframedMessage(InputStream stream, int type) {
+            this(null, requireNonNull(stream, "stream"), type);
         }
 
-        private ByteBufOrStream(@Nullable ByteBuf buf, @Nullable InputStream stream) {
+        private DeframedMessage(@Nullable ByteBuf buf, @Nullable InputStream stream, int type) {
             this.buf = buf;
             this.stream = stream;
+            this.type = type;
         }
 
+        /**
+         * Returns the {@link ByteBuf}.
+         *
+         * @return the {@link ByteBuf}, or {@code null} if not created with
+         *         {@link #DeframedMessage(ByteBuf, int)}.
+         */
         @Nullable
         public ByteBuf buf() {
             return buf;
         }
 
+        /**
+         * Returns the {@link InputStream}.
+         *
+         * @return the {@link InputStream}, or {@code null} if not created with
+         *         {@link #DeframedMessage(InputStream, int)}.
+         */
         @Nullable
         public InputStream stream() {
             return stream;
         }
 
+        /**
+         * Returns the type.
+         */
+        public int type() {
+            return type;
+        }
+
         @Override
-        public boolean equals(Object o) {
+        public boolean equals(@Nullable Object o) {
             if (this == o) {
                 return true;
             }
-            if (!(o instanceof ByteBufOrStream)) {
+            if (!(o instanceof DeframedMessage)) {
                 return false;
             }
 
-            final ByteBufOrStream that = (ByteBufOrStream) o;
+            final DeframedMessage that = (DeframedMessage) o;
 
-            return Objects.equals(buf, that.buf) && Objects.equals(stream, that.stream);
+            return type == that.type && Objects.equals(buf, that.buf) && Objects.equals(stream, that.stream);
         }
 
         @Override
@@ -144,6 +190,7 @@ public class ArmeriaMessageDeframer implements AutoCloseable {
     /**
      * A listener of deframing events.
      */
+    @UnstableApi
     public interface Listener {
 
         /**
@@ -151,7 +198,7 @@ public class ArmeriaMessageDeframer implements AutoCloseable {
          * will be non-null. {@code message.buf} must be released, or {@code message.stream} must be closed by
          * the callee.
          */
-        void messageRead(ByteBufOrStream message);
+        void messageRead(DeframedMessage message);
 
         /**
          * Called when the stream is complete and all messages have been successfully delivered.
@@ -159,20 +206,20 @@ public class ArmeriaMessageDeframer implements AutoCloseable {
         void endOfStream();
     }
 
-    private enum State {
-        HEADER, BODY
-    }
-
     private final Listener listener;
     private final int maxMessageSizeBytes;
     private final ByteBufAllocator alloc;
+    @Nullable
+    private final Base64Decoder base64Decoder;
 
-    private State state = State.HEADER;
+    private int currentType = UNINITIALIED_TYPE;
+
     private int requiredLength = HEADER_LENGTH;
     @Nullable
     private Decompressor decompressor;
 
-    private boolean compressedFlag;
+    @Nullable
+    private CloseFuture whenClosed;
     private boolean endOfStream;
     private boolean closeWhenComplete;
 
@@ -189,17 +236,21 @@ public class ArmeriaMessageDeframer implements AutoCloseable {
      */
     public ArmeriaMessageDeframer(Listener listener,
                                   int maxMessageSizeBytes,
-                                  ByteBufAllocator alloc) {
+                                  ByteBufAllocator alloc, boolean decodeBase64) {
         this.listener = requireNonNull(listener, "listener");
         this.maxMessageSizeBytes = maxMessageSizeBytes > 0 ? maxMessageSizeBytes : Integer.MAX_VALUE;
         this.alloc = requireNonNull(alloc, "alloc");
-
         unprocessed = new ArrayDeque<>();
+        if (decodeBase64) {
+            base64Decoder = new Base64Decoder(alloc);
+        } else {
+            base64Decoder = null;
+        }
     }
 
     /**
      * Requests up to the given number of messages from the call to be delivered to
-     * {@link Listener#messageRead(ByteBufOrStream)}. No additional messages will be delivered.
+     * {@link Listener#messageRead(DeframedMessage)}. No additional messages will be delivered.
      *
      * <p>If {@link #close()} has been called, this method will have no effect.
      *
@@ -215,7 +266,7 @@ public class ArmeriaMessageDeframer implements AutoCloseable {
     }
 
     /**
-     * Indicates whether delivery is currently stalled, pending receipt of more data.  This means
+     * Indicates whether delivery is currently stalled, pending receipt of more data. This means
      * that no additional data can be delivered to the application.
      */
     public boolean isStalled() {
@@ -242,14 +293,14 @@ public class ArmeriaMessageDeframer implements AutoCloseable {
         final int dataLength = data.length();
         if (dataLength != 0) {
             final ByteBuf buf;
-            if (data instanceof ByteBufHolder) {
-                buf = ((ByteBufHolder) data).content();
-            } else {
-                buf = Unpooled.wrappedBuffer(data.array());
-            }
             assert unprocessed != null;
+            if (base64Decoder != null) {
+                buf = base64Decoder.decode(data.byteBuf());
+            } else {
+                buf = data.byteBuf();
+            }
             unprocessed.add(buf);
-            unprocessedBytes += dataLength;
+            unprocessedBytes += buf.readableBytes();
         }
 
         // Indicate that all of the data for this stream has been received.
@@ -257,11 +308,15 @@ public class ArmeriaMessageDeframer implements AutoCloseable {
         deliver();
     }
 
-    /** Requests closing this deframer when any messages currently queued have been requested and delivered. */
+    /**
+     * Requests closing this deframer when any messages currently queued have been requested and delivered.
+     */
     public void closeWhenComplete() {
         if (isClosed()) {
             return;
-        } else if (isStalled()) {
+        }
+
+        if (isStalled()) {
             close();
         } else {
             closeWhenComplete = true;
@@ -285,6 +340,29 @@ public class ArmeriaMessageDeframer implements AutoCloseable {
                 listener.endOfStream();
             }
         }
+
+        if (whenClosed == null) {
+            whenClosed = CLOSED_FUTURE;
+        } else {
+            whenClosed.doComplete();
+        }
+    }
+
+    /**
+     * Returns a {@link CompletableFuture} which will be completed when this deframer has been closed.
+     */
+    public CompletableFuture<Void> whenClosed() {
+        if (whenClosed == null) {
+            whenClosed = new CloseFuture();
+        }
+        return whenClosed;
+    }
+
+    /**
+     * Indicates whether or not this deframer is closing.
+     */
+    public boolean isClosing() {
+        return closeWhenComplete;
     }
 
     /**
@@ -323,20 +401,15 @@ public class ArmeriaMessageDeframer implements AutoCloseable {
         try {
             // Process the uncompressed bytes.
             while (pendingDeliveries > 0 && hasRequiredBytes()) {
-                switch (state) {
-                    case HEADER:
-                        readHeader();
-                        break;
-                    case BODY:
-                        // Read the body and deliver the message.
-                        readBody();
+                if (currentType == UNINITIALIED_TYPE) {
+                    readHeader();
+                } else {
+                    // Read the body and deliver the message.
+                    readBody();
 
-                        // Since we've delivered a message, decrement the number of pending
-                        // deliveries remaining.
-                        pendingDeliveries--;
-                        break;
-                    default:
-                        throw new IllegalStateException("Invalid state: " + state);
+                    // Since we've delivered a message, decrement the number of pending
+                    // deliveries remaining.
+                    pendingDeliveries--;
                 }
             }
 
@@ -371,7 +444,6 @@ public class ArmeriaMessageDeframer implements AutoCloseable {
                     StatusCodes.INTERNAL,
                     DEBUG_STRING + ": Frame header malformed: reserved bits not zero");
         }
-        compressedFlag = (type & COMPRESSED_FLAG_MASK) != 0;
 
         // Update the required length to include the length of the frame.
         requiredLength = readInt();
@@ -383,8 +455,8 @@ public class ArmeriaMessageDeframer implements AutoCloseable {
                                   maxMessageSizeBytes));
         }
 
-        // Continue reading the frame body.
-        state = State.BODY;
+        // Store type and continue reading the frame body.
+        currentType = type;
     }
 
     private int readUnsignedByte() {
@@ -439,11 +511,12 @@ public class ArmeriaMessageDeframer implements AutoCloseable {
      */
     private void readBody() {
         final ByteBuf buf = readBytes(requiredLength);
-        final ByteBufOrStream msg = compressedFlag ? getCompressedBody(buf) : getUncompressedBody(buf);
+        final boolean isCompressed = (currentType & COMPRESSED_FLAG_MASK) != 0;
+        final DeframedMessage msg = isCompressed ? getCompressedBody(buf) : getUncompressedBody(buf);
         listener.messageRead(msg);
 
         // Done with this frame, begin processing the next header.
-        state = State.HEADER;
+        currentType = UNINITIALIED_TYPE;
         requiredLength = HEADER_LENGTH;
     }
 
@@ -495,15 +568,11 @@ public class ArmeriaMessageDeframer implements AutoCloseable {
         }
     }
 
-    private static ByteBufOrStream getUncompressedBody(ByteBuf buf) {
-        return new ByteBufOrStream(buf);
+    private DeframedMessage getUncompressedBody(ByteBuf buf) {
+        return new DeframedMessage(buf, currentType);
     }
 
-    private boolean isClosedOrScheduledToClose() {
-        return isClosed() || closeWhenComplete;
-    }
-
-    private ByteBufOrStream getCompressedBody(ByteBuf buf) {
+    private DeframedMessage getCompressedBody(ByteBuf buf) {
         if (decompressor == null) {
             buf.release();
             throw new ArmeriaStatusException(
@@ -515,8 +584,9 @@ public class ArmeriaMessageDeframer implements AutoCloseable {
             // Enforce the maxMessageSizeBytes limit on the returned stream.
             final InputStream unlimitedStream =
                     decompressor.decompress(new ByteBufInputStream(buf, true));
-            return new ByteBufOrStream(
-                    new SizeEnforcingInputStream(unlimitedStream, maxMessageSizeBytes, DEBUG_STRING));
+            return new DeframedMessage(
+                    new SizeEnforcingInputStream(unlimitedStream, maxMessageSizeBytes, DEBUG_STRING),
+                    currentType);
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
@@ -601,9 +671,15 @@ public class ArmeriaMessageDeframer implements AutoCloseable {
                 throw new ArmeriaStatusException(
                         StatusCodes.RESOURCE_EXHAUSTED,
                         String.format(
-                        "%s: Compressed frame exceeds maximum frame size: %d. Bytes read: %d. ",
-                        debugString, maxMessageSize, count));
+                                "%s: Compressed frame exceeds maximum frame size: %d. Bytes read: %d. ",
+                                debugString, maxMessageSize, count));
             }
+        }
+    }
+
+    private static class CloseFuture extends UnmodifiableFuture<Void> {
+        private void doComplete() {
+            doComplete(null);
         }
     }
 }

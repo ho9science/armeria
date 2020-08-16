@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 LINE Corporation
+ * Copyright 2020 LINE Corporation
  *
  * LINE Corporation licenses this file to you under the Apache License,
  * version 2.0 (the "License"); you may not use this file except in compliance
@@ -17,114 +17,42 @@
 package com.linecorp.armeria.server;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.Mockito.mock;
 
-import org.junit.Test;
-import org.reactivestreams.Subscription;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
+import com.linecorp.armeria.client.WebClient;
+import com.linecorp.armeria.common.AggregatedHttpResponse;
 import com.linecorp.armeria.common.HttpData;
-import com.linecorp.armeria.common.HttpHeaderNames;
-import com.linecorp.armeria.common.HttpHeaders;
-import com.linecorp.armeria.common.HttpMethod;
-import com.linecorp.armeria.common.HttpRequest;
+import com.linecorp.armeria.common.HttpResponse;
+import com.linecorp.armeria.common.HttpResponseWriter;
 import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.MediaType;
-import com.linecorp.armeria.common.RequestHeaders;
 import com.linecorp.armeria.common.ResponseHeaders;
-import com.linecorp.armeria.common.util.EventLoopGroups;
-import com.linecorp.armeria.internal.HttpObjectEncoder;
-import com.linecorp.armeria.internal.InboundTrafficController;
-import com.linecorp.armeria.unsafe.ByteBufHttpData;
-
-import io.netty.buffer.ByteBuf;
-import io.netty.buffer.ByteBufAllocator;
-import io.netty.channel.Channel;
-import io.netty.channel.ChannelFuture;
-import io.netty.channel.ChannelHandlerContext;
-import io.netty.channel.DefaultChannelPromise;
-import io.netty.handler.codec.http2.Http2Error;
-import io.netty.util.ReferenceCountUtil;
+import com.linecorp.armeria.testing.junit5.server.ServerExtension;
 
 public class HttpResponseSubscriberTest {
 
+    @RegisterExtension
+    static final ServerExtension server = new ServerExtension() {
+        @Override
+        protected void configure(ServerBuilder sb) throws Exception {
+            sb.service("/", (ctx, req) -> {
+                final ResponseHeaders headers = ResponseHeaders.builder(HttpStatus.NO_CONTENT).contentType(
+                        MediaType.PLAIN_TEXT_UTF_8).build();
+                final HttpResponseWriter streaming = HttpResponse.streaming();
+                streaming.write(headers);
+                streaming.write(HttpData.ofUtf8("foo"));
+                streaming.close();
+                return streaming;
+            });
+        }
+    };
+
     @Test
-    public void contentPreview() {
-        final RequestHeaders headers = RequestHeaders.of(HttpMethod.GET, "/");
-        final DefaultServiceRequestContext sctx = serviceRequestContext(headers);
-        final HttpResponseSubscriber responseSubscriber = responseSubscriber(headers, sctx);
-
-        responseSubscriber.onSubscribe(mock(Subscription.class));
-        responseSubscriber.onNext(ResponseHeaders.of(HttpStatus.OK,
-                                                     HttpHeaderNames.CONTENT_TYPE, MediaType.PLAIN_TEXT_UTF_8));
-        responseSubscriber.onNext(new ByteBufHttpData(newBuffer("hello"), true));
-        responseSubscriber.onComplete();
-
-        assertThat(sctx.log().responseContentPreview()).isEqualTo("hello");
-    }
-
-    private static DefaultServiceRequestContext serviceRequestContext(RequestHeaders headers) {
-        return (DefaultServiceRequestContext)
-                ServiceRequestContextBuilder.of(HttpRequest.of(headers))
-                                            .eventLoop(EventLoopGroups.directEventLoop())
-                                            .serverConfigurator(sb -> {
-                                                sb.contentPreview(100);
-                                                sb.requestTimeoutMillis(0);
-                                            })
-                                            .build();
-    }
-
-    private static HttpResponseSubscriber responseSubscriber(RequestHeaders headers,
-                                                             DefaultServiceRequestContext sctx) {
-
-        final DecodedHttpRequest req = new DecodedHttpRequest(sctx.eventLoop(), 1, 1, headers, true,
-                                                              InboundTrafficController.disabled(),
-                                                              sctx.maxRequestLength());
-        req.init(sctx);
-        return new HttpResponseSubscriber(mock(ChannelHandlerContext.class),
-                                          new ImmediateWriteEmulator(sctx.channel()),
-                                          sctx, req);
-    }
-
-    private static ByteBuf newBuffer(String content) {
-        return ByteBufAllocator.DEFAULT.buffer().writeBytes(content.getBytes());
-    }
-
-    private static class ImmediateWriteEmulator extends HttpObjectEncoder {
-
-        private Channel channel;
-
-        ImmediateWriteEmulator(Channel channel) {
-            this.channel = channel;
-        }
-
-        @Override
-        protected Channel channel() {
-            return channel;
-        }
-
-        @Override
-        protected ChannelFuture doWriteHeaders(int id, int streamId, HttpHeaders headers, boolean endStream) {
-            return successChannelFuture();
-        }
-
-        @Override
-        protected ChannelFuture doWriteData(int id, int streamId, HttpData data, boolean endStream) {
-            ReferenceCountUtil.safeRelease(data);
-            return successChannelFuture();
-        }
-
-        @Override
-        protected ChannelFuture doWriteReset(int id, int streamId, Http2Error error) {
-            return successChannelFuture();
-        }
-
-        private ChannelFuture successChannelFuture() {
-            final DefaultChannelPromise future = new DefaultChannelPromise(channel);
-            future.setSuccess();
-            return future;
-        }
-
-        @Override
-        protected void doClose() {}
+    void httpResponseSubscriberDoesNotThrowExceptionWhenContentIsNotEmpty() {
+        final WebClient client = WebClient.of(server.httpUri());
+        final AggregatedHttpResponse res = client.get("/").aggregate().join();
+        assertThat(res.content().isEmpty()).isTrue();
     }
 }

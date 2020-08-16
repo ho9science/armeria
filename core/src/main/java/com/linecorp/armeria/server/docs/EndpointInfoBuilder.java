@@ -32,10 +32,12 @@ import com.google.common.collect.Streams;
 
 import com.linecorp.armeria.common.MediaType;
 import com.linecorp.armeria.common.SerializationFormat;
+import com.linecorp.armeria.common.annotation.UnstableApi;
 
 /**
  * Creates a new {@link EndpointInfo} using the builder pattern.
  */
+@UnstableApi
 public final class EndpointInfoBuilder {
 
     private final String hostnamePattern;
@@ -54,7 +56,7 @@ public final class EndpointInfoBuilder {
      * Creates a new {@link EndpointInfoBuilder} that builds the {@link EndpointInfo} with the specified
      * {@code hostnamePattern} and {@code pathMapping}.
      */
-    public EndpointInfoBuilder(String hostnamePattern, String pathMapping) {
+    EndpointInfoBuilder(String hostnamePattern, String pathMapping) {
         this.hostnamePattern = requireNonNull(hostnamePattern, "hostnamePattern");
         this.pathMapping = requireNonNull(pathMapping, "pathMapping");
     }

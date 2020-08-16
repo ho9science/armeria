@@ -23,6 +23,7 @@ import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.file.Path;
 import java.security.GeneralSecurityException;
 import java.security.KeyStore;
 import java.util.HashMap;
@@ -59,18 +60,18 @@ public final class KeyStoreCredentialResolverBuilder {
     }
 
     /**
-     * Creates a builder with the specified {@code resourcePath} and the default {@link ClassLoader}.
+     * Creates a builder with the file at the specified {@link Path}.
      */
-    public KeyStoreCredentialResolverBuilder(String resourcePath) {
-        this(resourcePath, null);
+    public KeyStoreCredentialResolverBuilder(Path path) {
+        this(requireNonNull(path, "path").toFile());
     }
 
     /**
-     * Creates a builder with the specified {@code resourcePath} and {@link ClassLoader}.
+     * Creates a builder with the specified {@link ClassLoader} and {@code resourcePath}.
      */
-    public KeyStoreCredentialResolverBuilder(String resourcePath, @Nullable ClassLoader classLoader) {
+    public KeyStoreCredentialResolverBuilder(ClassLoader classLoader, String resourcePath) {
+        this.classLoader = requireNonNull(classLoader, "classLoader");
         this.resourcePath = requireNonNull(resourcePath, "resourcePath");
-        this.classLoader = classLoader;
         file = null;
     }
 
@@ -94,7 +95,7 @@ public final class KeyStoreCredentialResolverBuilder {
     /**
      * Adds a key name and its password to the {@link KeyStoreCredentialResolverBuilder}.
      */
-    public KeyStoreCredentialResolverBuilder addKeyPassword(String name, String password) {
+    public KeyStoreCredentialResolverBuilder keyPassword(String name, String password) {
         requireNonNull(name, "name");
         requireNonNull(password, "password");
         checkArgument(!keyPasswords.containsKey(name), "key already exists: %s", name);
@@ -105,9 +106,9 @@ public final class KeyStoreCredentialResolverBuilder {
     /**
      * Adds all key names and their passwords which are specified by the {@code keyPasswords}.
      */
-    public KeyStoreCredentialResolverBuilder addKeyPasswords(Map<String, String> keyPasswords) {
+    public KeyStoreCredentialResolverBuilder keyPasswords(Map<String, String> keyPasswords) {
         requireNonNull(keyPasswords, "keyPasswords");
-        keyPasswords.forEach(this::addKeyPassword);
+        keyPasswords.forEach(this::keyPassword);
         return this;
     }
 

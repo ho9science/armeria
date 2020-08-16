@@ -18,7 +18,6 @@ package com.linecorp.armeria.client;
 import static java.util.Objects.requireNonNull;
 
 import java.net.InetSocketAddress;
-import java.util.concurrent.CompletableFuture;
 
 import javax.annotation.Nullable;
 
@@ -26,12 +25,22 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Strings;
 
 import com.linecorp.armeria.client.HttpChannelPool.PoolKey;
+import com.linecorp.armeria.client.endpoint.EmptyEndpointGroupException;
+import com.linecorp.armeria.client.proxy.HAProxyConfig;
+import com.linecorp.armeria.client.proxy.ProxyConfig;
+import com.linecorp.armeria.client.proxy.ProxyType;
 import com.linecorp.armeria.common.HttpHeaderNames;
 import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.SessionProtocol;
+import com.linecorp.armeria.common.logging.ClientConnectionTimings;
+import com.linecorp.armeria.common.logging.ClientConnectionTimingsBuilder;
 import com.linecorp.armeria.common.logging.RequestLogBuilder;
-import com.linecorp.armeria.internal.PathAndQuery;
+import com.linecorp.armeria.common.util.SafeCloseable;
+import com.linecorp.armeria.internal.common.PathAndQuery;
+import com.linecorp.armeria.internal.common.RequestContextUtil;
+import com.linecorp.armeria.server.ProxiedAddresses;
+import com.linecorp.armeria.server.ServiceRequestContext;
 
 import io.netty.channel.Channel;
 import io.netty.channel.EventLoop;
@@ -39,12 +48,7 @@ import io.netty.resolver.AddressResolverGroup;
 import io.netty.util.concurrent.Future;
 import io.netty.util.concurrent.FutureListener;
 
-final class HttpClientDelegate implements Client<HttpRequest, HttpResponse> {
-
-    private static final Throwable CONTEXT_INITIALIZATION_FAILED = new Exception(
-            ClientRequestContext.class.getSimpleName() + " initialization failed", null, false, false) {
-        private static final long serialVersionUID = 837901495421033459L;
-    };
+final class HttpClientDelegate implements HttpClient {
 
     private final HttpClientFactory factory;
     private final AddressResolverGroup<InetSocketAddress> addressResolverGroup;
@@ -59,24 +63,34 @@ final class HttpClientDelegate implements Client<HttpRequest, HttpResponse> {
     public HttpResponse execute(ClientRequestContext ctx, HttpRequest req) throws Exception {
         final Endpoint endpoint = ctx.endpoint();
         if (endpoint == null) {
-            // Note that this response will be ignored because:
-            // - `ClientRequestContext.endpoint()` returns `null` only when the context initialization failed.
-            // - `ClientUtil.initContextAndExecuteWithFallback()` will use the fallback response rather than
-            //   what we return here.
-            return HttpResponse.ofFailure(CONTEXT_INITIALIZATION_FAILED);
+            // It is possible that we reach here even when `EndpointGroup` is not empty,
+            // because `endpoint` can be `null` for the following two cases:
+            // - `EndpointGroup.select()` returned `null`.
+            // - An exception was raised while context initialization.
+            //
+            // Because all the clean-up is done by `DefaultClientRequestContext.failEarly()`
+            // when context initialization fails with an exception, we can assume that the exception
+            // and response created here will be exposed only when `EndpointGroup.select()` returned `null`.
+            //
+            // See `DefaultClientRequestContext.init()` for more information.
+            final UnprocessedRequestException cause =
+                    UnprocessedRequestException.of(EmptyEndpointGroupException.get());
+            handleEarlyRequestException(ctx, req, cause);
+            return HttpResponse.ofFailure(cause);
         }
 
         if (!isValidPath(req)) {
-            final IllegalArgumentException cause = new IllegalArgumentException("invalid path: " + req.path());
+            final UnprocessedRequestException cause = UnprocessedRequestException.of(
+                    new IllegalArgumentException("invalid path: " + req.path()));
             handleEarlyRequestException(ctx, req, cause);
             return HttpResponse.ofFailure(cause);
         }
 
         final Endpoint endpointWithPort = endpoint.withDefaultPort(ctx.sessionProtocol().defaultPort());
-        final EventLoop eventLoop = ctx.eventLoop();
+        final EventLoop eventLoop = ctx.eventLoop().withoutContext();
         final DecodedHttpResponse res = new DecodedHttpResponse(eventLoop);
 
-        final ClientConnectionTimingsBuilder timingsBuilder = new ClientConnectionTimingsBuilder();
+        final ClientConnectionTimingsBuilder timingsBuilder = ClientConnectionTimings.builder();
 
         if (endpointWithPort.hasIpAddr()) {
             // IP address has been resolved already.
@@ -108,8 +122,8 @@ final class HttpClientDelegate implements Client<HttpRequest, HttpResponse> {
             final String ipAddr = resolveFuture.getNow().getAddress().getHostAddress();
             acquireConnectionAndExecute(ctx, endpointWithPort, ipAddr, req, res, timingsBuilder);
         } else {
-            timingsBuilder.build().setTo(ctx);
-            final Throwable cause = resolveFuture.cause();
+            ctx.logBuilder().session(null, ctx.sessionProtocol(), timingsBuilder.build());
+            final UnprocessedRequestException cause = UnprocessedRequestException.of(resolveFuture.cause());
             handleEarlyRequestException(ctx, req, cause);
             res.close(cause);
         }
@@ -128,24 +142,68 @@ final class HttpClientDelegate implements Client<HttpRequest, HttpResponse> {
         final String host = extractHost(ctx, req, endpointWithPort);
         final int port = endpointWithPort.port();
         final SessionProtocol protocol = ctx.sessionProtocol();
-        final HttpChannelPool pool = factory.pool(ctx.eventLoop());
+        final HttpChannelPool pool = factory.pool(ctx.eventLoop().withoutContext());
 
-        final PoolKey key = new PoolKey(host, ipAddr, port);
+        final ProxyConfig proxyConfig;
+        try {
+            final Endpoint endpoint = Endpoint.of(host, port).withIpAddr(ipAddr);
+            proxyConfig = getProxyConfig(protocol, endpoint);
+        } catch (Throwable t) {
+            final UnprocessedRequestException wrapped = UnprocessedRequestException.of(t);
+            handleEarlyRequestException(ctx, req, wrapped);
+            res.close(wrapped);
+            return;
+        }
+
+        final PoolKey key = new PoolKey(host, ipAddr, port, proxyConfig);
         final PooledChannel pooledChannel = pool.acquireNow(protocol, key);
         if (pooledChannel != null) {
+            logSession(ctx, pooledChannel, null);
             doExecute(pooledChannel, ctx, req, res);
         } else {
             pool.acquireLater(protocol, key, timingsBuilder).handle((newPooledChannel, cause) -> {
-                timingsBuilder.build().setTo(ctx);
-
+                logSession(ctx, newPooledChannel, timingsBuilder.build());
                 if (cause == null) {
                     doExecute(newPooledChannel, ctx, req, res);
                 } else {
-                    handleEarlyRequestException(ctx, req, cause);
-                    res.close(cause);
+                    final UnprocessedRequestException wrapped = UnprocessedRequestException.of(cause);
+                    handleEarlyRequestException(ctx, req, wrapped);
+                    res.close(wrapped);
                 }
                 return null;
             });
+        }
+    }
+
+    private ProxyConfig getProxyConfig(SessionProtocol protocol, Endpoint endpoint) {
+        final ProxyConfig proxyConfig = factory.proxyConfigSelector().select(protocol, endpoint);
+        requireNonNull(proxyConfig, "proxyConfig");
+
+        // special behavior for haproxy when sourceAddress is null
+        if (proxyConfig.proxyType() == ProxyType.HAPROXY &&
+            ((HAProxyConfig) proxyConfig).sourceAddress() == null) {
+            final InetSocketAddress proxyAddress = proxyConfig.proxyAddress();
+            assert proxyAddress != null;
+
+            // use proxy information in context if available
+            final ServiceRequestContext serviceCtx = ServiceRequestContext.currentOrNull();
+            if (serviceCtx != null) {
+                final ProxiedAddresses proxiedAddresses = serviceCtx.proxiedAddresses();
+                return ProxyConfig.haproxy(proxyAddress, proxiedAddresses.sourceAddress());
+            }
+        }
+
+        return proxyConfig;
+    }
+
+    private static void logSession(ClientRequestContext ctx, @Nullable PooledChannel pooledChannel,
+                                   @Nullable ClientConnectionTimings connectionTimings) {
+        if (pooledChannel != null) {
+            final Channel channel = pooledChannel.get();
+            final SessionProtocol actualProtocol = pooledChannel.protocol();
+            ctx.logBuilder().session(channel, actualProtocol, connectionTimings);
+        } else {
+            ctx.logBuilder().session(null, ctx.sessionProtocol(), connectionTimings);
         }
     }
 
@@ -202,56 +260,19 @@ final class HttpClientDelegate implements Client<HttpRequest, HttpResponse> {
 
     private static void handleEarlyRequestException(ClientRequestContext ctx,
                                                     HttpRequest req, Throwable cause) {
-        req.abort();
-        final RequestLogBuilder logBuilder = ctx.logBuilder();
-        logBuilder.endRequest(cause);
-        logBuilder.endResponse(cause);
+        try (SafeCloseable ignored = RequestContextUtil.pop()) {
+            req.abort(cause);
+            final RequestLogBuilder logBuilder = ctx.logBuilder();
+            logBuilder.endRequest(cause);
+            logBuilder.endResponse(cause);
+        }
     }
 
-    private void doExecute(PooledChannel pooledChannel, ClientRequestContext ctx,
-                           HttpRequest req, DecodedHttpResponse res) {
+    private static void doExecute(PooledChannel pooledChannel, ClientRequestContext ctx,
+                                  HttpRequest req, DecodedHttpResponse res) {
         final Channel channel = pooledChannel.get();
-        boolean needsRelease = true;
-        try {
-            final HttpSession session = HttpSession.get(channel);
-            res.init(session.inboundTrafficController());
-            final SessionProtocol sessionProtocol = session.protocol();
-
-            // Should never reach here.
-            if (sessionProtocol == null) {
-                needsRelease = false;
-                try {
-                    // TODO(minwoox): Make a test that handles this case
-                    final NullPointerException cause = new NullPointerException("sessionProtocol");
-                    handleEarlyRequestException(ctx, req, cause);
-                    res.close(cause);
-                } finally {
-                    channel.close();
-                }
-                return;
-            }
-
-            if (session.invoke(ctx, req, res)) {
-                needsRelease = false;
-
-                // Return the channel to the pool.
-                if (!sessionProtocol.isMultiplex()) {
-                    // If pipelining is enabled, return as soon as the request is fully sent.
-                    // If pipelining is disabled, return after the response is fully received.
-                    final CompletableFuture<Void> completionFuture =
-                            factory.useHttp1Pipelining() ? req.completionFuture() : res.completionFuture();
-                    completionFuture.handle((ret, cause) -> {
-                        pooledChannel.release();
-                        return null;
-                    });
-                } else {
-                    // HTTP/2 connections do not need to get returned.
-                }
-            }
-        } finally {
-            if (needsRelease) {
-                pooledChannel.release();
-            }
-        }
+        final HttpSession session = HttpSession.get(channel);
+        res.init(session.inboundTrafficController());
+        session.invoke(pooledChannel, ctx, req, res);
     }
 }

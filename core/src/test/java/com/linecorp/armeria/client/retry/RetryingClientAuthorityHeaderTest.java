@@ -16,7 +16,6 @@
 
 package com.linecorp.armeria.client.retry;
 
-import static com.linecorp.armeria.common.HttpMethod.GET;
 import static com.linecorp.armeria.common.HttpStatus.SERVICE_UNAVAILABLE;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -24,17 +23,12 @@ import org.junit.ClassRule;
 import org.junit.Test;
 
 import com.linecorp.armeria.client.Endpoint;
-import com.linecorp.armeria.client.HttpClient;
-import com.linecorp.armeria.client.HttpClientBuilder;
+import com.linecorp.armeria.client.WebClient;
 import com.linecorp.armeria.client.endpoint.EndpointGroup;
-import com.linecorp.armeria.client.endpoint.EndpointGroupRegistry;
-import com.linecorp.armeria.client.endpoint.EndpointSelectionStrategy;
-import com.linecorp.armeria.client.endpoint.StaticEndpointGroup;
 import com.linecorp.armeria.common.AggregatedHttpResponse;
-import com.linecorp.armeria.common.HttpHeaderNames;
 import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.HttpResponse;
-import com.linecorp.armeria.common.RequestHeaders;
+import com.linecorp.armeria.common.SessionProtocol;
 import com.linecorp.armeria.server.AbstractHttpService;
 import com.linecorp.armeria.server.ServerBuilder;
 import com.linecorp.armeria.server.ServiceRequestContext;
@@ -75,30 +69,20 @@ public class RetryingClientAuthorityHeaderTest {
 
     @Test
     public void authorityIsDifferentByBackendsWhenRetry() {
-        final HttpClient client = newHttpClientWithEndpointGroup();
+        final WebClient client = newHttpClientWithEndpointGroup();
 
         final AggregatedHttpResponse res = client.get("/").aggregate().join();
         assertThat(res.contentUtf8()).contains("www.bar.com");
     }
 
-    @Test
-    public void authorityIsSameWhenSet() {
-        final HttpClient client = newHttpClientWithEndpointGroup();
-
-        final RequestHeaders headers = RequestHeaders.of(GET, "/",
-                                                         HttpHeaderNames.AUTHORITY, "www.armeria.com");
-        final AggregatedHttpResponse res = client.execute(headers).aggregate().join();
-        assertThat(res.contentUtf8()).contains("www.armeria.com");
-    }
-
-    private static HttpClient newHttpClientWithEndpointGroup() {
-        final EndpointGroup endpointGroup = new StaticEndpointGroup(
+    private static WebClient newHttpClientWithEndpointGroup() {
+        final EndpointGroup endpointGroup = EndpointGroup.of(
                 Endpoint.of("www.foo.com", backend1.httpPort()).withIpAddr("127.0.0.1"),
                 Endpoint.of("www.bar.com", backend2.httpPort()).withIpAddr("127.0.0.1"));
-        EndpointGroupRegistry.register("backends", endpointGroup, EndpointSelectionStrategy.ROUND_ROBIN);
 
-        return new HttpClientBuilder("h2c://group:backends")
-                .decorator(RetryingHttpClient.newDecorator(RetryStrategy.onServerErrorStatus()))
-                .build();
+        return WebClient.builder(SessionProtocol.H2C, endpointGroup)
+                        .decorator(RetryingClient.newDecorator(
+                                RetryRule.builder().onServerErrorStatus().onException().thenBackoff()))
+                        .build();
     }
 }

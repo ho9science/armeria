@@ -54,7 +54,7 @@ configure(projectsWithFlags('java')) {
                     } else {
                         actualThriftPath =
                                 "${libDir}/thrift" +
-                                "/${project.findProperty('thriftVersion')?: '0.12'}" +
+                                "/${project.findProperty('thriftVersion')?: '0.13'}" +
                                 "/thrift.${rootProject.osdetector.classifier}"
                     }
 
@@ -99,6 +99,8 @@ configure(projectsWithFlags('java')) {
             if (compileTask != null) {
                 compileTask.dependsOn(task)
             }
+
+            project.ext.getGenerateSourcesTask().dependsOn(task)
         }
     }
 }

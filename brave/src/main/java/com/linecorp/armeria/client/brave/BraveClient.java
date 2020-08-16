@@ -16,8 +16,9 @@
 
 package com.linecorp.armeria.client.brave;
 
-import static com.linecorp.armeria.common.brave.RequestContextCurrentTraceContext.ensureScopeUsesRequestContext;
+import static com.linecorp.armeria.internal.common.brave.TraceContextUtil.ensureScopeUsesRequestContext;
 
+import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 
 import javax.annotation.Nullable;
@@ -25,32 +26,26 @@ import javax.annotation.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.linecorp.armeria.client.Client;
 import com.linecorp.armeria.client.ClientRequestContext;
+import com.linecorp.armeria.client.HttpClient;
 import com.linecorp.armeria.client.SimpleDecoratingHttpClient;
 import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.RequestHeadersBuilder;
-import com.linecorp.armeria.common.logging.RequestLog;
-import com.linecorp.armeria.common.logging.RequestLogAvailability;
-import com.linecorp.armeria.internal.brave.AsciiStringKeyFactory;
-import com.linecorp.armeria.internal.brave.SpanContextUtil;
-import com.linecorp.armeria.internal.brave.SpanTags;
-import com.linecorp.armeria.internal.brave.TraceContextUtil;
+import com.linecorp.armeria.common.logging.ClientConnectionTimings;
+import com.linecorp.armeria.internal.common.brave.SpanTags;
 
 import brave.Span;
 import brave.Tracer;
 import brave.Tracer.SpanInScope;
 import brave.Tracing;
 import brave.http.HttpClientHandler;
-import brave.http.HttpClientParser;
+import brave.http.HttpClientRequest;
+import brave.http.HttpClientResponse;
 import brave.http.HttpTracing;
-import brave.propagation.CurrentTraceContext;
-import brave.propagation.CurrentTraceContext.Scope;
-import brave.propagation.TraceContext;
 
 /**
- * Decorates a {@link Client} to trace outbound {@link HttpRequest}s using
+ * Decorates an {@link HttpClient} to trace outbound {@link HttpRequest}s using
  * <a href="https://github.com/openzipkin/brave">Brave</a>.
  */
 public final class BraveClient extends SimpleDecoratingHttpClient {
@@ -58,20 +53,21 @@ public final class BraveClient extends SimpleDecoratingHttpClient {
     private static final Logger logger = LoggerFactory.getLogger(BraveClient.class);
 
     /**
-     * Creates a new tracing {@link Client} decorator using the specified {@link Tracing} instance.
+     * Creates a new tracing {@link HttpClient} decorator using the specified {@link Tracing} instance.
      */
-    public static Function<Client<HttpRequest, HttpResponse>, BraveClient> newDecorator(Tracing tracing) {
+    public static Function<? super HttpClient, BraveClient> newDecorator(Tracing tracing) {
         return newDecorator(tracing, null);
     }
 
     /**
-     * Creates a new tracing {@link Client} decorator using the specified {@link Tracing} instance
+     * Creates a new tracing {@link HttpClient} decorator using the specified {@link Tracing} instance
      * and the remote service name.
      */
-    public static Function<Client<HttpRequest, HttpResponse>, BraveClient> newDecorator(
+    public static Function<? super HttpClient, BraveClient> newDecorator(
             Tracing tracing, @Nullable String remoteServiceName) {
         HttpTracing httpTracing = HttpTracing.newBuilder(tracing)
-                                             .clientParser(ArmeriaHttpClientParser.get())
+                                             .clientRequestParser(ArmeriaHttpClientParser.get())
+                                             .clientResponseParser(ArmeriaHttpClientParser.get())
                                              .build();
         if (remoteServiceName != null) {
             httpTracing = httpTracing.clientOf(remoteServiceName);
@@ -80,9 +76,9 @@ public final class BraveClient extends SimpleDecoratingHttpClient {
     }
 
     /**
-     * Creates a new tracing {@link Client} decorator using the specified {@link HttpTracing} instance.
+     * Creates a new tracing {@link HttpClient} decorator using the specified {@link HttpTracing} instance.
      */
-    public static Function<Client<HttpRequest, HttpResponse>, BraveClient> newDecorator(
+    public static Function<? super HttpClient, BraveClient> newDecorator(
             HttpTracing httpTracing) {
         try {
             ensureScopeUsesRequestContext(httpTracing.tracing());
@@ -95,87 +91,86 @@ public final class BraveClient extends SimpleDecoratingHttpClient {
     }
 
     private final Tracer tracer;
-    private final TraceContext.Injector<RequestHeadersBuilder> injector;
-    private final HttpClientHandler<RequestLog, RequestLog> handler;
-    private final CurrentTraceContext currentTraceContext;
-    private final ArmeriaHttpClientAdapter adapter;
-    private final HttpClientParser clientParser;
+    private final HttpClientHandler<HttpClientRequest, HttpClientResponse> handler;
 
     /**
      * Creates a new instance.
      */
-    private BraveClient(Client<HttpRequest, HttpResponse> delegate, HttpTracing httpTracing) {
+    private BraveClient(HttpClient delegate, HttpTracing httpTracing) {
         super(delegate);
-        currentTraceContext = httpTracing.tracing().currentTraceContext();
         tracer = httpTracing.tracing().tracer();
-        clientParser = httpTracing.clientParser();
-        adapter = ArmeriaHttpClientAdapter.get();
-        handler = HttpClientHandler.create(httpTracing, adapter);
-        injector = httpTracing.tracing().propagationFactory().create(AsciiStringKeyFactory.INSTANCE)
-                              .injector(RequestHeadersBuilder::set);
+        handler = HttpClientHandler.create(httpTracing);
     }
 
     @Override
     public HttpResponse execute(ClientRequestContext ctx, HttpRequest req) throws Exception {
         final RequestHeadersBuilder newHeaders = req.headers().toBuilder();
-        final Span span = handler.handleSend(injector, newHeaders, ctx.log());
-        req = HttpRequest.of(req, newHeaders.build());
+        final HttpClientRequest braveReq = ClientRequestContextAdapter.asHttpClientRequest(ctx, newHeaders);
+        final Span span = handler.handleSend(braveReq);
+        req = req.withHeaders(newHeaders);
         ctx.updateRequest(req);
-
-        // Ensure the trace context propagates to children
-        ctx.onChild(TraceContextUtil::copy);
 
         // For no-op spans, we only need to inject into headers and don't set any other attributes.
         if (span.isNoop()) {
             try (SpanInScope ignored = tracer.withSpanInScope(span)) {
-                return delegate().execute(ctx, req);
+                return unwrap().execute(ctx, req);
             }
         }
 
-        ctx.log().addListener(log -> SpanContextUtil.startSpan(span, log),
-                              RequestLogAvailability.REQUEST_START);
+        ctx.log().whenComplete().thenAccept(log -> {
+            span.start(log.requestStartTimeMicros());
 
-        ctx.log().addListener(log -> {
-            // The request might have failed even before it's sent, e.g. validation failure, connection error.
-            if (log.isAvailable(RequestLogAvailability.REQUEST_FIRST_BYTES_TRANSFERRED)) {
-                SpanTags.logWireSend(span, log.requestFirstBytesTransferredTimeNanos(), log);
+            final Long wireSendTimeNanos = log.requestFirstBytesTransferredTimeNanos();
+            if (wireSendTimeNanos != null) {
+                SpanTags.logWireSend(span, wireSendTimeNanos, log);
+            } else {
+                // The request might have failed even before it's sent,
+                // e.g. validation failure, connection error.
             }
-            // If the client timed-out the request, we will have never received any response data at all.
-            if (log.isAvailable(RequestLogAvailability.RESPONSE_FIRST_BYTES_TRANSFERRED)) {
-                SpanTags.logWireReceive(span, log.responseFirstBytesTransferredTimeNanos(), log);
+
+            final Long wireReceiveTimeNanos = log.responseFirstBytesTransferredTimeNanos();
+            if (wireReceiveTimeNanos != null) {
+                SpanTags.logWireReceive(span, wireReceiveTimeNanos, log);
+            } else {
+                // If the client timed-out the request, we will have never received any response data at all.
             }
-            SpanTags.updateRemoteEndpoint(span, log);
-            handleFinish(log, span);
-        }, RequestLogAvailability.COMPLETE);
+
+            SpanTags.updateRemoteEndpoint(span, ctx);
+
+            final ClientConnectionTimings timings = log.connectionTimings();
+            if (timings != null) {
+                logTiming(span, "connection-acquire.start", "connection-acquire.end",
+                          timings.connectionAcquisitionStartTimeMicros(),
+                          timings.connectionAcquisitionDurationNanos());
+                if (timings.dnsResolutionDurationNanos() != -1) {
+                    logTiming(span, "dns-resolve.start", "dns-resolve.end",
+                              timings.dnsResolutionStartTimeMicros(),
+                              timings.dnsResolutionDurationNanos());
+                }
+                if (timings.socketConnectDurationNanos() != -1) {
+                    logTiming(span, "socket-connect.start", "socket-connect.end",
+                              timings.socketConnectStartTimeMicros(),
+                              timings.socketConnectDurationNanos());
+                }
+                if (timings.pendingAcquisitionDurationNanos() != -1) {
+                    logTiming(span, "connection-reuse.start", "connection-reuse.end",
+                              timings.pendingAcquisitionStartTimeMicros(),
+                              timings.pendingAcquisitionDurationNanos());
+                }
+            }
+
+            final HttpClientResponse braveRes = ClientRequestContextAdapter.asHttpClientResponse(log, braveReq);
+            handler.handleReceive(braveRes, span);
+        });
 
         try (SpanInScope ignored = tracer.withSpanInScope(span)) {
-            return delegate().execute(ctx, req);
+            return unwrap().execute(ctx, req);
         }
     }
 
-    /**
-     * Copy from brave.http.HttpHandler#handleFinish(Object, Throwable, Span)
-     * We need to set timestamp from armeria's clock instead of brave's one. But current implementation
-     * of HttpHandler doesn't allow us to pass in our own timestamp.
-     * https://github.com/openzipkin/brave/issues/946
-     */
-    private void handleFinish(RequestLog requestLog, Span span) {
-        if (span.isNoop()) {
-            return;
-        }
-        try {
-            try (Scope ws = currentTraceContext.maybeScope(span.context())) {
-                clientParser.response(adapter, requestLog, requestLog.responseCause(), span.customizer());
-            }
-            // close the scope before finishing the span
-        } finally {
-            finishInNullScope(span, requestLog);
-        }
-    }
-
-    private void finishInNullScope(Span span, RequestLog requestLog) {
-        try (Scope ws = currentTraceContext.maybeScope(null)) {
-            span.finish(SpanContextUtil.wallTimeMicros(requestLog, requestLog.responseEndTimeNanos()));
-        }
+    private static void logTiming(Span span, String startName, String endName, long startTimeMicros,
+                                  long durationNanos) {
+        span.annotate(startTimeMicros, startName);
+        span.annotate(startTimeMicros + TimeUnit.NANOSECONDS.toMicros(durationNanos), endName);
     }
 }

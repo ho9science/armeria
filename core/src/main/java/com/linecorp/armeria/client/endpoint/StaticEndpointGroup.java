@@ -19,38 +19,35 @@ import static java.util.Objects.requireNonNull;
 
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ScheduledExecutorService;
+
+import javax.annotation.Nullable;
 
 import com.google.common.collect.ImmutableList;
 
+import com.linecorp.armeria.client.ClientRequestContext;
 import com.linecorp.armeria.client.Endpoint;
+import com.linecorp.armeria.common.util.UnmodifiableFuture;
 
 /**
  * A static immutable {@link EndpointGroup}.
  */
-public final class StaticEndpointGroup implements EndpointGroup {
+final class StaticEndpointGroup implements EndpointGroup {
 
-    static final StaticEndpointGroup EMPTY = new StaticEndpointGroup();
+    static final StaticEndpointGroup EMPTY =
+            new StaticEndpointGroup(new EmptyEndpointSelectionStrategy(), ImmutableList.of());
 
     private final List<Endpoint> endpoints;
-
     private final CompletableFuture<List<Endpoint>> initialEndpointsFuture;
+    private final EndpointSelectionStrategy selectionStrategy;
+    private final EndpointSelector selector;
 
-    /**
-     * Creates a new instance.
-     */
-    public StaticEndpointGroup(Endpoint... endpoints) {
-        this(ImmutableList.copyOf(requireNonNull(endpoints, "endpoints")));
-    }
-
-    /**
-     * Creates a new instance.
-     */
-    public StaticEndpointGroup(Iterable<Endpoint> endpoints) {
-        requireNonNull(endpoints, "endpoints");
-
-        this.endpoints = ImmutableList.copyOf(endpoints);
-
+    StaticEndpointGroup(EndpointSelectionStrategy selectionStrategy,
+                        Iterable<Endpoint> endpoints) {
+        this.endpoints = ImmutableList.copyOf(requireNonNull(endpoints, "endpoints"));
         initialEndpointsFuture = CompletableFuture.completedFuture(this.endpoints);
+        this.selectionStrategy = requireNonNull(selectionStrategy, "selectionStrategy");
+        selector = selectionStrategy.newSelector(this);
     }
 
     @Override
@@ -59,12 +56,62 @@ public final class StaticEndpointGroup implements EndpointGroup {
     }
 
     @Override
-    public CompletableFuture<List<Endpoint>> initialEndpointsFuture() {
+    public EndpointSelectionStrategy selectionStrategy() {
+        return selectionStrategy;
+    }
+
+    @Override
+    public Endpoint selectNow(ClientRequestContext ctx) {
+        return selector.selectNow(ctx);
+    }
+
+    @Override
+    public CompletableFuture<Endpoint> select(ClientRequestContext ctx,
+                                              ScheduledExecutorService executor,
+                                              long timeoutMillis) {
+        return UnmodifiableFuture.completedFuture(selectNow(ctx));
+    }
+
+    @Override
+    public CompletableFuture<List<Endpoint>> whenReady() {
         return initialEndpointsFuture;
     }
 
     @Override
+    public CompletableFuture<?> closeAsync() {
+        return UnmodifiableFuture.completedFuture(null);
+    }
+
+    @Override
+    public void close() {}
+
+    @Override
     public String toString() {
         return StaticEndpointGroup.class.getSimpleName() + endpoints;
+    }
+
+    private static final class EmptyEndpointSelectionStrategy implements EndpointSelectionStrategy {
+        @Override
+        public EndpointSelector newSelector(EndpointGroup endpointGroup) {
+            return EmptyEndpointSelector.INSTANCE;
+        }
+    }
+
+    private static final class EmptyEndpointSelector implements EndpointSelector {
+
+        static final EmptyEndpointSelector INSTANCE = new EmptyEndpointSelector();
+
+        @Nullable
+        @Override
+        public Endpoint selectNow(ClientRequestContext ctx) {
+            return null;
+        }
+
+        @Override
+        public CompletableFuture<Endpoint> select(ClientRequestContext ctx,
+                                                  ScheduledExecutorService executor,
+                                                  long timeoutMillis) {
+            return UnmodifiableFuture.completedFuture(null);
+        }
     }
 }

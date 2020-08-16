@@ -31,7 +31,7 @@ import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.MediaType;
 import com.linecorp.armeria.server.Server;
 import com.linecorp.armeria.server.Service;
-import com.linecorp.armeria.server.auth.HttpAuthService;
+import com.linecorp.armeria.server.auth.AuthService;
 
 /**
  * Builds a {@link HealthCheckService}.
@@ -39,6 +39,7 @@ import com.linecorp.armeria.server.auth.HttpAuthService;
 public final class HealthCheckServiceBuilder {
 
     private static final int DEFAULT_LONG_POLLING_TIMEOUT_SECONDS = 60;
+    private static final int DEFAULT_PING_INTERVAL_SECONDS = 5;
     private static final double DEFAULT_LONG_POLLING_TIMEOUT_JITTER_RATE = 0.2;
 
     private final ImmutableSet.Builder<HealthChecker> healthCheckers = ImmutableSet.builder();
@@ -50,6 +51,7 @@ public final class HealthCheckServiceBuilder {
                                                                                  "{\"healthy\":false}");
     private long maxLongPollingTimeoutMillis = TimeUnit.SECONDS.toMillis(DEFAULT_LONG_POLLING_TIMEOUT_SECONDS);
     private double longPollingTimeoutJitterRate = DEFAULT_LONG_POLLING_TIMEOUT_JITTER_RATE;
+    private long pingIntervalMillis = TimeUnit.SECONDS.toMillis(DEFAULT_PING_INTERVAL_SECONDS);
     @Nullable
     private HealthCheckUpdateHandler updateHandler;
 
@@ -131,10 +133,11 @@ public final class HealthCheckServiceBuilder {
      *                              in the {@code "prefer: wait=<n>"} request header.
      *                              Specify {@code 0} to disable long-polling support.
      * @return {@code this}
-     * @see #longPolling(Duration, double)
+     * @see #longPolling(Duration, double, Duration)
      */
     public HealthCheckServiceBuilder longPolling(Duration maxLongPollingTimeout) {
-        return longPolling(maxLongPollingTimeout, longPollingTimeoutJitterRate);
+        return longPolling(maxLongPollingTimeout, longPollingTimeoutJitterRate,
+                           Duration.ofMillis(pingIntervalMillis));
     }
 
     /**
@@ -146,10 +149,10 @@ public final class HealthCheckServiceBuilder {
      *                                    a client in the {@code "prefer: wait=<n>"} request header.
      *                                    Specify {@code 0} to disable long-polling support.
      * @return {@code this}
-     * @see #longPolling(long, double)
+     * @see #longPolling(long, double, long)
      */
     public HealthCheckServiceBuilder longPolling(long maxLongPollingTimeoutMillis) {
-        return longPolling(maxLongPollingTimeoutMillis, longPollingTimeoutJitterRate);
+        return longPolling(maxLongPollingTimeoutMillis, longPollingTimeoutJitterRate, pingIntervalMillis);
     }
 
     /**
@@ -166,11 +169,19 @@ public final class HealthCheckServiceBuilder {
      * @see #longPolling(Duration)
      */
     public HealthCheckServiceBuilder longPolling(Duration maxLongPollingTimeout,
-                                                 double longPollingTimeoutJitterRate) {
+                                                 double longPollingTimeoutJitterRate,
+                                                 Duration pingInterval) {
         requireNonNull(maxLongPollingTimeout, "maxLongPollingTimeout");
         checkArgument(!maxLongPollingTimeout.isNegative(),
                       "maxLongPollingTimeout: %s (expected: >= 0)", maxLongPollingTimeout);
-        return longPolling(maxLongPollingTimeout.toMillis(), longPollingTimeoutJitterRate);
+
+        requireNonNull(pingInterval, "pingInterval");
+        checkArgument(!pingInterval.isNegative(),
+                      "pingInterval: %s (expected: >= 0)", pingInterval);
+
+        return longPolling(maxLongPollingTimeout.toMillis(),
+                           longPollingTimeoutJitterRate,
+                           pingInterval.toMillis());
     }
 
     /**
@@ -187,15 +198,19 @@ public final class HealthCheckServiceBuilder {
      * @see #longPolling(long)
      */
     public HealthCheckServiceBuilder longPolling(long maxLongPollingTimeoutMillis,
-                                                 double longPollingTimeoutJitterRate) {
+                                                 double longPollingTimeoutJitterRate,
+                                                 long pingIntervalMillis) {
         checkArgument(maxLongPollingTimeoutMillis >= 0,
                       "maxLongPollingTimeoutMillis: %s (expected: >= 0)",
                       maxLongPollingTimeoutMillis);
+        checkArgument(pingIntervalMillis >= 0,
+                      "pingIntervalMillis: %s (expected: >= 0)");
         checkArgument(longPollingTimeoutJitterRate >= 0 && longPollingTimeoutJitterRate <= 1,
                       "longPollingTimeoutJitterRate: %s (expected: >= 0 && <= 1)",
                       longPollingTimeoutJitterRate);
         this.maxLongPollingTimeoutMillis = maxLongPollingTimeoutMillis;
         this.longPollingTimeoutJitterRate = longPollingTimeoutJitterRate;
+        this.pingIntervalMillis = pingIntervalMillis;
         return this;
     }
 
@@ -204,7 +219,7 @@ public final class HealthCheckServiceBuilder {
      * {@code POST} or {@code PATCH} request to the {@link HealthCheckService}. This feature is disabled
      * by default. If enabled, a JSON object which has a boolean property named {@code "healthy"} can be
      * sent using a {@code PUT} or {@code POST} request. A JSON patch in a {@code PATCH} request is also
-     * accepted. It is recommended to employ some authorization mechanism such as {@link HttpAuthService}
+     * accepted. It is recommended to employ some authorization mechanism such as {@link AuthService}
      * when enabling this feature.
      *
      * @return {@code this}
@@ -222,7 +237,7 @@ public final class HealthCheckServiceBuilder {
     /**
      * Specifies a {@link HealthCheckUpdateHandler} which handles other HTTP methods than {@code HEAD} and
      * {@code GET} which updates the healthiness of the {@link Server}. This feature is disabled by default.
-     * It is recommended to employ some authorization mechanism such as {@link HttpAuthService}
+     * It is recommended to employ some authorization mechanism such as {@link AuthService}
      * when enabling this feature.
      *
      * @param updateHandler The {@link HealthCheckUpdateHandler} which handles {@code PUT}, {@code POST} or
@@ -242,6 +257,6 @@ public final class HealthCheckServiceBuilder {
         return new HealthCheckService(healthCheckers.build(),
                                       healthyResponse, unhealthyResponse,
                                       maxLongPollingTimeoutMillis, longPollingTimeoutJitterRate,
-                                      updateHandler);
+                                      pingIntervalMillis, updateHandler);
     }
 }

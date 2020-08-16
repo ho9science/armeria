@@ -17,25 +17,36 @@
 package com.linecorp.armeria.client;
 
 import static com.google.common.base.Preconditions.checkState;
+import static com.linecorp.armeria.internal.common.RequestContextUtil.newIllegalContextPushingException;
+import static com.linecorp.armeria.internal.common.RequestContextUtil.noopSafeCloseable;
 import static java.util.Objects.requireNonNull;
 
 import java.net.URI;
 import java.time.Duration;
-import java.util.Map.Entry;
+import java.util.concurrent.CompletableFuture;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
 import javax.annotation.Nullable;
 
-import com.linecorp.armeria.client.endpoint.EndpointSelector;
+import com.google.errorprone.annotations.MustBeClosed;
+
+import com.linecorp.armeria.client.endpoint.EndpointGroup;
 import com.linecorp.armeria.common.ContentTooLargeException;
 import com.linecorp.armeria.common.HttpHeaders;
+import com.linecorp.armeria.common.HttpHeadersBuilder;
 import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.Request;
 import com.linecorp.armeria.common.RequestContext;
+import com.linecorp.armeria.common.RequestId;
 import com.linecorp.armeria.common.Response;
 import com.linecorp.armeria.common.RpcRequest;
 import com.linecorp.armeria.common.logging.RequestLog;
+import com.linecorp.armeria.common.util.SafeCloseable;
+import com.linecorp.armeria.common.util.TimeoutMode;
+import com.linecorp.armeria.internal.common.RequestContextUtil;
+import com.linecorp.armeria.server.ServiceRequestContext;
 
 import io.netty.util.Attribute;
 
@@ -62,17 +73,14 @@ public interface ClientRequestContext extends RequestContext {
      * Returns the client-side context of the {@link Request} that is being handled in the current thread.
      *
      * @return the {@link ClientRequestContext} available in the current thread, or {@code null} if unavailable.
-     * @throws IllegalStateException if the current context is not a {@link ClientRequestContext}.
      */
     @Nullable
     static ClientRequestContext currentOrNull() {
         final RequestContext ctx = RequestContext.currentOrNull();
-        if (ctx == null) {
-            return null;
+        if (ctx instanceof ClientRequestContext) {
+            return (ClientRequestContext) ctx;
         }
-        checkState(ctx instanceof ClientRequestContext,
-                   "The current context is not a client-side context: %s", ctx);
-        return (ClientRequestContext) ctx;
+        return null;
     }
 
     /**
@@ -93,6 +101,12 @@ public interface ClientRequestContext extends RequestContext {
             return mapper.apply(ctx);
         }
 
+        final ServiceRequestContext serviceRequestContext = ServiceRequestContext.currentOrNull();
+        if (serviceRequestContext != null) {
+            throw new IllegalStateException("The current context is not a client-side context: " +
+                                            serviceRequestContext);
+        }
+
         if (defaultValueSupplier != null) {
             return defaultValueSupplier.get();
         }
@@ -109,7 +123,7 @@ public interface ClientRequestContext extends RequestContext {
      * @see ClientRequestContextBuilder
      */
     static ClientRequestContext of(HttpRequest request) {
-        return ClientRequestContextBuilder.of(request).build();
+        return builder(request).build();
     }
 
     /**
@@ -121,7 +135,7 @@ public interface ClientRequestContext extends RequestContext {
      * @see ClientRequestContextBuilder
      */
     static ClientRequestContext of(RpcRequest request, String uri) {
-        return ClientRequestContextBuilder.of(request, URI.create(requireNonNull(uri, "uri"))).build();
+        return builder(request, URI.create(requireNonNull(uri, "uri"))).build();
     }
 
     /**
@@ -133,43 +147,116 @@ public interface ClientRequestContext extends RequestContext {
      * @see ClientRequestContextBuilder
      */
     static ClientRequestContext of(RpcRequest request, URI uri) {
-        return ClientRequestContextBuilder.of(request, uri).build();
+        return builder(request, uri).build();
     }
 
     /**
-     * Creates a new {@link ClientRequestContext} whose properties and {@link Attribute}s are copied from this
-     * {@link ClientRequestContext}, except having its own {@link RequestLog}.
+     * Returns a new {@link ClientRequestContextBuilder} created from the specified {@link HttpRequest}.
      */
-    @Override
-    ClientRequestContext newDerivedContext();
+    static ClientRequestContextBuilder builder(HttpRequest request) {
+        return new ClientRequestContextBuilder(request);
+    }
 
     /**
-     * Creates a new {@link ClientRequestContext} whose properties and {@link Attribute}s are copied from this
-     * {@link ClientRequestContext}, except having a different {@link Request} and its own {@link RequestLog}.
+     * Returns a new {@link ClientRequestContextBuilder} created from the specified {@link RpcRequest} and
+     * {@code uri}.
+     */
+    static ClientRequestContextBuilder builder(RpcRequest request, String uri) {
+        return builder(request, URI.create(requireNonNull(uri, "uri")));
+    }
+
+    /**
+     * Returns a new {@link ClientRequestContextBuilder} created from the specified {@link RpcRequest} and
+     * {@link URI}.
+     */
+    static ClientRequestContextBuilder builder(RpcRequest request, URI uri) {
+        return new ClientRequestContextBuilder(request, uri);
+    }
+
+    /**
+     * {@inheritDoc} For example, when you send an RPC request, this method will return {@code null} until
+     * the RPC request is translated into an HTTP request.
+     */
+    @Nullable
+    @Override
+    HttpRequest request();
+
+    /**
+     * {@inheritDoc} For example, this method will return {@code null} when you are not sending an RPC request
+     * but just a plain HTTP request.
+     */
+    @Nullable
+    @Override
+    RpcRequest rpcRequest();
+
+    /**
+     * Pushes this context to the thread-local stack. To pop the context from the stack, call
+     * {@link SafeCloseable#close()}, which can be done using a {@code try-with-resources} block:
+     * <pre>{@code
+     * try (SafeCloseable ignored = ctx.push()) {
+     *     ...
+     * }
+     * }</pre>
+     *
+     * <p>In order to call this method, the current thread-local state must meet one of the
+     * following conditions:
+     * <ul>
+     *   <li>the thread-local does not have any {@link RequestContext} in it</li>
+     *   <li>the thread-local has the same {@link ClientRequestContext} as this - reentrance</li>
+     *   <li>the thread-local has the {@link ServiceRequestContext} which is the same as {@link #root()}</li>
+     *   <li>the thread-local has the {@link ClientRequestContext} whose {@link #root()}
+     *       is the same {@link #root()}</li>
+     *   <li>the thread-local has the {@link ClientRequestContext} whose {@link #root()} is {@code null}
+     *       and this {@link #root()} is {@code null}</li>
+     * </ul>
+     * Otherwise, this method will throw an {@link IllegalStateException}.
      */
     @Override
-    ClientRequestContext newDerivedContext(Request request);
+    @MustBeClosed
+    default SafeCloseable push() {
+        final RequestContext oldCtx = RequestContextUtil.getAndSet(this);
+        if (oldCtx == this) {
+            // Reentrance
+            return noopSafeCloseable();
+        }
+
+        if (oldCtx == null) {
+            return () -> RequestContextUtil.pop(this, null);
+        }
+
+        final ServiceRequestContext root = root();
+        if (oldCtx.root() == root) {
+            return () -> RequestContextUtil.pop(this, oldCtx);
+        }
+
+        // Put the oldCtx back before throwing an exception.
+        RequestContextUtil.pop(this, oldCtx);
+        throw newIllegalContextPushingException(this, oldCtx);
+    }
 
     /**
      * Creates a new {@link ClientRequestContext} whose properties and {@link Attribute}s are copied from this
      * {@link ClientRequestContext}, except having different {@link Request}, {@link Endpoint} and its own
      * {@link RequestLog}.
+     *
+     * <p>Note that this method does not copy the {@link RequestLog} properties to the derived context.
      */
-    ClientRequestContext newDerivedContext(Request request, Endpoint endpoint);
+    ClientRequestContext newDerivedContext(RequestId id, @Nullable HttpRequest req, @Nullable RpcRequest rpcReq,
+                                           @Nullable Endpoint endpoint);
 
     /**
-     * Returns the {@link EndpointSelector} used for the current {@link Request}.
+     * Returns the {@link EndpointGroup} used for the current {@link Request}.
      *
-     * @return the {@link EndpointSelector} if a user specified a group {@link Endpoint}.
-     *         {@code null} if a user specified a host {@link Endpoint}.
+     * @return the {@link EndpointGroup} if a user specified an {@link EndpointGroup} when initiating
+     *         a {@link Request}. {@code null} if a user specified an {@link Endpoint}.
      */
     @Nullable
-    EndpointSelector endpointSelector();
+    EndpointGroup endpointGroup();
 
     /**
      * Returns the remote {@link Endpoint} of the current {@link Request}.
      *
-     * @return the remote {@link Endpoint}. {@code null} if the {@link Request} has failed
+     * @return the remote {@link Endpoint}, or {@code null} if the {@link Request} has failed
      *         because its remote {@link Endpoint} couldn't be determined.
      */
     @Nullable
@@ -191,46 +278,172 @@ public interface ClientRequestContext extends RequestContext {
 
     /**
      * Returns the amount of time allowed until the initial write attempt of the current {@link Request}
-     * succeeds. This value is initially set from {@link ClientOption#WRITE_TIMEOUT_MILLIS}.
+     * succeeds. This value is initially set from {@link ClientOptions#WRITE_TIMEOUT_MILLIS}.
      */
     long writeTimeoutMillis();
 
     /**
      * Returns the amount of time allowed until the initial write attempt of the current {@link Request}
-     * succeeds. This value is initially set from {@link ClientOption#WRITE_TIMEOUT_MILLIS}.
+     * succeeds. This value is initially set from {@link ClientOptions#WRITE_TIMEOUT_MILLIS}.
      */
     void setWriteTimeoutMillis(long writeTimeoutMillis);
 
     /**
      * Returns the amount of time allowed until the initial write attempt of the current {@link Request}
-     * succeeds. This value is initially set from {@link ClientOption#WRITE_TIMEOUT_MILLIS}.
+     * succeeds. This value is initially set from {@link ClientOptions#WRITE_TIMEOUT_MILLIS}.
      */
     void setWriteTimeout(Duration writeTimeout);
 
     /**
      * Returns the amount of time allowed until receiving the {@link Response} completely
      * since the transfer of the {@link Response} started. This value is initially set from
-     * {@link ClientOption#RESPONSE_TIMEOUT_MILLIS}.
+     * {@link ClientOptions#RESPONSE_TIMEOUT_MILLIS}.
      */
     long responseTimeoutMillis();
 
     /**
-     * Sets the amount of time allowed until receiving the {@link Response} completely
-     * since the transfer of the {@link Response} started. This value is initially set from
-     * {@link ClientOption#RESPONSE_TIMEOUT_MILLIS}.
+     * Clears the previously scheduled response timeout, if any.
+     * Note that calling this will prevent the response from ever being timed out.
      */
-    void setResponseTimeoutMillis(long responseTimeoutMillis);
+    void clearResponseTimeout();
 
     /**
-     * Sets the amount of time allowed until receiving the {@link Response} completely
-     * since the transfer of the {@link Response} started. This value is initially set from
-     * {@link ClientOption#RESPONSE_TIMEOUT_MILLIS}.
+     * Schedules the response timeout that is triggered when the {@link Response} is not fully received within
+     * the specified {@link TimeoutMode} and the specified {@code responseTimeoutMillis} since
+     * the {@link Response} started or {@link Request} was fully sent.
+     * This value is initially set from {@link ClientOptions#RESPONSE_TIMEOUT_MILLIS}.
+     *
+     * <table>
+     * <tr><th>Timeout mode</th><th>description</th></tr>
+     * <tr><td>{@link TimeoutMode#SET_FROM_NOW}</td>
+     *     <td>Sets a given amount of timeout from the current time.</td></tr>
+     * <tr><td>{@link TimeoutMode#SET_FROM_START}</td>
+     *     <td>Sets a given amount of timeout since the current {@link Response} began processing.</td></tr>
+     * <tr><td>{@link TimeoutMode#EXTEND}</td>
+     *     <td>Extends the previously scheduled timeout by the given amount of timeout.</td></tr>
+     * </table>
+     *
+     * <p>For example:
+     * <pre>{@code
+     * ClientRequestContext ctx = ...;
+     * // Schedules a timeout from the start time of the response
+     * ctx.setResponseTimeoutMillis(TimeoutMode.SET_FROM_START, 2000);
+     * assert ctx.responseTimeoutMillis() == 2000;
+     * ctx.setResponseTimeoutMillis(TimeoutMode.SET_FROM_START, 1000);
+     * assert ctx.responseTimeoutMillis() == 1000;
+     *
+     * // Schedules timeout after 3 seconds from now.
+     * ctx.setResponseTimeoutMillis(TimeoutMode.SET_FROM_NOW, 3000);
+     *
+     * // Extends the previously scheduled timeout.
+     * long oldResponseTimeoutMillis = ctx.responseTimeoutMillis();
+     * ctx.setResponseTimeoutMillis(TimeoutMode.EXTEND, 1000);
+     * assert ctx.responseTimeoutMillis() == oldResponseTimeoutMillis + 1000;
+     * ctx.extendResponseTimeoutMillis(TimeoutMode.EXTEND, -500);
+     * assert ctx.responseTimeoutMillis() == oldResponseTimeoutMillis + 500;
+     * }</pre>
      */
-    void setResponseTimeout(Duration responseTimeout);
+    void setResponseTimeoutMillis(TimeoutMode mode, long responseTimeoutMillis);
+
+    /**
+     * Schedules the response timeout that is triggered when the {@link Response} is not
+     * fully received within the specified amount of time from now.
+     * Note that the specified {@code responseTimeoutMillis} must be positive.
+     * This value is initially set from {@link ClientOptions#RESPONSE_TIMEOUT_MILLIS}.
+     * This method is a shortcut for
+     * {@code setResponseTimeoutMillis(TimeoutMode.SET_FROM_NOW, responseTimeoutMillis)}.
+     *
+     * <p>For example:
+     * <pre>{@code
+     * ClientRequestContext ctx = ...;
+     * // Schedules timeout after 1 seconds from now.
+     * ctx.setResponseTimeoutMillis(1000);
+     * }</pre>
+     *
+     * @param responseTimeoutMillis the amount of time allowed in milliseconds from now
+     */
+    default void setResponseTimeoutMillis(long responseTimeoutMillis) {
+        setResponseTimeoutMillis(TimeoutMode.SET_FROM_NOW, responseTimeoutMillis);
+    }
+
+    /**
+     * Schedules the response timeout that is triggered when the {@link Response} is not fully received within
+     * the specified {@link TimeoutMode} and the specified {@code responseTimeoutMillis} since
+     * the {@link Response} started or {@link Request} was fully sent.
+     * This value is initially set from {@link ClientOptions#RESPONSE_TIMEOUT_MILLIS}.
+     *
+     * <table>
+     * <tr><th>Timeout mode</th><th>description</th></tr>
+     * <tr><td>{@link TimeoutMode#SET_FROM_NOW}</td>
+     *     <td>Sets a given amount of timeout from the current time.</td></tr>
+     * <tr><td>{@link TimeoutMode#SET_FROM_START}</td>
+     *     <td>Sets a given amount of timeout since the current {@link Response} began processing.</td></tr>
+     * <tr><td>{@link TimeoutMode#EXTEND}</td>
+     *     <td>Extends the previously scheduled timeout by the given amount of timeout.</td></tr>
+     * </table>
+     *
+     * <p>For example:
+     * <pre>{@code
+     * ClientRequestContext ctx = ...;
+     * // Schedules a timeout from the start time of the response
+     * ctx.setResponseTimeoutMillis(TimeoutMode.SET_FROM_START, Duration.ofSeconds(2));
+     * assert ctx.responseTimeoutMillis() == 2000;
+     * ctx.setResponseTimeoutMillis(TimeoutMode.SET_FROM_START, Duration.ofSeconds(1));
+     * assert ctx.responseTimeoutMillis() == 1000;
+     *
+     * // Schedules timeout after 3 seconds from now.
+     * ctx.setResponseTimeoutMillis(TimeoutMode.SET_FROM_NOW, Duration.ofSeconds(3));
+     *
+     * // Extends the previously scheduled timeout.
+     * long oldResponseTimeoutMillis = ctx.responseTimeoutMillis();
+     * ctx.setResponseTimeoutMillis(TimeoutMode.EXTEND, Duration.ofSeconds(1));
+     * assert ctx.responseTimeoutMillis() == oldResponseTimeoutMillis + 1000;
+     * ctx.setResponseTimeoutMillis(TimeoutMode.EXTEND, Duration.ofMillis(-500));
+     * assert ctx.responseTimeoutMillis() == oldResponseTimeoutMillis + 500;
+     * }</pre>
+     */
+    void setResponseTimeout(TimeoutMode mode, Duration responseTimeout);
+
+    /**
+     * Schedules the response timeout that is triggered when the {@link Response} is not
+     * fully received within the specified amount of time from now.
+     * Note that the specified {@code responseTimeout} must be positive.
+     * This value is initially set from {@link ClientOptions#RESPONSE_TIMEOUT_MILLIS}.
+     * This method is a shortcut for {@code setResponseTimeout(TimeoutMode.SET_FROM_NOW, responseTimeout)}.
+     *
+     * <p>For example:
+     * <pre>{@code
+     * ClientRequestContext ctx = ...;
+     * // Schedules timeout after 1 seconds from now.
+     * ctx.setResponseTimeout(Duration.ofSeconds(1));
+     * }</pre>
+     *
+     * @param responseTimeout the amount of time allowed from now
+     *
+     */
+    default void setResponseTimeout(Duration responseTimeout) {
+        setResponseTimeout(TimeoutMode.SET_FROM_NOW, responseTimeout);
+    }
+
+    /**
+     * Returns a {@link CompletableFuture} which is completed when {@link ClientRequestContext} is about to
+     * get timed out.
+     */
+    CompletableFuture<Void> whenResponseTimingOut();
+
+    /**
+     * Returns a {@link CompletableFuture} which is completed after {@link ClientRequestContext} has been
+     * timed out (e.g., when the corresponding request passes a deadline).
+     * {@link #isTimedOut()} will always return {@code true} when the returned
+     * {@link CompletableFuture} is completed.
+     */
+    CompletableFuture<Void> whenResponseTimedOut();
 
     /**
      * Returns the maximum length of the received {@link Response}.
-     * This value is initially set from {@link ClientOption#MAX_RESPONSE_LENGTH}.
+     * This value is initially set from {@link ClientOptions#MAX_RESPONSE_LENGTH}.
+     *
+     * @return the maximum length of the response. {@code 0} if unlimited.
      *
      * @see ContentTooLargeException
      */
@@ -238,14 +451,15 @@ public interface ClientRequestContext extends RequestContext {
 
     /**
      * Sets the maximum length of the received {@link Response}.
-     * This value is initially set from {@link ClientOption#MAX_RESPONSE_LENGTH}.
+     * This value is initially set from {@link ClientOptions#MAX_RESPONSE_LENGTH}.
+     * Specify {@code 0} to disable the limit of the length of a response.
      *
      * @see ContentTooLargeException
      */
     void setMaxResponseLength(long maxResponseLength);
 
     /**
-     * Returns an {@link HttpHeaders} which is included when a {@link Client} sends an {@link HttpRequest}.
+     * Returns an {@link HttpHeaders} which will be included when a {@link Client} sends an {@link HttpRequest}.
      */
     HttpHeaders additionalRequestHeaders();
 
@@ -257,27 +471,16 @@ public interface ClientRequestContext extends RequestContext {
     void setAdditionalRequestHeader(CharSequence name, Object value);
 
     /**
-     * Clears the current header and sets the specified {@link HttpHeaders} which is included when a
-     * {@link Client} sends an {@link HttpRequest}.
-     */
-    void setAdditionalRequestHeaders(Iterable<? extends Entry<? extends CharSequence, ?>> headers);
-
-    /**
      * Adds a header with the specified {@code name} and {@code value}. The header will be included when
      * a {@link Client} sends an {@link HttpRequest}.
      */
     void addAdditionalRequestHeader(CharSequence name, Object value);
 
     /**
-     * Adds the specified {@link HttpHeaders} which is included when a {@link Client} sends an
-     * {@link HttpRequest}.
-     */
-    void addAdditionalRequestHeaders(Iterable<? extends Entry<? extends CharSequence, ?>> headers);
-
-    /**
-     * Removes all headers with the specified {@code name}.
+     * Mutates the {@link HttpHeaders} which will be included when a {@link Client} sends
+     * an {@link HttpRequest}.
      *
-     * @return {@code true} if at least one entry has been removed
+     * @param mutator the {@link Consumer} that mutates the additional request headers
      */
-    boolean removeAdditionalRequestHeader(CharSequence name);
+    void mutateAdditionalRequestHeaders(Consumer<HttpHeadersBuilder> mutator);
 }

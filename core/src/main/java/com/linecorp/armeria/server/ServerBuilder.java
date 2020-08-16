@@ -17,23 +17,23 @@
 package com.linecorp.armeria.server;
 
 import static com.google.common.base.Preconditions.checkArgument;
+import static com.google.common.base.Preconditions.checkNotNull;
 import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.linecorp.armeria.common.SessionProtocol.HTTP;
 import static com.linecorp.armeria.common.SessionProtocol.HTTPS;
 import static com.linecorp.armeria.common.SessionProtocol.PROXY;
-import static com.linecorp.armeria.server.ServerConfig.validateMaxRequestLength;
 import static com.linecorp.armeria.server.ServerConfig.validateNonNegative;
-import static com.linecorp.armeria.server.ServerConfig.validateRequestTimeoutMillis;
 import static io.netty.handler.codec.http2.Http2CodecUtil.MAX_FRAME_SIZE_LOWER_BOUND;
 import static io.netty.handler.codec.http2.Http2CodecUtil.MAX_FRAME_SIZE_UPPER_BOUND;
 import static java.util.Objects.requireNonNull;
 
 import java.io.File;
+import java.io.InputStream;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
-import java.nio.charset.Charset;
-import java.security.cert.CertificateException;
+import java.security.PrivateKey;
+import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -42,13 +42,14 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Predicate;
+import java.util.function.Supplier;
 
 import javax.annotation.Nullable;
 import javax.net.ssl.KeyManagerFactory;
-import javax.net.ssl.SSLException;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -60,14 +61,13 @@ import com.google.common.collect.Sets;
 
 import com.linecorp.armeria.common.CommonPools;
 import com.linecorp.armeria.common.Flags;
-import com.linecorp.armeria.common.HttpRequest;
-import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.Request;
+import com.linecorp.armeria.common.RequestContext;
+import com.linecorp.armeria.common.RequestId;
 import com.linecorp.armeria.common.SessionProtocol;
-import com.linecorp.armeria.common.logging.ContentPreviewer;
-import com.linecorp.armeria.common.logging.ContentPreviewerFactory;
 import com.linecorp.armeria.common.util.SystemInfo;
-import com.linecorp.armeria.internal.ArmeriaHttpUtil;
+import com.linecorp.armeria.internal.common.RequestContextUtil;
+import com.linecorp.armeria.internal.server.annotation.AnnotatedServiceExtensions;
 import com.linecorp.armeria.server.annotation.ExceptionHandlerFunction;
 import com.linecorp.armeria.server.annotation.RequestConverterFunction;
 import com.linecorp.armeria.server.annotation.ResponseConverterFunction;
@@ -78,11 +78,9 @@ import io.micrometer.core.instrument.Metrics;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.epoll.EpollChannelOption;
-import io.netty.handler.ssl.OpenSsl;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
-import io.netty.util.DomainNameMapping;
-import io.netty.util.DomainNameMappingBuilder;
+import io.netty.util.Mapping;
 import io.netty.util.concurrent.GlobalEventExecutor;
 import it.unimi.dsi.fastutil.objects.Object2ObjectArrayMap;
 
@@ -90,7 +88,7 @@ import it.unimi.dsi.fastutil.objects.Object2ObjectArrayMap;
  * Builds a new {@link Server} and its {@link ServerConfig}.
  * <h2>Example</h2>
  * <pre>{@code
- * ServerBuilder sb = new ServerBuilder();
+ * ServerBuilder sb = Server.builder();
  * // Add a port to listen
  * sb.http(8080);
  * // Add services to the default virtual host.
@@ -102,7 +100,7 @@ import it.unimi.dsi.fastutil.objects.Object2ObjectArrayMap;
  *
  * <h2>Example 2</h2>
  * <pre>{@code
- * ServerBuilder sb = new ServerBuilder();
+ * ServerBuilder sb = Server.builder();
  * Server server =
  *     sb.http(8080) // Add a port to listen
  *       .defaultVirtualHost() // Add services to the default virtual host.
@@ -122,10 +120,15 @@ import it.unimi.dsi.fastutil.objects.Object2ObjectArrayMap;
  *
  * <pre>{@code
  * // Build an HTTP server that runs on an ephemeral TCP/IP port.
- * Server httpServer = new ServerBuilder().service(...).build();
+ * Server httpServer = Server.builder()
+ *                           .service(...)
+ *                           .build();
  *
  * // Build an HTTPS server that runs on an ephemeral TCP/IP port.
- * Server httpsServer = new ServerBuilder().tls(...).service(...).build();
+ * Server httpsServer = Server.builder()
+ *                            .tls(...)
+ *                            .service(...)
+ *                            .build();
  * }</pre>
  *
  * @see VirtualHostBuilder
@@ -135,11 +138,10 @@ public final class ServerBuilder {
     // Defaults to no graceful shutdown.
     private static final Duration DEFAULT_GRACEFUL_SHUTDOWN_QUIET_PERIOD = Duration.ZERO;
     private static final Duration DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT = Duration.ZERO;
-    private static final String DEFAULT_SERVICE_LOGGER_PREFIX = "armeria.services";
     private static final int PROXY_PROTOCOL_DEFAULT_MAX_TLV_SIZE = 65535 - 216;
     private static final String DEFAULT_ACCESS_LOGGER_PREFIX = "com.linecorp.armeria.logging.access";
 
-    // Prohibit deprecate option
+    // Prohibit deprecated options
     @SuppressWarnings("deprecation")
     private static final Set<ChannelOption<?>> PROHIBITED_SOCKET_OPTIONS = ImmutableSet.of(
             ChannelOption.ALLOW_HALF_CLOSURE, ChannelOption.AUTO_READ,
@@ -147,10 +149,20 @@ public final class ServerBuilder {
             ChannelOption.WRITE_BUFFER_HIGH_WATER_MARK, ChannelOption.WRITE_BUFFER_LOW_WATER_MARK,
             EpollChannelOption.EPOLL_MODE);
 
+    @VisibleForTesting
+    static final long MIN_PING_INTERVAL_MILLIS = 1000L;
+    private static final long MIN_MAX_CONNECTION_AGE_MILLIS = 1_000L;
+
+    static {
+        RequestContextUtil.init();
+    }
+
     private final List<ServerPort> ports = new ArrayList<>();
     private final List<ServerListener> serverListeners = new ArrayList<>();
-    private final List<VirtualHostBuilder> virtualHostBuilders = new ArrayList<>();
+    @VisibleForTesting
+    final VirtualHostBuilder virtualHostTemplate = new VirtualHostBuilder(this, false);
     private final VirtualHostBuilder defaultVirtualHostBuilder = new VirtualHostBuilder(this, true);
+    private final List<VirtualHostBuilder> virtualHostBuilders = new ArrayList<>();
 
     private EventLoopGroup workerGroup = CommonPools.workerGroup();
     private boolean shutdownWorkerGroupOnStop;
@@ -159,6 +171,8 @@ public final class ServerBuilder {
     private final Map<ChannelOption<?>, Object> childChannelOptions = new Object2ObjectArrayMap<>();
     private int maxNumConnections = Flags.maxNumConnections();
     private long idleTimeoutMillis = Flags.defaultServerIdleTimeoutMillis();
+    private long pingIntervalMillis = Flags.defaultPingIntervalMillis();
+    private long maxConnectionAgeMillis = Flags.defaultMaxServerConnectionAgeMillis();
     private int http2InitialConnectionWindowSize = Flags.defaultHttp2InitialConnectionWindowSize();
     private int http2InitialStreamWindowSize = Flags.defaultHttp2InitialStreamWindowSize();
     private long http2MaxStreamsPerConnection = Flags.defaultHttp2MaxStreamsPerConnection();
@@ -170,30 +184,48 @@ public final class ServerBuilder {
     private int proxyProtocolMaxTlvSize = PROXY_PROTOCOL_DEFAULT_MAX_TLV_SIZE;
     private Duration gracefulShutdownQuietPeriod = DEFAULT_GRACEFUL_SHUTDOWN_QUIET_PERIOD;
     private Duration gracefulShutdownTimeout = DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT;
-    private Executor blockingTaskExecutor = CommonPools.blockingTaskExecutor();
+    private ScheduledExecutorService blockingTaskExecutor = CommonPools.blockingTaskExecutor();
     private boolean shutdownBlockingTaskExecutorOnStop;
     private MeterRegistry meterRegistry = Metrics.globalRegistry;
-    private String serviceLoggerPrefix = DEFAULT_SERVICE_LOGGER_PREFIX;
-    private AccessLogWriter accessLogWriter = AccessLogWriter.disabled();
-    private boolean shutdownAccessLogWriterOnStop = true;
     private List<ClientAddressSource> clientAddressSources = ClientAddressSource.DEFAULT_SOURCES;
-    private Predicate<InetAddress> clientAddressTrustedProxyFilter = address -> false;
-    private Predicate<InetAddress> clientAddressFilter = address -> true;
-    private RejectedRouteHandler rejectedRouteHandler = RejectedRouteHandler.WARN;
+    private Predicate<? super InetAddress> clientAddressTrustedProxyFilter = address -> false;
+    private Predicate<? super InetAddress> clientAddressFilter = address -> true;
+    private Function<? super ProxiedAddresses, ? extends InetSocketAddress> clientAddressMapper =
+            ProxiedAddresses::sourceAddress;
+    private boolean enableServerHeader = true;
+    private boolean enableDateHeader = true;
+    private Supplier<? extends RequestId> requestIdGenerator = RequestId::random;
 
-    // These properties can also be set in the service level.
+    ServerBuilder() {
+        // Set the default host-level properties.
+        virtualHostTemplate.accessLogWriter(AccessLogWriter.disabled(), true);
+        virtualHostTemplate.rejectedRouteHandler(RejectedRouteHandler.WARN);
+        virtualHostTemplate.requestTimeoutMillis(Flags.defaultRequestTimeoutMillis());
+        virtualHostTemplate.maxRequestLength(Flags.defaultMaxRequestLength());
+        virtualHostTemplate.verboseResponses(Flags.verboseResponses());
+        virtualHostTemplate.accessLogger(
+                host -> LoggerFactory.getLogger(defaultAccessLoggerName(host.hostnamePattern())));
+        virtualHostTemplate.tlsSelfSigned(false);
+        virtualHostTemplate.annotatedServiceExtensions(ImmutableList.of(), ImmutableList.of(),
+                                                       ImmutableList.of());
+    }
 
-    private long requestTimeoutMillis = Flags.defaultRequestTimeoutMillis();
-    private long maxRequestLength = Flags.defaultMaxRequestLength();
-    private boolean verboseResponses = Flags.verboseResponses();
-    private ContentPreviewerFactory requestContentPreviewerFactory = ContentPreviewerFactory.disabled();
-    private ContentPreviewerFactory responseContentPreviewerFactory = ContentPreviewerFactory.disabled();
-
-    @Nullable
-    private Function<Service<HttpRequest, HttpResponse>, Service<HttpRequest, HttpResponse>> decorator;
-
-    private Function<VirtualHost, Logger> accessLoggerMapper = host -> LoggerFactory.getLogger(
-            defaultAccessLoggerName(host.hostnamePattern()));
+    private static String defaultAccessLoggerName(String hostnamePattern) {
+        requireNonNull(hostnamePattern, "hostnamePattern");
+        final String[] elements = hostnamePattern.split("\\.");
+        final StringBuilder name = new StringBuilder(
+                DEFAULT_ACCESS_LOGGER_PREFIX.length() + hostnamePattern.length() + 1);
+        name.append(DEFAULT_ACCESS_LOGGER_PREFIX);
+        for (int i = elements.length - 1; i >= 0; i--) {
+            final String element = elements[i];
+            if (element.isEmpty() || "*".equals(element)) {
+                continue;
+            }
+            name.append('.');
+            name.append(element);
+        }
+        return name.toString();
+    }
 
     /**
      * Adds an HTTP port that listens on all available network interfaces.
@@ -245,23 +277,11 @@ public final class ServerBuilder {
 
     /**
      * Adds a new {@link ServerPort} that listens to the specified {@code port} of all available network
-     * interfaces using the specified protocol.
-     *
-     * @deprecated Use {@link #http(int)} or {@link #https(int)}.
-     * @see <a href="#no_port_specified">What happens if no HTTP(S) port is specified?</a>
-     */
-    @Deprecated
-    public ServerBuilder port(int port, String protocol) {
-        return port(port, SessionProtocol.of(requireNonNull(protocol, "protocol")));
-    }
-
-    /**
-     * Adds a new {@link ServerPort} that listens to the specified {@code port} of all available network
      * interfaces using the specified {@link SessionProtocol}s. Specify multiple protocols to serve more than
      * one protocol on the same port:
      *
      * <pre>{@code
-     * ServerBuilder sb = new ServerBuilder();
+     * ServerBuilder sb = Server.builder();
      * // Serve both HTTP and HTTPS at port 8080.
      * sb.port(8080,
      *         SessionProtocol.HTTP,
@@ -282,7 +302,7 @@ public final class ServerBuilder {
      * one protocol on the same port:
      *
      * <pre>{@code
-     * ServerBuilder sb = new ServerBuilder();
+     * ServerBuilder sb = Server.builder();
      * // Serve both HTTP and HTTPS at port 8080.
      * sb.port(8080,
      *         Arrays.asList(SessionProtocol.HTTP,
@@ -299,21 +319,10 @@ public final class ServerBuilder {
 
     /**
      * Adds a new {@link ServerPort} that listens to the specified {@code localAddress} using the specified
-     * protocol.
-     *
-     * @deprecated Use {@link #http(InetSocketAddress)} or {@link #https(InetSocketAddress)}.
-     */
-    @Deprecated
-    public ServerBuilder port(InetSocketAddress localAddress, String protocol) {
-        return port(localAddress, SessionProtocol.of(requireNonNull(protocol, "protocol")));
-    }
-
-    /**
-     * Adds a new {@link ServerPort} that listens to the specified {@code localAddress} using the specified
      * {@link SessionProtocol}s. Specify multiple protocols to serve more than one protocol on the same port:
      *
      * <pre>{@code
-     * ServerBuilder sb = new ServerBuilder();
+     * ServerBuilder sb = Server.builder();
      * // Serve both HTTP and HTTPS at port 8080.
      * sb.port(new InetSocketAddress(8080),
      *         SessionProtocol.HTTP,
@@ -333,7 +342,7 @@ public final class ServerBuilder {
      * {@link SessionProtocol}s. Specify multiple protocols to serve more than one protocol on the same port:
      *
      * <pre>{@code
-     * ServerBuilder sb = new ServerBuilder();
+     * ServerBuilder sb = Server.builder();
      * // Serve both HTTP and HTTPS at port 8080.
      * sb.port(new InetSocketAddress(8080),
      *         Arrays.asList(SessionProtocol.HTTP,
@@ -363,7 +372,7 @@ public final class ServerBuilder {
      * Note that the previously added option will be overridden if the same option is set again.
      *
      * <pre>{@code
-     * ServerBuilder sb = new ServerBuilder();
+     * ServerBuilder sb = Server.builder();
      * sb.channelOption(ChannelOption.BACKLOG, 1024);
      * }</pre>
      */
@@ -382,7 +391,7 @@ public final class ServerBuilder {
      * Note that the previously added option will be overridden if the same option is set again.
      *
      * <pre>{@code
-     * ServerBuilder sb = new ServerBuilder();
+     * ServerBuilder sb = Server.builder();
      * sb.childChannelOption(ChannelOption.SO_REUSEADDR, true)
      *   .childChannelOption(ChannelOption.SO_KEEPALIVE, true);
      * }</pre>
@@ -452,6 +461,71 @@ public final class ServerBuilder {
         requireNonNull(idleTimeout, "idleTimeout");
         idleTimeoutMillis = ServerConfig.validateIdleTimeoutMillis(idleTimeout.toMillis());
         return this;
+    }
+
+    /**
+     * Sets the HTTP/2 <a href="https://httpwg.org/specs/rfc7540.html#PING">PING</a> interval.
+     *
+     * <p>Note that this settings is only in effect when {@link #idleTimeoutMillis(long)}} or
+     * {@link #idleTimeout(Duration)} is greater than the specified PING interval.
+     *
+     * <p>The minimum allowed PING interval is {@value #MIN_PING_INTERVAL_MILLIS} milliseconds.
+     * {@code 0} means the server will not send PING frames on an HTTP/2 connection.
+     *
+     * @throws IllegalArgumentException if the specified {@code pingIntervalMillis} is smaller than
+     *                                  {@value #MIN_PING_INTERVAL_MILLIS} milliseconds.
+     */
+    public ServerBuilder pingIntervalMillis(long pingIntervalMillis) {
+        checkArgument(pingIntervalMillis == 0 || pingIntervalMillis >= MIN_PING_INTERVAL_MILLIS,
+                      "pingIntervalMillis: %s (expected: >= %s or == 0)", pingIntervalMillis,
+                      MIN_PING_INTERVAL_MILLIS);
+        this.pingIntervalMillis = pingIntervalMillis;
+        return this;
+    }
+
+    /**
+     * Sets the HTTP/2 <a href="https://httpwg.org/specs/rfc7540.html#PING">PING</a> interval.
+     *
+     * <p>Note that this settings is only in effect when {@link #idleTimeoutMillis(long)}} or
+     * {@link #idleTimeout(Duration)} is greater than the specified PING interval.
+     *
+     * <p>The minimum allowed PING interval is {@value #MIN_PING_INTERVAL_MILLIS} milliseconds.
+     * {@code 0} means the server will not send PING frames on an HTTP/2 connection.
+     *
+     * @throws IllegalArgumentException if the specified {@code pingInterval} is smaller than
+     *                                  {@value #MIN_PING_INTERVAL_MILLIS} milliseconds.
+     */
+    public ServerBuilder pingInterval(Duration pingInterval) {
+        pingIntervalMillis(requireNonNull(pingInterval, "pingInterval").toMillis());
+        return this;
+    }
+
+    /**
+     * Sets the maximum allowed age of a connection in millis for keep-alive. A connection is disconnected
+     * after the specified {@code maxConnectionAgeMillis} since the connection was established.
+     *
+     * @param maxConnectionAgeMillis the maximum connection age in millis. {@code 0} disables the limit.
+     * @throws IllegalArgumentException if the specified {@code maxConnectionAgeMillis} is smaller than
+     *                                  {@value #MIN_MAX_CONNECTION_AGE_MILLIS} milliseconds.
+     */
+    public ServerBuilder maxConnectionAgeMillis(long maxConnectionAgeMillis) {
+        checkArgument(maxConnectionAgeMillis >= MIN_MAX_CONNECTION_AGE_MILLIS || maxConnectionAgeMillis == 0,
+                      "maxConnectionAgeMillis: %s (expected: >= %s or == 0)",
+                      maxConnectionAgeMillis, MIN_MAX_CONNECTION_AGE_MILLIS);
+        this.maxConnectionAgeMillis = maxConnectionAgeMillis;
+        return this;
+    }
+
+    /**
+     * Sets the maximum allowed age of a connection for keep-alive. A connection is disconnected
+     * after the specified {@code maxConnectionAge} since the connection was established.
+     *
+     * @param maxConnectionAge the maximum connection age. {@code 0} disables the limit.
+     * @throws IllegalArgumentException if the specified {@code maxConnectionAge} is smaller than
+     *                                  {@value #MIN_MAX_CONNECTION_AGE_MILLIS} milliseconds.
+     */
+    public ServerBuilder maxConnectionAge(Duration maxConnectionAge) {
+        return maxConnectionAgeMillis(requireNonNull(maxConnectionAge, "maxConnectionAge").toMillis());
     }
 
     /**
@@ -559,14 +633,13 @@ public final class ServerBuilder {
      * requests to go away before actually shutting down.
      *
      * @param quietPeriodMillis the number of milliseconds to wait for active
-     *     requests to go end before shutting down. 0 means the server will
-     *     stop right away without waiting.
-     * @param timeoutMillis the number of milliseconds to wait before shutting
-     *     down the server regardless of active requests. This should be set to
-     *     a time greater than {@code quietPeriodMillis} to ensure the server
-     *     shuts down even if there is a stuck request.
+     *                          requests to go end before shutting down. 0 means the server will
+     *                          stop right away without waiting.
+     * @param timeoutMillis the number of milliseconds to wait before shutting down the server regardless of
+     *                      active requests. This should be set to a time greater than {@code quietPeriodMillis}
+     *                      to ensure the server shuts down even if there is a stuck request.
      */
-    public ServerBuilder gracefulShutdownTimeout(long quietPeriodMillis, long timeoutMillis) {
+    public ServerBuilder gracefulShutdownTimeoutMillis(long quietPeriodMillis, long timeoutMillis) {
         return gracefulShutdownTimeout(
                 Duration.ofMillis(quietPeriodMillis), Duration.ofMillis(timeoutMillis));
     }
@@ -576,12 +649,11 @@ public final class ServerBuilder {
      * requests to go away before actually shutting down.
      *
      * @param quietPeriod the number of milliseconds to wait for active
-     *     requests to go end before shutting down. {@link Duration#ZERO} means
-     *     the server will stop right away without waiting.
-     * @param timeout the number of milliseconds to wait before shutting
-     *     down the server regardless of active requests. This should be set to
-     *     a time greater than {@code quietPeriod} to ensure the server shuts
-     *     down even if there is a stuck request.
+     *                    requests to go end before shutting down. {@link Duration#ZERO} means
+     *                    the server will stop right away without waiting.
+     * @param timeout the amount of time to wait before shutting down the server regardless of active requests.
+     *                This should be set to a time greater than {@code quietPeriod} to ensure the server
+     *                shuts down even if there is a stuck request.
      */
     public ServerBuilder gracefulShutdownTimeout(Duration quietPeriod, Duration timeout) {
         requireNonNull(quietPeriod, "quietPeriod");
@@ -594,24 +666,14 @@ public final class ServerBuilder {
     }
 
     /**
-     * Sets the {@link Executor} dedicated to the execution of blocking tasks or invocations.
+     * Sets the {@link ScheduledExecutorService} dedicated to the execution of blocking tasks or invocations.
      * If not set, {@linkplain CommonPools#blockingTaskExecutor() the common pool} is used.
      *
-     * @deprecated Use {@link #blockingTaskExecutor(Executor, boolean)}.
-     *
+     * @param shutdownOnStop whether to shut down the {@link ScheduledExecutorService} when the
+     *                       {@link Server} stops
      */
-    @Deprecated
-    public ServerBuilder blockingTaskExecutor(Executor blockingTaskExecutor) {
-        return blockingTaskExecutor(blockingTaskExecutor, false);
-    }
-
-    /**
-     * Sets the {@link Executor} dedicated to the execution of blocking tasks or invocations.
-     * If not set, {@linkplain CommonPools#blockingTaskExecutor() the common pool} is used.
-     *
-     * @param shutdownOnStop whether to shut down the {@link Executor} when the {@link Server} stops
-     */
-    public ServerBuilder blockingTaskExecutor(Executor blockingTaskExecutor, boolean shutdownOnStop) {
+    public ServerBuilder blockingTaskExecutor(ScheduledExecutorService blockingTaskExecutor,
+                                              boolean shutdownOnStop) {
         this.blockingTaskExecutor = requireNonNull(blockingTaskExecutor, "blockingTaskExecutor");
         shutdownBlockingTaskExecutorOnStop = shutdownOnStop;
         return this;
@@ -622,16 +684,6 @@ public final class ServerBuilder {
      */
     public ServerBuilder meterRegistry(MeterRegistry meterRegistry) {
         this.meterRegistry = requireNonNull(meterRegistry, "meterRegistry");
-        return this;
-    }
-
-    /**
-     * Sets the prefix of {@linkplain ServiceRequestContext#logger() service logger} names.
-     * The default value is "{@value #DEFAULT_SERVICE_LOGGER_PREFIX}". A service logger name prefix must be
-     * a string of valid Java identifier names concatenated by period ({@code '.'}), such as a package name.
-     */
-    public ServerBuilder serviceLoggerPrefix(String serviceLoggerPrefix) {
-        this.serviceLoggerPrefix = ServiceConfig.validateLoggerName(serviceLoggerPrefix, "serviceLoggerPrefix");
         return this;
     }
 
@@ -650,17 +702,8 @@ public final class ServerBuilder {
      * @param shutdownOnStop whether to shut down the {@link AccessLogWriter} when the {@link Server} stops
      */
     public ServerBuilder accessLogWriter(AccessLogWriter accessLogWriter, boolean shutdownOnStop) {
-        this.accessLogWriter = requireNonNull(accessLogWriter, "accessLogWriter");
-        shutdownAccessLogWriterOnStop = shutdownOnStop;
+        virtualHostTemplate.accessLogWriter(accessLogWriter, shutdownOnStop);
         return this;
-    }
-
-    AccessLogWriter accessLogWriter() {
-        return accessLogWriter;
-    }
-
-    boolean shutdownAccessLogWriterOnStop() {
-        return shutdownAccessLogWriterOnStop;
     }
 
     /**
@@ -679,149 +722,169 @@ public final class ServerBuilder {
     }
 
     /**
-     * Sets the {@link SslContext} of the default {@link VirtualHost}.
-     */
-    public ServerBuilder tls(SslContext sslContext) {
-        defaultVirtualHostBuilder.tls(sslContext);
-        return this;
-    }
-
-    /**
-     * Configures SSL or TLS of the default {@link VirtualHost} from the specified {@code keyCertChainFile}
+     * Configures SSL or TLS of the {@link Server} from the specified {@code keyCertChainFile}
      * and cleartext {@code keyFile}.
+     *
+     * @see #tlsCustomizer(Consumer)
      */
-    public ServerBuilder tls(File keyCertChainFile, File keyFile) throws SSLException {
-        defaultVirtualHostBuilder.tls(keyCertChainFile, keyFile);
+    public ServerBuilder tls(File keyCertChainFile, File keyFile) {
+        virtualHostTemplate.tls(keyCertChainFile, keyFile);
         return this;
     }
 
     /**
-     * Configures SSL or TLS of the default {@link VirtualHost} from the specified {@code keyCertChainFile},
-     * cleartext {@code keyFile} and {@code tlsCustomizer}.
-     */
-    public ServerBuilder tls(File keyCertChainFile, File keyFile,
-                             Consumer<SslContextBuilder> tlsCustomizer) throws SSLException {
-        defaultVirtualHostBuilder.tls(keyCertChainFile, keyFile, tlsCustomizer);
-        return this;
-    }
-
-    /**
-     * Configures SSL or TLS of the default {@link VirtualHost} from the specified {@code keyCertChainFile},
+     * Configures SSL or TLS of the {@link Server} from the specified {@code keyCertChainFile},
      * {@code keyFile} and {@code keyPassword}.
+     *
+     * @see #tlsCustomizer(Consumer)
      */
     public ServerBuilder tls(
-            File keyCertChainFile, File keyFile, @Nullable String keyPassword) throws SSLException {
-        defaultVirtualHostBuilder.tls(keyCertChainFile, keyFile, keyPassword);
+            File keyCertChainFile, File keyFile, @Nullable String keyPassword) {
+        virtualHostTemplate.tls(keyCertChainFile, keyFile, keyPassword);
         return this;
     }
 
     /**
-     * Configures SSL or TLS of the default {@link VirtualHost} from the specified {@code keyCertChainFile},
-     * {@code keyFile}, {@code keyPassword} and {@code tlsCustomizer}.
-     */
-    public ServerBuilder tls(
-            File keyCertChainFile, File keyFile, @Nullable String keyPassword,
-            Consumer<SslContextBuilder> tlsCustomizer) throws SSLException {
-        defaultVirtualHostBuilder.tls(keyCertChainFile, keyFile, keyPassword, tlsCustomizer);
-        return this;
-    }
-
-    /**
-     * Configures SSL or TLS of the default {@link VirtualHost} from the specified {@code keyManagerFactory}
-     * and {@code tlsCustomizer}.
-     */
-    public ServerBuilder tls(KeyManagerFactory keyManagerFactory,
-                             Consumer<SslContextBuilder> tlsCustomizer) throws SSLException {
-        defaultVirtualHostBuilder.tls(keyManagerFactory, tlsCustomizer);
-        return this;
-    }
-
-    /**
-     * Configures SSL or TLS of the default {@link VirtualHost} with an auto-generated self-signed
-     * certificate. <strong>Note:</strong> You should never use this in production but only for a testing
-     * purpose.
+     * Configures SSL or TLS of this {@link Server} with the specified {@code keyCertChainInputStream} and
+     * cleartext {@code keyInputStream}.
      *
-     * @throws CertificateException if failed to generate a self-signed certificate
+     * @see #tlsCustomizer(Consumer)
      */
-    public ServerBuilder tlsSelfSigned() throws SSLException, CertificateException {
-        defaultVirtualHostBuilder.tlsSelfSigned();
+    public ServerBuilder tls(InputStream keyCertChainInputStream, InputStream keyInputStream) {
+        virtualHostTemplate.tls(keyCertChainInputStream, keyInputStream);
         return this;
     }
 
     /**
-     * Sets the {@link SslContext} of the default {@link VirtualHost}.
+     * Configures SSL or TLS of this {@link Server} with the specified {@code keyCertChainInputStream},
+     * {@code keyInputStream} and {@code keyPassword}.
      *
-     * @deprecated Use {@link #tls(SslContext)}.
+     * @see #tlsCustomizer(Consumer)
      */
-    @Deprecated
-    public ServerBuilder sslContext(SslContext sslContext) {
-        defaultVirtualHostBuilder.tls(sslContext);
+    public ServerBuilder tls(InputStream keyCertChainInputStream, InputStream keyInputStream,
+                             @Nullable String keyPassword) {
+        virtualHostTemplate.tls(keyCertChainInputStream, keyInputStream, keyPassword);
         return this;
     }
 
     /**
-     * Sets the {@link SslContext} of the default {@link VirtualHost} from the specified
-     * {@link SessionProtocol}, {@code keyCertChainFile} and cleartext {@code keyFile}.
+     * Configures SSL or TLS of this {@link Server} with the specified cleartext {@link PrivateKey} and
+     * {@link X509Certificate} chain.
      *
-     * @deprecated Use {@link #tls(File, File)}.
+     * @see #tlsCustomizer(Consumer)
      */
-    @Deprecated
-    public ServerBuilder sslContext(
-            SessionProtocol protocol, File keyCertChainFile, File keyFile) throws SSLException {
-        defaultVirtualHostBuilder.sslContext(protocol, keyCertChainFile, keyFile);
+    public ServerBuilder tls(PrivateKey key, X509Certificate... keyCertChain) {
+        virtualHostTemplate.tls(key, keyCertChain);
         return this;
     }
 
     /**
-     * Sets the {@link SslContext} of the default {@link VirtualHost} from the specified
-     * {@link SessionProtocol}, {@code keyCertChainFile}, {@code keyFile} and {@code keyPassword}.
+     * Configures SSL or TLS of this {@link Server} with the specified cleartext {@link PrivateKey} and
+     * {@link X509Certificate} chain.
      *
-     * @deprecated Use {@link #tls(File, File, String)}.
+     * @see #tlsCustomizer(Consumer)
      */
-    @Deprecated
-    public ServerBuilder sslContext(
-            SessionProtocol protocol,
-            File keyCertChainFile, File keyFile, String keyPassword) throws SSLException {
-        defaultVirtualHostBuilder.sslContext(protocol, keyCertChainFile, keyFile, keyPassword);
+    public ServerBuilder tls(PrivateKey key, Iterable<? extends X509Certificate> keyCertChain) {
+        virtualHostTemplate.tls(key, keyCertChain);
         return this;
     }
 
     /**
-     * Configures a {@link Service} of the default {@link VirtualHost} with the {@code customizer}.
+     * Configures SSL or TLS of this {@link Server} with the specified {@link PrivateKey}, {@code keyPassword}
+     * and {@link X509Certificate} chain.
+     *
+     * @see #tlsCustomizer(Consumer)
      */
-    public ServerBuilder withRoute(Consumer<ServiceBindingBuilder> customizer) {
+    public ServerBuilder tls(PrivateKey key, @Nullable String keyPassword, X509Certificate... keyCertChain) {
+        virtualHostTemplate.tls(key, keyPassword, keyCertChain);
+        return this;
+    }
+
+    /**
+     * Configures SSL or TLS of this {@link Server} with the specified {@link PrivateKey}, {@code keyPassword}
+     * and {@link X509Certificate} chain.
+     *
+     * @see #tlsCustomizer(Consumer)
+     */
+    public ServerBuilder tls(PrivateKey key, @Nullable String keyPassword,
+                             Iterable<? extends X509Certificate> keyCertChain) {
+        virtualHostTemplate.tls(key, keyPassword, keyCertChain);
+        return this;
+    }
+
+    /**
+     * Configures SSL or TLS of this {@link Server} with the specified {@link KeyManagerFactory}.
+     *
+     * @see #tlsCustomizer(Consumer)
+     */
+    public ServerBuilder tls(KeyManagerFactory keyManagerFactory) {
+        virtualHostTemplate.tls(keyManagerFactory);
+        return this;
+    }
+
+    /**
+     * Configures SSL or TLS of the {@link Server} with an auto-generated self-signed certificate.
+     * <strong>Note:</strong> You should never use this in production but only for a testing purpose.
+     *
+     * @see #tlsCustomizer(Consumer)
+     */
+    public ServerBuilder tlsSelfSigned() {
+        virtualHostTemplate.tlsSelfSigned();
+        return this;
+    }
+
+    /**
+     * Configures SSL or TLS of the {@link Server} with an auto-generated self-signed certificate.
+     * <strong>Note:</strong> You should never use this in production but only for a testing purpose.
+     *
+     * @see #tlsCustomizer(Consumer)
+     */
+    public ServerBuilder tlsSelfSigned(boolean tlsSelfSigned) {
+        virtualHostTemplate.tlsSelfSigned(tlsSelfSigned);
+        return this;
+    }
+
+    /**
+     * Adds the {@link Consumer} which can arbitrarily configure the {@link SslContextBuilder} that will be
+     * applied to the SSL session.
+     */
+    public ServerBuilder tlsCustomizer(Consumer<? super SslContextBuilder> tlsCustomizer) {
+        virtualHostTemplate.tlsCustomizer(tlsCustomizer);
+        return this;
+    }
+
+    /**
+     * Configures an {@link HttpService} of the default {@link VirtualHost} with the {@code customizer}.
+     */
+    public ServerBuilder withRoute(Consumer<? super ServiceBindingBuilder> customizer) {
         final ServiceBindingBuilder serviceBindingBuilder = new ServiceBindingBuilder(this);
         customizer.accept(serviceBindingBuilder);
         return this;
     }
 
     /**
-     * Returns a {@link ServiceBindingBuilder} which is for binding a {@link Service} fluently.
+     * Returns a {@link ServiceBindingBuilder} which is for binding an {@link HttpService} fluently.
      */
     public ServiceBindingBuilder route() {
         return new ServiceBindingBuilder(this);
     }
 
     /**
-     * Binds the specified {@link Service} at the specified path pattern of the default {@link VirtualHost}.
-     *
-     * @deprecated Use {@link #service(String, Service)} instead.
+     * Returns a {@link DecoratingServiceBindingBuilder} which is for binding a {@code decorator} fluently.
      */
-    @Deprecated
-    public ServerBuilder serviceAt(String pathPattern, Service<HttpRequest, HttpResponse> service) {
-        return service(pathPattern, service);
+    public DecoratingServiceBindingBuilder routeDecorator() {
+        return new DecoratingServiceBindingBuilder(this);
     }
 
     /**
-     * Binds the specified {@link Service} under the specified directory of the default {@link VirtualHost}.
+     * Binds the specified {@link HttpService} under the specified directory of the default {@link VirtualHost}.
      */
-    public ServerBuilder serviceUnder(String pathPrefix, Service<HttpRequest, HttpResponse> service) {
-        defaultVirtualHostBuilder.serviceUnder(pathPrefix, service);
-        return this;
+    public ServerBuilder serviceUnder(String pathPrefix, HttpService service) {
+        return service(Route.builder().pathPrefix(pathPrefix).build(), service);
     }
 
     /**
-     * Binds the specified {@link Service} at the specified path pattern of the default {@link VirtualHost}.
+     * Binds the specified {@link HttpService} at the specified path pattern of the default {@link VirtualHost}.
      * e.g.
      * <ul>
      *   <li>{@code /login} (no path parameters)</li>
@@ -835,49 +898,56 @@ public final class ServerBuilder {
      *
      * @throws IllegalArgumentException if the specified path pattern is invalid
      */
-    public ServerBuilder service(String pathPattern, Service<HttpRequest, HttpResponse> service) {
-        defaultVirtualHostBuilder.service(pathPattern, service);
-        return this;
+    public ServerBuilder service(String pathPattern, HttpService service) {
+        return route().path(pathPattern).build(service);
     }
 
     /**
-     * Binds the specified {@link Service} at the specified {@link Route} of the default
+     * Binds the specified {@link HttpService} at the specified {@link Route} of the default
      * {@link VirtualHost}.
      */
-    public ServerBuilder service(Route route, Service<HttpRequest, HttpResponse> service) {
-        defaultVirtualHostBuilder.service(route, service);
-        return this;
+    public ServerBuilder service(Route route, HttpService service) {
+        return route().addRoute(route).build(service);
     }
 
     /**
-     * Decorates and binds the specified {@link ServiceWithRoutes} at multiple {@link Route}s
+     * Decorates and binds the specified {@link HttpServiceWithRoutes} at multiple {@link Route}s
      * of the default {@link VirtualHost}.
      *
-     * @param serviceWithRoutes the {@link ServiceWithRoutes}.
+     * @param serviceWithRoutes the {@link HttpServiceWithRoutes}.
      * @param decorators the decorator functions, which will be applied in the order specified.
      */
     public ServerBuilder service(
-            ServiceWithRoutes<HttpRequest, HttpResponse> serviceWithRoutes,
-            Iterable<Function<? super Service<HttpRequest, HttpResponse>,
-                    ? extends Service<HttpRequest, HttpResponse>>> decorators) {
-        defaultVirtualHostBuilder.service(serviceWithRoutes, decorators);
+            HttpServiceWithRoutes serviceWithRoutes,
+            Iterable<? extends Function<? super HttpService, ? extends HttpService>> decorators) {
+        requireNonNull(serviceWithRoutes, "serviceWithRoutes");
+        requireNonNull(serviceWithRoutes.routes(), "serviceWithRoutes.routes()");
+        requireNonNull(decorators, "decorators");
+
+        HttpService decorated = serviceWithRoutes;
+        for (Function<? super HttpService, ? extends HttpService> d : decorators) {
+            checkNotNull(d, "decorators contains null: %s", decorators);
+            decorated = d.apply(decorated);
+            checkNotNull(decorated, "A decorator returned null: %s", d);
+        }
+
+        final HttpService finalDecorated = decorated;
+        serviceWithRoutes.routes().forEach(route -> service(route, finalDecorated));
         return this;
     }
 
     /**
-     * Decorates and binds the specified {@link ServiceWithRoutes} at multiple {@link Route}s
+     * Decorates and binds the specified {@link HttpServiceWithRoutes} at multiple {@link Route}s
      * of the default {@link VirtualHost}.
      *
-     * @param serviceWithRoutes the {@link ServiceWithRoutes}.
+     * @param serviceWithRoutes the {@link HttpServiceWithRoutes}.
      * @param decorators the decorator functions, which will be applied in the order specified.
      */
     @SafeVarargs
     public final ServerBuilder service(
-            ServiceWithRoutes<HttpRequest, HttpResponse> serviceWithRoutes,
-            Function<? super Service<HttpRequest, HttpResponse>,
-                    ? extends Service<HttpRequest, HttpResponse>>... decorators) {
-        defaultVirtualHostBuilder.service(serviceWithRoutes, decorators);
-        return this;
+            HttpServiceWithRoutes serviceWithRoutes,
+            Function<? super HttpService, ? extends HttpService>... decorators) {
+        return service(serviceWithRoutes, ImmutableList.copyOf(requireNonNull(decorators, "decorators")));
     }
 
     /**
@@ -890,9 +960,9 @@ public final class ServerBuilder {
     /**
      * Binds the specified annotated service object under the path prefix {@code "/"}.
      *
-     * @param exceptionHandlersAndConverters instances of {@link ExceptionHandlerFunction},
-     *                                       {@link RequestConverterFunction} and/or
-     *                                       {@link ResponseConverterFunction}
+     * @param exceptionHandlersAndConverters the {@link ExceptionHandlerFunction}s,
+     *                                       the {@link RequestConverterFunction}s and/or
+     *                                       the {@link ResponseConverterFunction}s
      */
     public ServerBuilder annotatedService(Object service,
                                           Object... exceptionHandlersAndConverters) {
@@ -904,13 +974,12 @@ public final class ServerBuilder {
     /**
      * Binds the specified annotated service object under the path prefix {@code "/"}.
      *
-     * @param exceptionHandlersAndConverters instances of {@link ExceptionHandlerFunction},
-     *                                       {@link RequestConverterFunction} and/or
-     *                                       {@link ResponseConverterFunction}
+     * @param exceptionHandlersAndConverters the {@link ExceptionHandlerFunction}s,
+     *                                       the {@link RequestConverterFunction}s and/or
+     *                                       the {@link ResponseConverterFunction}s
      */
     public ServerBuilder annotatedService(Object service,
-                                          Function<Service<HttpRequest, HttpResponse>,
-                                                  ? extends Service<HttpRequest, HttpResponse>> decorator,
+                                          Function<? super HttpService, ? extends HttpService> decorator,
                                           Object... exceptionHandlersAndConverters) {
         return annotatedService("/", service, decorator,
                                 ImmutableList.copyOf(requireNonNull(exceptionHandlersAndConverters,
@@ -927,9 +996,9 @@ public final class ServerBuilder {
     /**
      * Binds the specified annotated service object under the specified path prefix.
      *
-     * @param exceptionHandlersAndConverters instances of {@link ExceptionHandlerFunction},
-     *                                       {@link RequestConverterFunction} and/or
-     *                                       {@link ResponseConverterFunction}
+     * @param exceptionHandlersAndConverters the {@link ExceptionHandlerFunction}s,
+     *                                       the {@link RequestConverterFunction}s and/or
+     *                                       the {@link ResponseConverterFunction}s
      */
     public ServerBuilder annotatedService(String pathPrefix, Object service,
                                           Object... exceptionHandlersAndConverters) {
@@ -941,13 +1010,12 @@ public final class ServerBuilder {
     /**
      * Binds the specified annotated service object under the specified path prefix.
      *
-     * @param exceptionHandlersAndConverters instances of {@link ExceptionHandlerFunction},
-     *                                       {@link RequestConverterFunction} and/or
-     *                                       {@link ResponseConverterFunction}
+     * @param exceptionHandlersAndConverters the {@link ExceptionHandlerFunction}s,
+     *                                       the {@link RequestConverterFunction}s and/or
+     *                                       the {@link ResponseConverterFunction}s
      */
     public ServerBuilder annotatedService(String pathPrefix, Object service,
-                                          Function<Service<HttpRequest, HttpResponse>,
-                                                  ? extends Service<HttpRequest, HttpResponse>> decorator,
+                                          Function<? super HttpService, ? extends HttpService> decorator,
                                           Object... exceptionHandlersAndConverters) {
 
         return annotatedService(pathPrefix, service, decorator,
@@ -958,9 +1026,9 @@ public final class ServerBuilder {
     /**
      * Binds the specified annotated service object under the specified path prefix.
      *
-     * @param exceptionHandlersAndConverters an iterable object of {@link ExceptionHandlerFunction},
-     *                                       {@link RequestConverterFunction} and/or
-     *                                       {@link ResponseConverterFunction}
+     * @param exceptionHandlersAndConverters the {@link ExceptionHandlerFunction}s,
+     *                                       the {@link RequestConverterFunction}s and/or
+     *                                       the {@link ResponseConverterFunction}s
      */
     public ServerBuilder annotatedService(String pathPrefix, Object service,
                                           Iterable<?> exceptionHandlersAndConverters) {
@@ -970,26 +1038,70 @@ public final class ServerBuilder {
     /**
      * Binds the specified annotated service object under the specified path prefix.
      *
-     * @param exceptionHandlersAndConverters an iterable object of {@link ExceptionHandlerFunction},
-     *                                       {@link RequestConverterFunction} and/or
-     *                                       {@link ResponseConverterFunction}
+     * @param exceptionHandlersAndConverters the {@link ExceptionHandlerFunction},
+     *                                       the {@link RequestConverterFunction} and/or
+     *                                       the {@link ResponseConverterFunction}
      */
     public ServerBuilder annotatedService(String pathPrefix, Object service,
-                                          Function<Service<HttpRequest, HttpResponse>,
-                                                  ? extends Service<HttpRequest, HttpResponse>> decorator,
+                                          Function<? super HttpService, ? extends HttpService> decorator,
                                           Iterable<?> exceptionHandlersAndConverters) {
         requireNonNull(pathPrefix, "pathPrefix");
         requireNonNull(service, "service");
         requireNonNull(decorator, "decorator");
         requireNonNull(exceptionHandlersAndConverters, "exceptionHandlersAndConverters");
+        final AnnotatedServiceExtensions configurator =
+                AnnotatedServiceExtensions
+                        .ofExceptionHandlersAndConverters(exceptionHandlersAndConverters);
+        return annotatedService(pathPrefix, service, decorator, configurator.exceptionHandlers(),
+                                configurator.requestConverters(), configurator.responseConverters());
+    }
 
-        defaultVirtualHostBuilder.annotatedService(pathPrefix, service, decorator,
-                                                   exceptionHandlersAndConverters);
-        return this;
+    /**
+     * Binds the specified annotated service object under the specified path prefix.
+     *
+     * @param exceptionHandlerFunctions the {@link ExceptionHandlerFunction}s
+     * @param requestConverterFunctions the {@link RequestConverterFunction}s
+     * @param responseConverterFunctions the {@link ResponseConverterFunction}s
+     */
+    public ServerBuilder annotatedService(
+            String pathPrefix, Object service, Function<? super HttpService, ? extends HttpService> decorator,
+            Iterable<? extends ExceptionHandlerFunction> exceptionHandlerFunctions,
+            Iterable<? extends RequestConverterFunction> requestConverterFunctions,
+            Iterable<? extends ResponseConverterFunction> responseConverterFunctions) {
+        requireNonNull(pathPrefix, "pathPrefix");
+        requireNonNull(service, "service");
+        requireNonNull(decorator, "decorator");
+        requireNonNull(exceptionHandlerFunctions, "exceptionHandlerFunctions");
+        requireNonNull(requestConverterFunctions, "requestConverterFunctions");
+        requireNonNull(responseConverterFunctions, "responseConverterFunctions");
+        return annotatedService().pathPrefix(pathPrefix)
+                                 .decorator(decorator)
+                                 .exceptionHandlers(exceptionHandlerFunctions)
+                                 .requestConverters(requestConverterFunctions)
+                                 .responseConverters(responseConverterFunctions)
+                                 .build(service);
+    }
+
+    /**
+     * Returns an {@link AnnotatedServiceBindingBuilder} to build annotated service.
+     */
+    public AnnotatedServiceBindingBuilder annotatedService() {
+        return new AnnotatedServiceBindingBuilder(this);
     }
 
     ServerBuilder serviceConfigBuilder(ServiceConfigBuilder serviceConfigBuilder) {
-        defaultVirtualHostBuilder.serviceConfigBuilder(serviceConfigBuilder);
+        virtualHostTemplate.addServiceConfigSetters(serviceConfigBuilder);
+        return this;
+    }
+
+    ServerBuilder annotatedServiceBindingBuilder(
+            AnnotatedServiceBindingBuilder annotatedServiceBindingBuilder) {
+        virtualHostTemplate.addServiceConfigSetters(annotatedServiceBindingBuilder);
+        return this;
+    }
+
+    ServerBuilder routingDecorator(RouteDecoratingService routeDecoratingService) {
+        virtualHostTemplate.addRouteDecoratingService(routeDecoratingService);
         return this;
     }
 
@@ -1013,20 +1125,9 @@ public final class ServerBuilder {
     /**
      * Configures the default {@link VirtualHost} with the {@code customizer}.
      */
-    public ServerBuilder withDefaultVirtualHost(Consumer<VirtualHostBuilder> customizer) {
+    public ServerBuilder withDefaultVirtualHost(Consumer<? super VirtualHostBuilder> customizer) {
         customizer.accept(defaultVirtualHostBuilder);
         return this;
-    }
-
-    /**
-     * Returns the {@link VirtualHostBuilder} for building the default
-     * <a href="https://en.wikipedia.org/wiki/Virtual_hosting#Name-based">name-based virtual host</a>.
-     *
-     * @deprecated Use {@link #defaultVirtualHost()}.
-     */
-    @Deprecated
-    public VirtualHostBuilder withDefaultVirtualHost() {
-        return defaultVirtualHostBuilder;
     }
 
     /**
@@ -1040,45 +1141,11 @@ public final class ServerBuilder {
     /**
      * Configures a {@link VirtualHost} with the {@code customizer}.
      */
-    public ServerBuilder withVirtualHost(Consumer<VirtualHostBuilder> customizer) {
+    public ServerBuilder withVirtualHost(Consumer<? super VirtualHostBuilder> customizer) {
         final VirtualHostBuilder virtualHostBuilder = new VirtualHostBuilder(this, false);
         customizer.accept(virtualHostBuilder);
         virtualHostBuilders.add(virtualHostBuilder);
         return this;
-    }
-
-    /**
-     * Adds the <a href="https://en.wikipedia.org/wiki/Virtual_hosting#Name-based">name-based virtual host</a>.
-     *
-     * @deprecated Use {@link #virtualHost(String)}.
-     *
-     * @param hostnamePattern virtual host name regular expression
-     * @return {@link VirtualHostBuilder} for building the virtual host
-     */
-    @Deprecated
-    public VirtualHostBuilder withVirtualHost(String hostnamePattern) {
-        final VirtualHostBuilder virtualHostBuilder =
-                new VirtualHostBuilder(this, false).hostnamePattern(hostnamePattern);
-        virtualHostBuilders.add(virtualHostBuilder);
-        return virtualHostBuilder;
-    }
-
-    /**
-     * Adds the <a href="https://en.wikipedia.org/wiki/Virtual_hosting#Name-based">name-based virtual host</a>.
-     *
-     * @deprecated Use {@link #virtualHost(String, String)}.
-     *
-     * @param defaultHostname default hostname of this virtual host
-     * @param hostnamePattern virtual host name regular expression
-     * @return {@link VirtualHostBuilder} for building the virtual host
-     */
-    @Deprecated
-    public VirtualHostBuilder withVirtualHost(String defaultHostname, String hostnamePattern) {
-        final VirtualHostBuilder virtualHostBuilder = new VirtualHostBuilder(this, false)
-                .defaultHostname(defaultHostname)
-                .hostnamePattern(hostnamePattern);
-        virtualHostBuilders.add(virtualHostBuilder);
-        return virtualHostBuilder;
     }
 
     /**
@@ -1110,39 +1177,89 @@ public final class ServerBuilder {
     }
 
     /**
-     * Decorates all {@link Service}s with the specified {@code decorator}.
+     * Decorates all {@link HttpService}s with the specified {@code decorator}.
      *
-     * @param decorator the {@link Function} that decorates a {@link Service}
-     * @param <T> the type of the {@link Service} being decorated
-     * @param <R> the type of the {@link Service} {@code decorator} will produce
+     * @param decorator the {@link Function} that decorates {@link HttpService}s
      */
-    public <T extends Service<HttpRequest, HttpResponse>, R extends Service<HttpRequest, HttpResponse>>
-    ServerBuilder decorator(Function<T, R> decorator) {
-
-        requireNonNull(decorator, "decorator");
-
-        @SuppressWarnings("unchecked")
-        final Function<Service<HttpRequest, HttpResponse>, Service<HttpRequest, HttpResponse>> castDecorator =
-                (Function<Service<HttpRequest, HttpResponse>, Service<HttpRequest, HttpResponse>>) decorator;
-
-        if (this.decorator != null) {
-            this.decorator = this.decorator.andThen(castDecorator);
-        } else {
-            this.decorator = castDecorator;
-        }
-
-        return this;
+    public ServerBuilder decorator(Function<? super HttpService, ? extends HttpService> decorator) {
+        return decorator(Route.ofCatchAll(), decorator);
     }
 
     /**
-     * Decorates all {@link Service}s with the specified {@link DecoratingServiceFunction}.
+     * Decorates all {@link HttpService}s with the specified {@link DecoratingHttpServiceFunction}.
      *
-     * @param decoratingServiceFunction the {@link DecoratingServiceFunction} that decorates a {@link Service}.
+     * @param decoratingHttpServiceFunction the {@link DecoratingHttpServiceFunction} that decorates
+     *                                      {@link HttpService}s
      */
     public ServerBuilder decorator(
-            DecoratingServiceFunction<HttpRequest, HttpResponse> decoratingServiceFunction) {
-        requireNonNull(decoratingServiceFunction, "decoratingServiceFunction");
-        return decorator(delegate -> new FunctionalDecoratingService<>(delegate, decoratingServiceFunction));
+            DecoratingHttpServiceFunction decoratingHttpServiceFunction) {
+        return decorator(Route.ofCatchAll(), decoratingHttpServiceFunction);
+    }
+
+    /**
+     * Decorates {@link HttpService}s whose {@link Route} matches the specified {@code pathPattern}.
+     */
+    public ServerBuilder decorator(
+            String pathPattern, Function<? super HttpService, ? extends HttpService> decorator) {
+        return decorator(Route.builder().path(pathPattern).build(), decorator);
+    }
+
+    /**
+     * Decorates {@link HttpService}s whose {@link Route} matches the specified {@code pathPattern}.
+     *
+     * @param decoratingHttpServiceFunction the {@link DecoratingHttpServiceFunction} that decorates
+     *                                      {@link HttpService}.
+     */
+    public ServerBuilder decorator(
+            String pathPattern, DecoratingHttpServiceFunction decoratingHttpServiceFunction) {
+        return decorator(Route.builder().path(pathPattern).build(), decoratingHttpServiceFunction);
+    }
+
+    /**
+     * Decorates {@link HttpService}s with the specified {@link Route}.
+     *
+     * @param route the route being decorated
+     * @param decorator the {@link Function} that decorates {@link HttpService} which matches
+     *                  the specified {@link Route}
+     */
+    public ServerBuilder decorator(
+            Route route, Function<? super HttpService, ? extends HttpService> decorator) {
+        requireNonNull(route, "route");
+        requireNonNull(decorator, "decorator");
+        return routingDecorator(new RouteDecoratingService(route, decorator));
+    }
+
+    /**
+     * Decorates {@link HttpService}s with the specified {@link Route}.
+     *
+     * @param route the route being decorated
+     * @param decoratingHttpServiceFunction the {@link DecoratingHttpServiceFunction} that decorates
+     *                                      {@link HttpService}s
+     */
+    public ServerBuilder decorator(
+            Route route, DecoratingHttpServiceFunction decoratingHttpServiceFunction) {
+        requireNonNull(decoratingHttpServiceFunction, "decoratingHttpServiceFunction");
+        return decorator(route, delegate -> new FunctionalDecoratingHttpService(
+                delegate, decoratingHttpServiceFunction));
+    }
+
+    /**
+     * Decorates {@link HttpService}s under the specified directory.
+     *
+     * @param decoratingHttpServiceFunction the {@link DecoratingHttpServiceFunction} that decorates
+     *                                      {@link HttpService}s
+     */
+    public ServerBuilder decoratorUnder(
+            String prefix, DecoratingHttpServiceFunction decoratingHttpServiceFunction) {
+        return decorator(Route.builder().pathPrefix(prefix).build(), decoratingHttpServiceFunction);
+    }
+
+    /**
+     * Decorates {@link HttpService}s under the specified directory.
+     */
+    public ServerBuilder decoratorUnder(String prefix,
+                                        Function<? super HttpService, ? extends HttpService> decorator) {
+        return decorator(Route.builder().pathPrefix(prefix).build(), decorator);
     }
 
     /**
@@ -1171,7 +1288,7 @@ public final class ServerBuilder {
      * Sets a filter which evaluates whether an {@link InetAddress} of a remote endpoint is trusted.
      */
     public ServerBuilder clientAddressTrustedProxyFilter(
-            Predicate<InetAddress> clientAddressTrustedProxyFilter) {
+            Predicate<? super InetAddress> clientAddressTrustedProxyFilter) {
         this.clientAddressTrustedProxyFilter =
                 requireNonNull(clientAddressTrustedProxyFilter, "clientAddressTrustedProxyFilter");
         return this;
@@ -1180,8 +1297,18 @@ public final class ServerBuilder {
     /**
      * Sets a filter which evaluates whether an {@link InetAddress} can be used as a client address.
      */
-    public ServerBuilder clientAddressFilter(Predicate<InetAddress> clientAddressFilter) {
+    public ServerBuilder clientAddressFilter(Predicate<? super InetAddress> clientAddressFilter) {
         this.clientAddressFilter = requireNonNull(clientAddressFilter, "clientAddressFilter");
+        return this;
+    }
+
+    /**
+     * Sets a {@link Function} to use when determining the client address from {@link ProxiedAddresses}.
+     * If not set, the {@link ProxiedAddresses#sourceAddress()}} is used as a client address.
+     */
+    public ServerBuilder clientAddressMapper(
+            Function<? super ProxiedAddresses, ? extends InetSocketAddress> clientAddressMapper) {
+        this.clientAddressMapper = requireNonNull(clientAddressMapper, "clientAddressMapper");
         return this;
     }
 
@@ -1211,60 +1338,46 @@ public final class ServerBuilder {
      * The {@link VirtualHost}s which do not have an access logger specified by a {@link VirtualHostBuilder}
      * will have an access logger set by the {@code mapper} when {@link ServerBuilder#build()} is called.
      */
-    public ServerBuilder accessLogger(Function<VirtualHost, Logger> mapper) {
-        accessLoggerMapper = requireNonNull(mapper, "mapper");
+    public ServerBuilder accessLogger(Function<? super VirtualHost, ? extends Logger> mapper) {
+        virtualHostTemplate.accessLogger(mapper);
         return this;
-    }
-
-    Function<VirtualHost, Logger> accessLoggerMapper() {
-        return accessLoggerMapper;
     }
 
     /**
      * Sets the {@link RejectedRouteHandler} which will be invoked when an attempt to bind
-     * a {@link Service} at a certain {@link Route} is rejected. By default, the duplicate
+     * an {@link HttpService} at a certain {@link Route} is rejected. By default, the duplicate
      * routes are logged at WARN level.
      */
     public ServerBuilder rejectedRouteHandler(RejectedRouteHandler handler) {
-        rejectedRouteHandler = requireNonNull(handler, "handler");
-        defaultVirtualHostBuilder.rejectedRouteHandler(handler);
+        virtualHostTemplate.rejectedRouteHandler(handler);
         return this;
     }
 
-    RejectedRouteHandler rejectedRouteHandler() {
-        return rejectedRouteHandler;
+    /**
+     * Sets the response header not to include default {@code "Server"} header.
+     */
+    public ServerBuilder disableServerHeader() {
+        enableServerHeader = false;
+        return this;
     }
 
     /**
-     * Sets the timeout of a request.
-     *
-     * @deprecated Use {@link #requestTimeout(Duration)}.
-     * @param requestTimeout the timeout. {@code 0} disables the timeout.
+     * Sets the response header not to include default {@code "Date"} header.
      */
-    @Deprecated
-    public ServerBuilder defaultRequestTimeout(Duration requestTimeout) {
-        return requestTimeout(requestTimeout);
+    public ServerBuilder disableDateHeader() {
+        enableDateHeader = false;
+        return this;
     }
 
     /**
-     * Sets the timeout of a request in milliseconds.
+     * Sets the {@link Supplier} which generates a {@link RequestId}.
+     * By default, a {@link RequestId} is generated from a random 64-bit integer.
      *
-     * @deprecated Use {@link #requestTimeoutMillis(long)}.
-     * @param requestTimeoutMillis the timeout in milliseconds. {@code 0} disables the timeout.
+     * @see RequestContext#id()
      */
-    @Deprecated
-    public ServerBuilder defaultRequestTimeoutMillis(long requestTimeoutMillis) {
-        return requestTimeoutMillis(requestTimeoutMillis);
-    }
-
-    /**
-     * Returns the timeout of a request in milliseconds.
-     *
-     * @deprecated Use {@link #requestTimeoutMillis()}.
-     */
-    @Deprecated
-    long defaultRequestTimeoutMillis() {
-        return requestTimeoutMillis;
+    public ServerBuilder requestIdGenerator(Supplier<? extends RequestId> requestIdGenerator) {
+        this.requestIdGenerator = requireNonNull(requestIdGenerator, "requestIdGenerator");
+        return this;
     }
 
     /**
@@ -1282,40 +1395,8 @@ public final class ServerBuilder {
      * @param requestTimeoutMillis the timeout in milliseconds. {@code 0} disables the timeout.
      */
     public ServerBuilder requestTimeoutMillis(long requestTimeoutMillis) {
-        this.requestTimeoutMillis = validateRequestTimeoutMillis(requestTimeoutMillis);
-        defaultVirtualHostBuilder.requestTimeoutMillis(requestTimeoutMillis);
+        virtualHostTemplate.requestTimeoutMillis(requestTimeoutMillis);
         return this;
-    }
-
-    /**
-     * Returns the timeout of a request in milliseconds.
-     */
-    long requestTimeoutMillis() {
-        return requestTimeoutMillis;
-    }
-
-    /**
-     * Sets the maximum allowed length of the content decoded at the session layer.
-     * e.g. the content length of an HTTP request.
-     *
-     * @deprecated Use {@link #maxRequestLength(long)}.
-     *
-     * @param maxRequestLength the maximum allowed length. {@code 0} disables the length limit.
-     */
-    @Deprecated
-    public ServerBuilder defaultMaxRequestLength(long maxRequestLength) {
-        return maxRequestLength(maxRequestLength);
-    }
-
-    /**
-     * Returns the maximum allowed length of the content decoded at the session layer.
-     * e.g. the content length of an HTTP request.
-     *
-     * @deprecated Use {@link #maxRequestLength()}.
-     */
-    @Deprecated
-    long defaultMaxRequestLength() {
-        return maxRequestLength;
     }
 
     /**
@@ -1325,17 +1406,8 @@ public final class ServerBuilder {
      * @param maxRequestLength the maximum allowed length. {@code 0} disables the length limit.
      */
     public ServerBuilder maxRequestLength(long maxRequestLength) {
-        this.maxRequestLength = validateMaxRequestLength(maxRequestLength);
-        defaultVirtualHostBuilder.maxRequestLength(maxRequestLength);
+        virtualHostTemplate.maxRequestLength(maxRequestLength);
         return this;
-    }
-
-    /**
-     * Returns the maximum allowed length of the content decoded at the session layer.
-     * e.g. the content length of an HTTP request.
-     */
-    long maxRequestLength() {
-        return maxRequestLength;
     }
 
     /**
@@ -1345,98 +1417,46 @@ public final class ServerBuilder {
      * The default value of this property is retrieved from {@link Flags#verboseResponses()}.
      */
     public ServerBuilder verboseResponses(boolean verboseResponses) {
-        this.verboseResponses = verboseResponses;
-        defaultVirtualHostBuilder.verboseResponses(verboseResponses);
-        return this;
-    }
-
-    boolean verboseResponses() {
-        return verboseResponses;
-    }
-
-    /**
-     * Sets the {@link ContentPreviewerFactory} for a request of this {@link Server}.
-     */
-    public ServerBuilder requestContentPreviewerFactory(ContentPreviewerFactory factory) {
-        requestContentPreviewerFactory = requireNonNull(factory, "factory");
-        defaultVirtualHostBuilder.requestContentPreviewerFactory(factory);
-        return this;
-    }
-
-    ContentPreviewerFactory requestContentPreviewerFactory() {
-        return requestContentPreviewerFactory;
-    }
-
-    /**
-     * Sets the {@link ContentPreviewerFactory} for a response of this {@link Server}.
-     */
-    public ServerBuilder responseContentPreviewerFactory(ContentPreviewerFactory factory) {
-        responseContentPreviewerFactory = requireNonNull(factory, "factory");
-        defaultVirtualHostBuilder.responseContentPreviewerFactory(factory);
-        return this;
-    }
-
-    ContentPreviewerFactory responseContentPreviewerFactory() {
-        return responseContentPreviewerFactory;
-    }
-
-    /**
-     * Sets the {@link ContentPreviewerFactory} for a request and a response of this {@link Server}.
-     */
-    public ServerBuilder contentPreviewerFactory(ContentPreviewerFactory factory) {
-        requestContentPreviewerFactory(factory);
-        responseContentPreviewerFactory(factory);
+        virtualHostTemplate.verboseResponses(verboseResponses);
         return this;
     }
 
     /**
-     * Sets the {@link ContentPreviewerFactory} for creating a {@link ContentPreviewer} which produces the
-     * preview with the maximum {@code length} limit for a request and a response of this {@link Server}.
-     * The previewer is enabled only if the content type of a request/response meets
-     * any of the following conditions:
-     * <ul>
-     *     <li>when it matches {@code text/*} or {@code application/x-www-form-urlencoded}</li>
-     *     <li>when its charset has been specified</li>
-     *     <li>when its subtype is {@code "xml"} or {@code "json"}</li>
-     *     <li>when its subtype ends with {@code "+xml"} or {@code "+json"}</li>
-     * </ul>
-     * @param length the maximum length of the preview
-     * @param defaultCharset the default charset used when a charset is not specified in the
-     *                       {@code "content-type"} header
+     * Sets the {@link RequestConverterFunction}s, {@link ResponseConverterFunction}
+     * and {@link ExceptionHandlerFunction}s for creating an {@link AnnotatedServiceExtensions}.
+     *
+     * @param requestConverterFunctions the {@link RequestConverterFunction}s
+     * @param responseConverterFunctions the {@link ResponseConverterFunction}s
+     * @param exceptionHandlerFunctions the {@link ExceptionHandlerFunction}s
      */
-    public ServerBuilder contentPreview(int length, Charset defaultCharset) {
-        return contentPreviewerFactory(ContentPreviewerFactory.ofText(length, defaultCharset));
-    }
-
-    /**
-     * Sets the {@link ContentPreviewerFactory} for creating a {@link ContentPreviewer} which produces the
-     * preview with the maximum {@code length} limit for a request and a response of this {@link Server}.
-     * The previewer is enabled only if the content type of a request/response meets
-     * any of the following conditions:
-     * <ul>
-     *     <li>when it matches {@code text/*} or {@code application/x-www-form-urlencoded}</li>
-     *     <li>when its charset has been specified</li>
-     *     <li>when its subtype is {@code "xml"} or {@code "json"}</li>
-     *     <li>when its subtype ends with {@code "+xml"} or {@code "+json"}</li>
-     * </ul>
-     * @param length the maximum length of the preview.
-     */
-    public ServerBuilder contentPreview(int length) {
-        return contentPreview(length, ArmeriaHttpUtil.HTTP_DEFAULT_CONTENT_CHARSET);
+    public ServerBuilder annotatedServiceExtensions(
+            Iterable<? extends RequestConverterFunction> requestConverterFunctions,
+            Iterable<? extends ResponseConverterFunction> responseConverterFunctions,
+            Iterable<? extends ExceptionHandlerFunction> exceptionHandlerFunctions) {
+        virtualHostTemplate.annotatedServiceExtensions(requestConverterFunctions,
+                                                       responseConverterFunctions,
+                                                       exceptionHandlerFunctions);
+        return this;
     }
 
     /**
      * Returns a newly-created {@link Server} based on the configuration properties set so far.
      */
     public Server build() {
-        final VirtualHost defaultVirtualHost = defaultVirtualHostBuilder.build().decorate(decorator);
-        final List<VirtualHost> virtualHosts = virtualHostBuilders.stream()
-                                                                  .map(VirtualHostBuilder::build)
-                                                                  .map(vh -> vh.decorate(decorator))
-                                                                  .collect(toImmutableList());
+        final AnnotatedServiceExtensions extensions =
+                virtualHostTemplate.annotatedServiceExtensions();
+
+        assert extensions != null;
+
+        final VirtualHost defaultVirtualHost =
+                defaultVirtualHostBuilder.build(virtualHostTemplate);
+        final List<VirtualHost> virtualHosts =
+                virtualHostBuilders.stream()
+                                   .map(vhb -> vhb.build(virtualHostTemplate))
+                                   .collect(toImmutableList());
 
         // Pre-populate the domain name mapping for later matching.
-        final DomainNameMapping<SslContext> sslContexts;
+        final Mapping<String, SslContext> sslContexts;
         final SslContext defaultSslContext = findDefaultSslContext(defaultVirtualHost, virtualHosts);
 
         final Collection<ServerPort> ports;
@@ -1459,7 +1479,7 @@ public final class ServerBuilder {
                 ports = ImmutableList.of(new ServerPort(0, HTTP));
             }
         } else {
-            if ((!OpenSsl.isAvailable() || !Flags.useOpenSsl()) && !SystemInfo.jettyAlpnOptionalOrAvailable()) {
+            if (!Flags.useOpenSsl() && !SystemInfo.jettyAlpnOptionalOrAvailable()) {
                 throw new IllegalStateException(
                         "TLS configured but this is Java 8 and neither OpenSSL nor Jetty ALPN could be " +
                         "detected. To use TLS with Armeria, you must either use Java 9+, enable OpenSSL, " +
@@ -1474,8 +1494,8 @@ public final class ServerBuilder {
                 ports = ImmutableList.of(new ServerPort(0, HTTPS));
             }
 
-            final DomainNameMappingBuilder<SslContext>
-                    mappingBuilder = new DomainNameMappingBuilder<>(defaultSslContext);
+            final DomainMappingBuilder<SslContext>
+                    mappingBuilder = new DomainMappingBuilder<>(defaultSslContext);
             for (VirtualHost h : virtualHosts) {
                 final SslContext sslCtx = h.sslContext();
                 if (sslCtx != null) {
@@ -1485,18 +1505,32 @@ public final class ServerBuilder {
             sslContexts = mappingBuilder.build();
         }
 
+        if (pingIntervalMillis > 0) {
+            pingIntervalMillis = Math.max(pingIntervalMillis, MIN_PING_INTERVAL_MILLIS);
+            if (idleTimeoutMillis > 0 && pingIntervalMillis >= idleTimeoutMillis) {
+                pingIntervalMillis = 0;
+            }
+        }
+
+        if (maxConnectionAgeMillis > 0) {
+            maxConnectionAgeMillis = Math.max(maxConnectionAgeMillis, MIN_MAX_CONNECTION_AGE_MILLIS);
+            if (idleTimeoutMillis == 0 || idleTimeoutMillis > maxConnectionAgeMillis) {
+                idleTimeoutMillis = maxConnectionAgeMillis;
+            }
+        }
+
         final Server server = new Server(new ServerConfig(
                 ports, setSslContextIfAbsent(defaultVirtualHost, defaultSslContext), virtualHosts,
                 workerGroup, shutdownWorkerGroupOnStop, startStopExecutor, maxNumConnections,
-                idleTimeoutMillis, requestTimeoutMillis, maxRequestLength, verboseResponses,
-                http2InitialConnectionWindowSize, http2InitialStreamWindowSize, http2MaxStreamsPerConnection,
-                http2MaxFrameSize, http2MaxHeaderListSize,
-                http1MaxInitialLineLength, http1MaxHeaderSize, http1MaxChunkSize,
-                gracefulShutdownQuietPeriod, gracefulShutdownTimeout,
+                idleTimeoutMillis, pingIntervalMillis, maxConnectionAgeMillis,
+                http2InitialConnectionWindowSize,
+                http2InitialStreamWindowSize, http2MaxStreamsPerConnection,
+                http2MaxFrameSize, http2MaxHeaderListSize, http1MaxInitialLineLength, http1MaxHeaderSize,
+                http1MaxChunkSize, gracefulShutdownQuietPeriod, gracefulShutdownTimeout,
                 blockingTaskExecutor, shutdownBlockingTaskExecutorOnStop,
-                meterRegistry, serviceLoggerPrefix, accessLogWriter, shutdownAccessLogWriterOnStop,
-                proxyProtocolMaxTlvSize, channelOptions, childChannelOptions,
-                clientAddressSources, clientAddressTrustedProxyFilter, clientAddressFilter), sslContexts);
+                meterRegistry, proxyProtocolMaxTlvSize, channelOptions, childChannelOptions,
+                clientAddressSources, clientAddressTrustedProxyFilter, clientAddressFilter, clientAddressMapper,
+                enableServerHeader, enableDateHeader, requestIdGenerator), sslContexts);
 
         serverListeners.forEach(server::addListener);
         return server;
@@ -1559,37 +1593,17 @@ public final class ServerBuilder {
         return null;
     }
 
-    private static String defaultAccessLoggerName(String hostnamePattern) {
-        requireNonNull(hostnamePattern, "hostnamePattern");
-        final String[] elements = hostnamePattern.split("\\.");
-        final StringBuilder name = new StringBuilder(
-                DEFAULT_ACCESS_LOGGER_PREFIX.length() + hostnamePattern.length() + 1);
-        name.append(DEFAULT_ACCESS_LOGGER_PREFIX);
-        for (int i = elements.length - 1; i >= 0; i--) {
-            final String element = elements[i];
-            if (element.isEmpty() || "*".equals(element)) {
-                continue;
-            }
-            name.append('.');
-            name.append(element);
-        }
-        return name.toString();
-    }
-
     @Override
     public String toString() {
         return ServerConfig.toString(
                 getClass(), ports, null, ImmutableList.of(), workerGroup, shutdownWorkerGroupOnStop,
-                maxNumConnections, idleTimeoutMillis, requestTimeoutMillis, maxRequestLength,
-                verboseResponses, http2InitialConnectionWindowSize, http2InitialStreamWindowSize,
-                http2MaxStreamsPerConnection, http2MaxFrameSize, http2MaxHeaderListSize,
-                http1MaxInitialLineLength, http1MaxHeaderSize, http1MaxChunkSize,
+                maxNumConnections, idleTimeoutMillis, http2InitialConnectionWindowSize,
+                http2InitialStreamWindowSize, http2MaxStreamsPerConnection, http2MaxFrameSize,
+                http2MaxHeaderListSize, http1MaxInitialLineLength, http1MaxHeaderSize, http1MaxChunkSize,
                 proxyProtocolMaxTlvSize, gracefulShutdownQuietPeriod, gracefulShutdownTimeout,
                 blockingTaskExecutor, shutdownBlockingTaskExecutorOnStop,
-                meterRegistry, serviceLoggerPrefix,
-                accessLogWriter, shutdownAccessLogWriterOnStop,
-                channelOptions, childChannelOptions,
-                clientAddressSources, clientAddressTrustedProxyFilter, clientAddressFilter
-        );
+                meterRegistry, channelOptions, childChannelOptions,
+                clientAddressSources, clientAddressTrustedProxyFilter, clientAddressFilter, clientAddressMapper,
+                enableServerHeader, enableDateHeader);
     }
 }

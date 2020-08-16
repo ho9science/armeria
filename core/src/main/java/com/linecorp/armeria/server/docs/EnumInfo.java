@@ -29,9 +29,12 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableList;
 
+import com.linecorp.armeria.common.annotation.UnstableApi;
+
 /**
  * Metadata about an enum type.
  */
+@UnstableApi
 public final class EnumInfo implements NamedTypeInfo {
 
     private final String name;
@@ -102,7 +105,7 @@ public final class EnumInfo implements NamedTypeInfo {
     }
 
     @Override
-    public boolean equals(Object o) {
+    public boolean equals(@Nullable Object o) {
         if (this == o) {
             return true;
         }

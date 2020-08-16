@@ -15,10 +15,9 @@
  */
 package com.linecorp.armeria.server.healthcheck;
 
-import java.util.ArrayDeque;
-import java.util.Queue;
+import static com.google.common.collect.ImmutableList.toImmutableList;
+
 import java.util.Set;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
@@ -28,18 +27,20 @@ import javax.annotation.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Ascii;
 import com.google.common.collect.ImmutableSet;
-import com.google.common.math.LongMath;
 
 import com.linecorp.armeria.common.AggregatedHttpResponse;
 import com.linecorp.armeria.common.HttpHeaderNames;
 import com.linecorp.armeria.common.HttpMethod;
 import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.HttpResponse;
+import com.linecorp.armeria.common.HttpResponseWriter;
 import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.ResponseHeaders;
-import com.linecorp.armeria.internal.ArmeriaHttpUtil;
+import com.linecorp.armeria.common.util.TimeoutMode;
+import com.linecorp.armeria.internal.common.ArmeriaHttpUtil;
 import com.linecorp.armeria.server.HttpService;
 import com.linecorp.armeria.server.HttpStatusException;
 import com.linecorp.armeria.server.RequestTimeoutException;
@@ -47,10 +48,12 @@ import com.linecorp.armeria.server.Server;
 import com.linecorp.armeria.server.ServerListenerAdapter;
 import com.linecorp.armeria.server.ServiceConfig;
 import com.linecorp.armeria.server.ServiceRequestContext;
-import com.linecorp.armeria.server.TransientService;
+import com.linecorp.armeria.server.TransientHttpService;
 
 import io.netty.util.AsciiString;
+import io.netty.util.concurrent.FutureListener;
 import io.netty.util.concurrent.ScheduledFuture;
+import it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet;
 
 /**
  * An {@link HttpService} that responds with HTTP status {@code "200 OK"} if the server is healthy and can
@@ -94,7 +97,7 @@ import io.netty.util.concurrent.ScheduledFuture;
  *
  * @see HealthCheckServiceBuilder
  */
-public final class HealthCheckService implements HttpService, TransientService<HttpRequest, HttpResponse> {
+public final class HealthCheckService implements TransientHttpService {
 
     private static final Logger logger = LoggerFactory.getLogger(HealthCheckService.class);
     private static final AsciiString ARMERIA_LPHC = HttpHeaderNames.of("armeria-lphc");
@@ -126,15 +129,19 @@ public final class HealthCheckService implements HttpService, TransientService<H
     private final AggregatedHttpResponse healthyResponse;
     private final AggregatedHttpResponse unhealthyResponse;
     private final AggregatedHttpResponse stoppingResponse;
+    private final ResponseHeaders ping;
     private final ResponseHeaders notModifiedHeaders;
     private final long maxLongPollingTimeoutMillis;
     private final double longPollingTimeoutJitterRate;
+    private final long pingIntervalMillis;
     @Nullable
     private final Consumer<HealthChecker> healthCheckerListener;
     @Nullable
-    private final Queue<PendingResponse> pendingHealthyResponses;
+    @VisibleForTesting
+    final Set<PendingResponse> pendingHealthyResponses;
     @Nullable
-    private final Queue<PendingResponse> pendingUnhealthyResponses;
+    @VisibleForTesting
+    final Set<PendingResponse> pendingUnhealthyResponses;
     @Nullable
     private final HealthCheckUpdateHandler updateHandler;
 
@@ -145,7 +152,7 @@ public final class HealthCheckService implements HttpService, TransientService<H
     HealthCheckService(Iterable<HealthChecker> healthCheckers,
                        AggregatedHttpResponse healthyResponse, AggregatedHttpResponse unhealthyResponse,
                        long maxLongPollingTimeoutMillis, double longPollingTimeoutJitterRate,
-                       @Nullable HealthCheckUpdateHandler updateHandler) {
+                       long pingIntervalMillis, @Nullable HealthCheckUpdateHandler updateHandler) {
         serverHealth = new SettableHealthChecker(false);
         this.healthCheckers = ImmutableSet.<HealthChecker>builder()
                 .add(serverHealth).addAll(healthCheckers).build();
@@ -155,47 +162,77 @@ public final class HealthCheckService implements HttpService, TransientService<H
             this.healthCheckers.stream().allMatch(ListenableHealthChecker.class::isInstance)) {
             this.maxLongPollingTimeoutMillis = maxLongPollingTimeoutMillis;
             this.longPollingTimeoutJitterRate = longPollingTimeoutJitterRate;
+            this.pingIntervalMillis = pingIntervalMillis;
             healthCheckerListener = this::onHealthCheckerUpdate;
-            pendingHealthyResponses = new ArrayDeque<>();
-            pendingUnhealthyResponses = new ArrayDeque<>();
+            pendingHealthyResponses = new ObjectLinkedOpenHashSet<>();
+            pendingUnhealthyResponses = new ObjectLinkedOpenHashSet<>();
         } else {
             this.maxLongPollingTimeoutMillis = 0;
             this.longPollingTimeoutJitterRate = 0;
+            this.pingIntervalMillis = 0;
             healthCheckerListener = null;
             pendingHealthyResponses = null;
             pendingUnhealthyResponses = null;
 
-            if (maxLongPollingTimeoutMillis > 0) {
-                logger.warn("Long-polling support has been disabled for {} " +
-                            "because some of the specified {}s are not listenable.",
-                            getClass().getSimpleName(), HealthChecker.class.getSimpleName());
+            if (maxLongPollingTimeoutMillis > 0 && logger.isWarnEnabled()) {
+                logger.warn("Long-polling support has been disabled " +
+                            "because some of the specified {}s do not implement {}: {}",
+                            HealthChecker.class.getSimpleName(),
+                            ListenableHealthChecker.class.getSimpleName(),
+                            this.healthCheckers.stream()
+                                               .filter(e -> !(e instanceof ListenableHealthChecker))
+                                               .collect(toImmutableList()));
             }
         }
 
-        this.healthyResponse = addCommonHeaders(healthyResponse);
-        this.unhealthyResponse = addCommonHeaders(unhealthyResponse);
-        stoppingResponse = isLongPollingEnabled() ? addCommonHeaders(unhealthyResponse, 0)
-                                                  : this.unhealthyResponse;
+        this.healthyResponse = setCommonHeaders(healthyResponse);
+        this.unhealthyResponse = setCommonHeaders(unhealthyResponse);
+        stoppingResponse = clearCommonHeaders(unhealthyResponse);
         notModifiedHeaders = ResponseHeaders.builder()
                                             .add(this.unhealthyResponse.headers())
+                                            .endOfStream(true)
                                             .status(HttpStatus.NOT_MODIFIED)
                                             .removeAndThen(HttpHeaderNames.CONTENT_LENGTH)
                                             .build();
+
+        ping = setCommonHeaders(ResponseHeaders.of(HttpStatus.PROCESSING));
     }
 
-    private AggregatedHttpResponse addCommonHeaders(AggregatedHttpResponse res) {
-        final long maxLongPollingTimeoutSeconds =
-                isLongPollingEnabled() ? Math.max(1, maxLongPollingTimeoutMillis / 1000)
-                                       : 0;
-
-        return addCommonHeaders(res, maxLongPollingTimeoutSeconds);
+    private AggregatedHttpResponse setCommonHeaders(AggregatedHttpResponse res) {
+        return AggregatedHttpResponse.of(res.informationals(),
+                                         setCommonHeaders(res.headers()),
+                                         res.content(),
+                                         res.trailers().toBuilder()
+                                            .removeAndThen(ARMERIA_LPHC)
+                                            .build());
     }
 
-    private static AggregatedHttpResponse addCommonHeaders(AggregatedHttpResponse res,
-                                                           long maxLongPollingTimeoutSeconds) {
+    private ResponseHeaders setCommonHeaders(ResponseHeaders headers) {
+        final long maxLongPollingTimeoutSeconds;
+        final long pingIntervalSeconds;
+        if (isLongPollingEnabled()) {
+            maxLongPollingTimeoutSeconds = Math.max(1, maxLongPollingTimeoutMillis / 1000);
+            pingIntervalSeconds = Math.max(1, pingIntervalMillis / 1000);
+        } else {
+            maxLongPollingTimeoutSeconds = 0;
+            pingIntervalSeconds = 0;
+        }
+
+        return setCommonHeaders(headers, maxLongPollingTimeoutSeconds, pingIntervalSeconds);
+    }
+
+    private static ResponseHeaders setCommonHeaders(ResponseHeaders headers,
+                                                    long maxLongPollingTimeoutSeconds,
+                                                    long pingIntervalSeconds) {
+        return headers.toBuilder()
+                      .set(ARMERIA_LPHC, maxLongPollingTimeoutSeconds + ", " + pingIntervalSeconds)
+                      .build();
+    }
+
+    private static AggregatedHttpResponse clearCommonHeaders(AggregatedHttpResponse res) {
         return AggregatedHttpResponse.of(res.informationals(),
                                          res.headers().toBuilder()
-                                            .setLong(ARMERIA_LPHC, maxLongPollingTimeoutSeconds)
+                                            .removeAndThen(ARMERIA_LPHC)
                                             .build(),
                                          res.content(),
                                          res.trailers().toBuilder()
@@ -285,19 +322,47 @@ public final class HealthCheckService implements HttpService, TransientService<H
             synchronized (healthCheckerListener) {
                 final boolean currentHealthiness = isHealthy();
                 if (isHealthy == currentHealthiness) {
-                    final CompletableFuture<HttpResponse> future = new CompletableFuture<>();
-                    final ScheduledFuture<Boolean> timeoutFuture = ctx.eventLoop().schedule(
-                            () -> future.complete(HttpResponse.of(notModifiedHeaders)),
-                            longPollingTimeoutMillis, TimeUnit.MILLISECONDS);
-                    final PendingResponse pendingResponse = new PendingResponse(method, future, timeoutFuture);
-                    if (isHealthy) {
-                        pendingUnhealthyResponses.add(pendingResponse);
+                    final HttpResponseWriter res = HttpResponse.streaming();
+
+                    final Set<PendingResponse> pendingResponses = isHealthy ? pendingUnhealthyResponses
+                                                                            : pendingHealthyResponses;
+
+                    // Send the initial ack (102 Processing) to let the client know that the request
+                    // was accepted.
+                    res.write(ping);
+
+                    // Send pings (102 Processing) periodically afterwards.
+                    final ScheduledFuture<?> pingFuture;
+                    if (pingIntervalMillis != 0 && pingIntervalMillis < longPollingTimeoutMillis) {
+                        pingFuture = ctx.eventLoop().withoutContext().scheduleWithFixedDelay(
+                                new PingTask(res),
+                                pingIntervalMillis, pingIntervalMillis, TimeUnit.MILLISECONDS);
                     } else {
-                        pendingHealthyResponses.add(pendingResponse);
+                        pingFuture = null;
                     }
 
+                    // Send 304 Not Modified on timeout.
+                    final ScheduledFuture<?> timeoutFuture = ctx.eventLoop().withoutContext().schedule(
+                            new TimeoutTask(res), longPollingTimeoutMillis, TimeUnit.MILLISECONDS);
+
+                    final PendingResponse pendingResponse =
+                            new PendingResponse(method, res, pingFuture, timeoutFuture);
+                    pendingResponses.add(pendingResponse);
+                    timeoutFuture.addListener((FutureListener<Object>) f -> {
+                        synchronized (healthCheckerListener) {
+                            pendingResponses.remove(pendingResponse);
+                        }
+                    });
+
                     updateRequestTimeout(ctx, longPollingTimeoutMillis);
-                    return HttpResponse.from(future);
+
+                    // Cancel the scheduled timeout and ping task if the response is closed,
+                    // so that they are removed from the event loop's task queue.
+                    res.whenComplete().handle((unused1, unused2) -> {
+                        pendingResponse.cancelAllScheduledFutures();
+                        return null;
+                    });
+                    return res;
                 } else {
                     // State has been changed before we acquire the lock.
                     // Fall through because there's no need for long polling.
@@ -375,8 +440,13 @@ public final class HealthCheckService implements HttpService, TransientService<H
             throw HttpStatusException.of(HttpStatus.BAD_REQUEST);
         }
 
-        return (long) (Math.min(timeoutMillisHolder.value, maxLongPollingTimeoutMillis) *
-                       (1.0 - ThreadLocalRandom.current().nextDouble(longPollingTimeoutJitterRate)));
+        final double multiplier;
+        if (longPollingTimeoutJitterRate > 0) {
+            multiplier = 1.0 - ThreadLocalRandom.current().nextDouble(longPollingTimeoutJitterRate);
+        } else {
+            multiplier = 1;
+        }
+        return (long) (Math.min(timeoutMillisHolder.value, maxLongPollingTimeoutMillis) * multiplier);
     }
 
     private boolean isLongPollingEnabled() {
@@ -391,25 +461,30 @@ public final class HealthCheckService implements HttpService, TransientService<H
     private static void updateRequestTimeout(ServiceRequestContext ctx, long longPollingTimeoutMillis) {
         final long requestTimeoutMillis = ctx.requestTimeoutMillis();
         if (requestTimeoutMillis > 0) {
-            ctx.setRequestTimeoutMillis(LongMath.saturatedAdd(longPollingTimeoutMillis, requestTimeoutMillis));
+            ctx.setRequestTimeoutMillis(TimeoutMode.EXTEND, longPollingTimeoutMillis);
         }
     }
 
     private HttpResponse newResponse(HttpMethod method, boolean isHealthy) {
-        final AggregatedHttpResponse aRes;
-        if (isHealthy) {
-            aRes = healthyResponse;
-        } else if (serverStopping) {
-            aRes = stoppingResponse;
-        } else {
-            aRes = unhealthyResponse;
-        }
+        final AggregatedHttpResponse aRes = getResponse(isHealthy);
 
         if (method == HttpMethod.HEAD) {
             return HttpResponse.of(aRes.headers());
         } else {
-            return HttpResponse.of(aRes);
+            return aRes.toHttpResponse();
         }
+    }
+
+    private AggregatedHttpResponse getResponse(boolean isHealthy) {
+        if (isHealthy) {
+            return healthyResponse;
+        }
+
+        if (serverStopping) {
+            return stoppingResponse;
+        }
+
+        return unhealthyResponse;
     }
 
     private void onHealthCheckerUpdate(HealthChecker unused) {
@@ -420,34 +495,89 @@ public final class HealthCheckService implements HttpService, TransientService<H
         final boolean isHealthy = isHealthy();
         final PendingResponse[] pendingResponses;
         synchronized (healthCheckerListener) {
-            final Queue<PendingResponse> queue = isHealthy ? pendingHealthyResponses
-                                                           : pendingUnhealthyResponses;
-            if (!queue.isEmpty()) {
-                pendingResponses = queue.toArray(EMPTY_PENDING_RESPONSES);
-                queue.clear();
+            final Set<PendingResponse> set = isHealthy ? pendingHealthyResponses
+                                                       : pendingUnhealthyResponses;
+            if (!set.isEmpty()) {
+                pendingResponses = set.toArray(EMPTY_PENDING_RESPONSES);
+                set.clear();
             } else {
                 pendingResponses = EMPTY_PENDING_RESPONSES;
             }
         }
 
+        final AggregatedHttpResponse res = getResponse(isHealthy);
         for (PendingResponse e : pendingResponses) {
-            if (e.timeoutFuture.cancel(false)) {
-                e.future.complete(newResponse(e.method, isHealthy));
+            if (e.cancelAllScheduledFutures()) {
+                if (e.method == HttpMethod.HEAD) {
+                    if (e.res.tryWrite(res.headers())) {
+                        e.res.close();
+                    }
+                } else {
+                    e.res.close(res);
+                }
             }
         }
     }
 
     private static final class PendingResponse {
         final HttpMethod method;
-        final CompletableFuture<HttpResponse> future;
-        final ScheduledFuture<Boolean> timeoutFuture;
+        final HttpResponseWriter res;
+        @Nullable
+        private final ScheduledFuture<?> pingFuture;
+        private final ScheduledFuture<?> timeoutFuture;
 
         PendingResponse(HttpMethod method,
-                        CompletableFuture<HttpResponse> future,
-                        ScheduledFuture<Boolean> timeoutFuture) {
+                        HttpResponseWriter res,
+                        @Nullable ScheduledFuture<?> pingFuture,
+                        ScheduledFuture<?> timeoutFuture) {
             this.method = method;
-            this.future = future;
+            this.res = res;
+            this.pingFuture = pingFuture;
             this.timeoutFuture = timeoutFuture;
+        }
+
+        boolean cancelAllScheduledFutures() {
+            if (pingFuture != null) {
+                pingFuture.cancel(false);
+            }
+            return timeoutFuture.cancel(false);
+        }
+    }
+
+    private class PingTask implements Runnable {
+
+        private final HttpResponseWriter res;
+        private int pendingPings;
+
+        PingTask(HttpResponseWriter res) {
+            this.res = res;
+        }
+
+        @Override
+        public void run() {
+            if (pendingPings < 5) {
+                if (res.tryWrite(ping)) {
+                    ++pendingPings;
+                    res.whenConsumed().thenRun(() -> pendingPings--);
+                }
+            } else {
+                // Do not send a ping if the client is not reading it.
+            }
+        }
+    }
+
+    private class TimeoutTask implements Runnable {
+        private final HttpResponseWriter res;
+
+        TimeoutTask(HttpResponseWriter res) {
+            this.res = res;
+        }
+
+        @Override
+        public void run() {
+            if (res.tryWrite(notModifiedHeaders)) {
+                res.close();
+            }
         }
     }
 

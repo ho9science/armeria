@@ -20,29 +20,35 @@ import static com.google.common.collect.ImmutableSet.toImmutableSet;
 import static java.util.Objects.requireNonNull;
 
 import java.net.InetSocketAddress;
-import java.net.URI;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Iterator;
-import java.util.Map;
-import java.util.Optional;
+import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentMap;
 import java.util.function.Consumer;
-import java.util.function.Function;
 import java.util.function.Supplier;
 
 import javax.annotation.Nullable;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.MapMaker;
 
-import com.linecorp.armeria.common.HttpRequest;
-import com.linecorp.armeria.common.HttpResponse;
+import com.linecorp.armeria.client.endpoint.EndpointGroup;
+import com.linecorp.armeria.client.proxy.ProxyConfigSelector;
 import com.linecorp.armeria.common.RequestContext;
 import com.linecorp.armeria.common.Scheme;
 import com.linecorp.armeria.common.SerializationFormat;
 import com.linecorp.armeria.common.SessionProtocol;
+import com.linecorp.armeria.common.util.AsyncCloseableSupport;
 import com.linecorp.armeria.common.util.ReleasableHolder;
-import com.linecorp.armeria.internal.TransportType;
+import com.linecorp.armeria.internal.common.util.SslContextUtil;
+import com.linecorp.armeria.internal.common.util.TransportType;
 
 import io.micrometer.core.instrument.MeterRegistry;
 import io.netty.bootstrap.Bootstrap;
@@ -50,13 +56,20 @@ import io.netty.channel.ChannelFactory;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.EventLoop;
 import io.netty.channel.EventLoopGroup;
+import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.resolver.AddressResolverGroup;
+import io.netty.util.concurrent.FutureListener;
+import reactor.core.scheduler.NonBlocking;
 
 /**
  * A {@link ClientFactory} that creates an HTTP client.
  */
-final class HttpClientFactory extends AbstractClientFactory {
+final class HttpClientFactory implements ClientFactory {
+
+    private static final Logger logger = LoggerFactory.getLogger(HttpClientFactory.class);
+
+    private static final CompletableFuture<?>[] EMPTY_FUTURES = new CompletableFuture[0];
 
     private static final Set<Scheme> SUPPORTED_SCHEMES =
             Arrays.stream(SessionProtocol.values())
@@ -66,7 +79,9 @@ final class HttpClientFactory extends AbstractClientFactory {
     private final EventLoopGroup workerGroup;
     private final boolean shutdownWorkerGroupOnClose;
     private final Bootstrap baseBootstrap;
-    private final Consumer<? super SslContextBuilder> sslContextCustomizer;
+    private final SslContext sslCtxHttp1Or2;
+    private final SslContext sslCtxHttp1Only;
+    private final AddressResolverGroup<InetSocketAddress> addressResolverGroup;
     private final int http2InitialConnectionWindowSize;
     private final int http2InitialStreamWindowSize;
     private final int http2MaxFrameSize;
@@ -75,64 +90,68 @@ final class HttpClientFactory extends AbstractClientFactory {
     private final int http1MaxHeaderSize;
     private final int http1MaxChunkSize;
     private final long idleTimeoutMillis;
+    private final long pingIntervalMillis;
     private final boolean useHttp2Preface;
     private final boolean useHttp1Pipelining;
     private final ConnectionPoolListener connectionPoolListener;
     private MeterRegistry meterRegistry;
+    private final ProxyConfigSelector proxyConfigSelector;
 
     private final ConcurrentMap<EventLoop, HttpChannelPool> pools = new MapMaker().weakKeys().makeMap();
     private final HttpClientDelegate clientDelegate;
 
     private final EventLoopScheduler eventLoopScheduler;
     private final Supplier<EventLoop> eventLoopSupplier =
-            () -> RequestContext.mapCurrent(RequestContext::eventLoop, () -> eventLoopGroup().next());
+            () -> RequestContext.mapCurrent(
+                    ctx -> ctx.eventLoop().withoutContext(), () -> eventLoopGroup().next());
+    private final ClientFactoryOptions options;
+    private final AsyncCloseableSupport closeable = AsyncCloseableSupport.of(this::closeAsync);
 
-    private volatile boolean closed;
-
-    HttpClientFactory(
-            EventLoopGroup workerGroup, boolean shutdownWorkerGroupOnClose,
-            Map<ChannelOption<?>, Object> channelOptions,
-            Consumer<? super SslContextBuilder> sslContextCustomizer,
-            Function<? super EventLoopGroup,
-                    ? extends AddressResolverGroup<? extends InetSocketAddress>> addressResolverGroupFactory,
-            int http2InitialConnectionWindowSize, int http2InitialStreamWindowSize, int http2MaxFrameSize,
-            long http2MaxHeaderListSize, int http1MaxInitialLineLength, int http1MaxHeaderSize,
-            int http1MaxChunkSize, long idleTimeoutMillis, boolean useHttp2Preface, boolean useHttp1Pipelining,
-            ConnectionPoolListener connectionPoolListener, MeterRegistry meterRegistry) {
+    HttpClientFactory(ClientFactoryOptions options) {
+        workerGroup = options.workerGroup();
 
         @SuppressWarnings("unchecked")
-        final AddressResolverGroup<InetSocketAddress> addressResolverGroup =
-                (AddressResolverGroup<InetSocketAddress>) addressResolverGroupFactory.apply(workerGroup);
+        final AddressResolverGroup<InetSocketAddress> group =
+                (AddressResolverGroup<InetSocketAddress>) options.addressResolverGroupFactory()
+                                                                 .apply(workerGroup);
+        addressResolverGroup = group;
 
-        final Bootstrap baseBootstrap = new Bootstrap();
-        baseBootstrap.channel(TransportType.socketChannelType(workerGroup));
-        baseBootstrap.resolver(addressResolverGroup);
+        final Bootstrap bootstrap = new Bootstrap();
+        bootstrap.channel(TransportType.socketChannelType(workerGroup));
+        bootstrap.resolver(addressResolverGroup);
 
-        channelOptions.forEach((option, value) -> {
+        options.channelOptions().forEach((option, value) -> {
             @SuppressWarnings("unchecked")
             final ChannelOption<Object> castOption = (ChannelOption<Object>) option;
-            baseBootstrap.option(castOption, value);
+            bootstrap.option(castOption, value);
         });
 
-        this.workerGroup = workerGroup;
-        this.shutdownWorkerGroupOnClose = shutdownWorkerGroupOnClose;
-        this.baseBootstrap = baseBootstrap;
-        this.sslContextCustomizer = sslContextCustomizer;
-        this.http2InitialConnectionWindowSize = http2InitialConnectionWindowSize;
-        this.http2InitialStreamWindowSize = http2InitialStreamWindowSize;
-        this.http2MaxFrameSize = http2MaxFrameSize;
-        this.http2MaxHeaderListSize = http2MaxHeaderListSize;
-        this.http1MaxInitialLineLength = http1MaxInitialLineLength;
-        this.http1MaxHeaderSize = http1MaxHeaderSize;
-        this.http1MaxChunkSize = http1MaxChunkSize;
-        this.idleTimeoutMillis = idleTimeoutMillis;
-        this.useHttp2Preface = useHttp2Preface;
-        this.useHttp1Pipelining = useHttp1Pipelining;
-        this.connectionPoolListener = connectionPoolListener;
-        this.meterRegistry = meterRegistry;
+        final ImmutableList<? extends Consumer<? super SslContextBuilder>> tlsCustomizers =
+                ImmutableList.of(options.tlsCustomizer());
+
+        shutdownWorkerGroupOnClose = options.shutdownWorkerGroupOnClose();
+        eventLoopScheduler = options.eventLoopSchedulerFactory().apply(workerGroup);
+        baseBootstrap = bootstrap;
+        sslCtxHttp1Or2 = SslContextUtil.createSslContext(SslContextBuilder::forClient, false, tlsCustomizers);
+        sslCtxHttp1Only = SslContextUtil.createSslContext(SslContextBuilder::forClient, true, tlsCustomizers);
+        http2InitialConnectionWindowSize = options.http2InitialConnectionWindowSize();
+        http2InitialStreamWindowSize = options.http2InitialStreamWindowSize();
+        http2MaxFrameSize = options.http2MaxFrameSize();
+        http2MaxHeaderListSize = options.http2MaxHeaderListSize();
+        pingIntervalMillis = options.pingIntervalMillis();
+        http1MaxInitialLineLength = options.http1MaxInitialLineLength();
+        http1MaxHeaderSize = options.http1MaxHeaderSize();
+        http1MaxChunkSize = options.http1MaxChunkSize();
+        idleTimeoutMillis = options.idleTimeoutMillis();
+        useHttp2Preface = options.useHttp2Preface();
+        useHttp1Pipelining = options.useHttp1Pipelining();
+        connectionPoolListener = options.connectionPoolListener();
+        meterRegistry = options.meterRegistry();
+        proxyConfigSelector = options.proxyConfigSelector();
+
+        this.options = options;
 
         clientDelegate = new HttpClientDelegate(this, addressResolverGroup);
-        eventLoopScheduler = new EventLoopScheduler(workerGroup);
     }
 
     /**
@@ -141,10 +160,6 @@ final class HttpClientFactory extends AbstractClientFactory {
      */
     Bootstrap newBootstrap() {
         return baseBootstrap.clone();
-    }
-
-    Consumer<? super SslContextBuilder> sslContextCustomizer() {
-        return sslContextCustomizer;
     }
 
     int http2InitialConnectionWindowSize() {
@@ -179,6 +194,10 @@ final class HttpClientFactory extends AbstractClientFactory {
         return idleTimeoutMillis;
     }
 
+    long pingIntervalMillis() {
+        return pingIntervalMillis;
+    }
+
     boolean useHttp2Preface() {
         return useHttp2Preface;
     }
@@ -189,6 +208,15 @@ final class HttpClientFactory extends AbstractClientFactory {
 
     ConnectionPoolListener connectionPoolListener() {
         return connectionPoolListener;
+    }
+
+    ProxyConfigSelector proxyConfigSelector() {
+        return proxyConfigSelector;
+    }
+
+    @VisibleForTesting
+    AddressResolverGroup<InetSocketAddress> addressResolverGroup() {
+        return addressResolverGroup;
     }
 
     @Override
@@ -207,8 +235,10 @@ final class HttpClientFactory extends AbstractClientFactory {
     }
 
     @Override
-    public ReleasableHolder<EventLoop> acquireEventLoop(Endpoint endpoint) {
-        return eventLoopScheduler.acquire(endpoint);
+    public ReleasableHolder<EventLoop> acquireEventLoop(SessionProtocol sessionProtocol,
+                                                        EndpointGroup endpointGroup,
+                                                        @Nullable Endpoint endpoint) {
+        return eventLoopScheduler.acquire(sessionProtocol, endpointGroup, endpoint);
     }
 
     @Override
@@ -222,80 +252,97 @@ final class HttpClientFactory extends AbstractClientFactory {
     }
 
     @Override
-    public <T> T newClient(URI uri, Class<T> clientType, ClientOptions options) {
-        final Scheme scheme = validateScheme(uri);
-        final Endpoint endpoint = newEndpoint(uri);
-
-        return newClient(uri, scheme, endpoint, clientType, options);
+    public ClientFactoryOptions options() {
+        return options;
     }
 
     @Override
-    public <T> T newClient(Scheme scheme, Endpoint endpoint, @Nullable String path, Class<T> clientType,
-                           ClientOptions options) {
-        final URI uri = endpoint.toUri(scheme, path);
-        return newClient(uri, scheme, endpoint, clientType, options);
-    }
+    public Object newClient(ClientBuilderParams params) {
+        validateParams(params);
 
-    private <T> T newClient(URI uri, Scheme scheme, Endpoint endpoint, Class<T> clientType,
-                            ClientOptions options) {
+        final Class<?> clientType = params.clientType();
         validateClientType(clientType);
 
-        final Client<HttpRequest, HttpResponse> delegate = options.decoration().decorate(
-                HttpRequest.class, HttpResponse.class, clientDelegate);
-
-        if (clientType == Client.class) {
-            @SuppressWarnings("unchecked")
-            final T castClient = (T) delegate;
-            return castClient;
-        }
+        final HttpClient delegate = params.options().decoration().decorate(clientDelegate);
 
         if (clientType == HttpClient.class) {
-            final HttpClient client = newHttpClient(uri, scheme, endpoint, options, delegate);
+            return delegate;
+        }
 
-            @SuppressWarnings("unchecked")
-            final T castClient = (T) client;
-            return castClient;
+        if (clientType == WebClient.class) {
+            return new DefaultWebClient(params, delegate, meterRegistry);
         } else {
             throw new IllegalArgumentException("unsupported client type: " + clientType.getName());
         }
     }
 
-    @Override
-    public <T> Optional<ClientBuilderParams> clientBuilderParams(T client) {
-        return Optional.empty();
-    }
-
-    private DefaultHttpClient newHttpClient(URI uri, Scheme scheme, Endpoint endpoint, ClientOptions options,
-                                            Client<HttpRequest, HttpResponse> delegate) {
-        return new DefaultHttpClient(
-                new DefaultClientBuilderParams(this, uri, HttpClient.class, options),
-                delegate, meterRegistry, scheme.sessionProtocol(), endpoint);
-    }
-
-    private static void validateClientType(Class<?> clientType) {
-        if (clientType != HttpClient.class && clientType != Client.class) {
+    private static Class<?> validateClientType(Class<?> clientType) {
+        if (clientType != WebClient.class && clientType != HttpClient.class) {
             throw new IllegalArgumentException(
                     "clientType: " + clientType +
-                    " (expected: " + HttpClient.class.getSimpleName() + " or " +
-                    Client.class.getSimpleName() + ')');
+                    " (expected: " + WebClient.class.getSimpleName() + " or " +
+                    HttpClient.class.getSimpleName() + ')');
         }
+
+        return clientType;
     }
 
-    boolean isClosing() {
-        return closed;
+    @Override
+    public boolean isClosing() {
+        return closeable.isClosing();
+    }
+
+    @Override
+    public boolean isClosed() {
+        return closeable.isClosed();
+    }
+
+    @Override
+    public CompletableFuture<?> whenClosed() {
+        return closeable.whenClosed();
+    }
+
+    @Override
+    public CompletableFuture<?> closeAsync() {
+        return closeable.closeAsync();
+    }
+
+    private void closeAsync(CompletableFuture<?> future) {
+        final List<CompletableFuture<?>> dependencies = new ArrayList<>(pools.size());
+        for (final Iterator<HttpChannelPool> i = pools.values().iterator(); i.hasNext();) {
+            dependencies.add(i.next().closeAsync());
+            i.remove();
+        }
+
+        addressResolverGroup.close();
+
+        CompletableFuture.allOf(dependencies.toArray(EMPTY_FUTURES)).handle((unused, cause) -> {
+            if (cause != null) {
+                logger.warn("Failed to close {}s:", HttpChannelPool.class.getSimpleName(), cause);
+            }
+
+            if (shutdownWorkerGroupOnClose) {
+                workerGroup.shutdownGracefully().addListener((FutureListener<Object>) f -> {
+                    if (f.cause() != null) {
+                        logger.warn("Failed to shut down a worker group:", f.cause());
+                    }
+                    future.complete(null);
+                });
+            } else {
+                future.complete(null);
+            }
+            return null;
+        });
     }
 
     @Override
     public void close() {
-        closed = true;
-
-        for (final Iterator<HttpChannelPool> i = pools.values().iterator(); i.hasNext();) {
-            i.next().close();
-            i.remove();
-        }
-
-        if (shutdownWorkerGroupOnClose) {
-            workerGroup.shutdownGracefully().syncUninterruptibly();
+        if (Thread.currentThread() instanceof NonBlocking) {
+            // Avoid blocking operation if we're in an event loop, because otherwise we might see a dead lock
+            // while waiting for the channels to be closed.
+            closeable.closeAsync();
+        } else {
+            closeable.close();
         }
     }
 
@@ -306,6 +353,8 @@ final class HttpClientFactory extends AbstractClientFactory {
         }
 
         return pools.computeIfAbsent(eventLoop,
-                                     e -> new HttpChannelPool(this, eventLoop, connectionPoolListener()));
+                                     e -> new HttpChannelPool(this, eventLoop,
+                                                              sslCtxHttp1Or2, sslCtxHttp1Only,
+                                                              connectionPoolListener()));
     }
 }

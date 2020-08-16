@@ -15,7 +15,7 @@
  */
 package com.linecorp.armeria.server.annotation;
 
-import static com.linecorp.armeria.internal.ResponseConversionUtil.streamingFrom;
+import static com.linecorp.armeria.internal.server.ResponseConversionUtil.streamingFrom;
 
 import java.util.stream.Stream;
 
@@ -31,10 +31,17 @@ import com.linecorp.armeria.common.ResponseHeaders;
 import com.linecorp.armeria.server.ServiceRequestContext;
 
 /**
- * A response converter implementation which creates an {@link HttpResponse} with
- * {@code content-type: application/binary} or {@code content-type: application/octet-stream}.
+ * A {@link ResponseConverterFunction} which creates an {@link HttpResponse} when:
+ * <ul>
+ *   <li>the {@code result} is an instance of {@link HttpData} or {@code byte[]}</li>
+ *   <li>the {@code result} is an instance of {@link Publisher} or {@link Stream} while the
+ *       {@code "content-type"} of the {@link ResponseHeaders} is {@code "application/binary"} or
+ *       {@code "application/octet-stream"}</li>
+ * </ul>
+ * Note that this {@link ResponseConverterFunction} is applied to the annotated service by default,
+ * so you don't have to set explicitly.
  */
-public class ByteArrayResponseConverterFunction implements ResponseConverterFunction {
+public final class ByteArrayResponseConverterFunction implements ResponseConverterFunction {
 
     @Override
     public HttpResponse convertResponse(ServiceRequestContext ctx,
@@ -58,19 +65,25 @@ public class ByteArrayResponseConverterFunction implements ResponseConverterFunc
                                          ByteArrayResponseConverterFunction::toHttpData,
                                          ctx.blockingTaskExecutor());
                 }
-                if (result instanceof HttpData) {
-                    return HttpResponse.of(headers, (HttpData) result, trailers);
-                }
-                if (result instanceof byte[]) {
-                    return HttpResponse.of(headers, HttpData.wrap((byte[]) result), trailers);
-                }
-
-                return ResponseConverterFunction.fallthrough();
             }
-        } else if (result instanceof HttpData) {
+
+            if (result instanceof HttpData) {
+                return HttpResponse.of(headers, (HttpData) result, trailers);
+            }
+
+            if (result instanceof byte[]) {
+                return HttpResponse.of(headers, HttpData.wrap((byte[]) result), trailers);
+            }
+
+            return ResponseConverterFunction.fallthrough();
+        }
+
+        if (result instanceof HttpData) {
             return HttpResponse.of(headers.toBuilder().contentType(MediaType.OCTET_STREAM).build(),
                                    (HttpData) result, trailers);
-        } else if (result instanceof byte[]) {
+        }
+
+        if (result instanceof byte[]) {
             return HttpResponse.of(headers.toBuilder().contentType(MediaType.OCTET_STREAM).build(),
                                    HttpData.wrap((byte[]) result), trailers);
         }
@@ -86,7 +99,7 @@ public class ByteArrayResponseConverterFunction implements ResponseConverterFunc
             return HttpData.wrap((byte[]) value);
         }
         if (value == null) {
-            return HttpData.EMPTY_DATA;
+            return HttpData.empty();
         }
         throw new IllegalStateException("Failed to convert an object to an HttpData: " +
                                         value.getClass().getName());

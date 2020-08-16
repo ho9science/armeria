@@ -1,5 +1,0 @@
-dependencies {
-    compile project(':testing:common')
-
-    compile 'junit:junit'
-}

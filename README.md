@@ -1,36 +1,41 @@
-Visit [the official web site](https://line.github.io/armeria/) for more information.
+Visit [the official web site](https://armeria.dev/) for more information.
 
 # Armeria
 
-_Armeria_ is an open-source asynchronous RPC/API client/server library built on top of
-[Java 8](https://go.java/), [Netty 4.1](https://netty.io/), [HTTP/2](https://http2.github.io/),
-[Thrift](https://thrift.apache.org/) and [gRPC](https://grpc.io/). Its primary goal is to help engineers build
-high-performance asynchronous microservices that use HTTP/2 as a session layer protocol.
+<a href="https://github.com/line/armeria"><img src="https://img.shields.io/github/stars/line/armeria.svg?style=social" /></a>
+<a href="https://twitter.com/armeria_project"><img src="https://img.shields.io/twitter/follow/armeria_project.svg?label=Follow" /></a>
+<a href="https://armeria.dev/s/slack"><img src="https://img.shields.io/badge/chat-on%20Slack-brightgreen.svg?style=social&amp;logo=slack" /></a>
+<a href="https://github.com/line/armeria/contributors"><img src="https://img.shields.io/github/contributors/line/armeria.svg" /></a>
+<a href="https://github.com/line/armeria/pulse"><img src="https://img.shields.io/github/commit-activity/m/line/armeria.svg?label=commits" /></a>
+<a href="https://search.maven.org/search?q=g:com.linecorp.armeria%20AND%20a:armeria"><img src="https://img.shields.io/maven-central/v/com.linecorp.armeria/armeria.svg?label=version" /></a>
+<a href="https://github.com/line/armeria/commits"><img src="https://img.shields.io/github/release-date/line/armeria.svg?label=release" /></a>
 
-It is open-sourced and licensed under [Apache License 2.0](https://tldrlegal.com/license/apache-license-2.0-(apache-2.0))
-by [LINE Corporation](https://linecorp.com/en/), who uses it in production.
+> Build a reactive microservice **at your pace**, not theirs.
+
+_Armeria_ is your go-to microservice framework for any situation. You can build any type of
+microservice leveraging your favorite technologies, including [gRPC](https://grpc.io/),
+[Thrift](https://thrift.apache.org/), [Kotlin](https://kotlinlang.org/),
+[Retrofit](https://square.github.io/retrofit/), [Reactive Streams](https://www.reactive-streams.org/),
+[Spring Boot](https://spring.io/projects/spring-boot) and [Dropwizard](https://www.dropwizard.io/).
+
+It is open-sourced by the creator of [Netty](https://netty.io/) and his colleagues at
+[LINE Corporation](https://engineering.linecorp.com/en/).
 
 ## Requirements
 
-[Java 8 or later](https://adoptopenjdk.net/).
-See [Requirements](https://line.github.io/armeria/setup.html#requirements) for more information.
+- Java 8 or later if you are a user.
+- See [the developer guide](https://armeria.dev/community/developer-guide/) if you are building Armeria.
 
-## How to build
+## How to reach us — chat, questions and newsletters
 
-We use [Gradle](https://gradle.org/) and Java 11 or later to build Armeria.
-The following command will compile Armeria and generate JARs and web site:
+Visit [the community](https://armeria.dev/community/) to chat with us, ask questions and learn how to contribute.
 
-```bash
-$ ./gradlew build
-```
+## Hall of fame
 
-## How to ask a question
+See [the complete list of our contributors](https://github.com/line/armeria/contributors).
 
-Just [create a new issue](https://github.com/line/armeria/issues/new) to ask a question, and browse
-[the list of previous questions](https://github.com/line/armeria/issues?q=label%3Aquestion).
-
-We also have [a Slack workspace](https://join.slack.com/t/line-armeria/shared_invite/enQtNjIxNDU1ODU1MTI2LTgwMzk0MzVhOGRhZjJiY2ExODc0MzNhYzIxZDFlYjM5OGRjNTE1MzYzYzQ4MzNhNGY2ZDM0NThhMTRmZmQ3ZjQ).
-
-## How to contribute
-
-See [`CONTRIBUTING.md`](CONTRIBUTING.md).
+<img
+  src="https://opencollective.com/armeria/contributors.svg?width=890&button=false"
+  title="Contributors"
+  alt="Contributors"
+/>

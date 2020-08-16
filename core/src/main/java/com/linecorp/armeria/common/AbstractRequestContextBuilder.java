@@ -28,9 +28,11 @@ import java.util.concurrent.ThreadLocalRandom;
 import javax.annotation.Nullable;
 import javax.net.ssl.SSLSession;
 
+import com.linecorp.armeria.client.Client;
 import com.linecorp.armeria.client.ClientRequestContextBuilder;
 import com.linecorp.armeria.common.metric.NoopMeterRegistry;
-import com.linecorp.armeria.internal.PathAndQuery;
+import com.linecorp.armeria.internal.common.PathAndQuery;
+import com.linecorp.armeria.server.Service;
 import com.linecorp.armeria.server.ServiceRequestContextBuilder;
 
 import io.micrometer.core.instrument.MeterRegistry;
@@ -60,8 +62,13 @@ public abstract class AbstractRequestContextBuilder {
     private static final String FALLBACK_AUTHORITY = "127.0.0.1";
 
     private final boolean server;
-    private final Request request;
+    @Nullable
+    private final HttpRequest req;
+    @Nullable
+    private final RpcRequest rpcReq;
     private SessionProtocol sessionProtocol;
+    @Nullable
+    private RequestId id;
     private HttpMethod method;
     private final String authority;
     private final String path;
@@ -73,9 +80,9 @@ public abstract class AbstractRequestContextBuilder {
     private EventLoop eventLoop;
     private ByteBufAllocator alloc = ByteBufAllocator.DEFAULT;
     @Nullable
-    private InetSocketAddress remoteAddress;
+    private SocketAddress remoteAddress;
     @Nullable
-    private InetSocketAddress localAddress;
+    private SocketAddress localAddress;
     @Nullable
     private SSLSession sslSession;
     private boolean requestStartTimeSet;
@@ -83,24 +90,26 @@ public abstract class AbstractRequestContextBuilder {
     private long requestStartTimeMicros;
     @Nullable
     private Channel channel;
+    private boolean timedOut;
 
     /**
      * Creates a new builder with the specified {@link HttpRequest}.
      *
      * @param server whether this builder will build a server-side context.
-     * @param request the {@link HttpRequest}.
+     * @param req the {@link HttpRequest}.
      */
-    protected AbstractRequestContextBuilder(boolean server, HttpRequest request) {
+    protected AbstractRequestContextBuilder(boolean server, HttpRequest req) {
         this.server = server;
-        this.request = requireNonNull(request, "request");
+        this.req = requireNonNull(req, "req");
+        rpcReq = null;
         sessionProtocol = SessionProtocol.H2C;
 
-        method = request.headers().method();
-        authority = firstNonNull(request.headers().authority(), FALLBACK_AUTHORITY);
+        method = req.headers().method();
+        authority = firstNonNull(req.headers().authority(), FALLBACK_AUTHORITY);
 
-        final String pathAndQueryStr = request.headers().path();
+        final String pathAndQueryStr = req.headers().path();
         final PathAndQuery pathAndQuery = PathAndQuery.parse(pathAndQueryStr);
-        checkArgument(pathAndQuery != null, "request.path is not valid: %s", request);
+        checkArgument(pathAndQuery != null, "request.path is not valid: %s", req);
         path = pathAndQuery.path();
         query = pathAndQuery.query();
     }
@@ -109,27 +118,18 @@ public abstract class AbstractRequestContextBuilder {
      * Creates a new builder with the specified {@link RpcRequest} and {@link URI}.
      *
      * @param server whether this builder will build a server-side context.
-     * @param request the {@link RpcRequest}.
+     * @param rpcReq the {@link RpcRequest}.
      * @param uri the {@link URI} of the request endpoint.
      */
-    protected AbstractRequestContextBuilder(boolean server, RpcRequest request, URI uri) {
+    protected AbstractRequestContextBuilder(boolean server, RpcRequest rpcReq, URI uri) {
         this.server = server;
-        this.request = requireNonNull(request, "request");
+        req = null;
+        this.rpcReq = requireNonNull(rpcReq, "rpcReq");
         method = HttpMethod.POST;
 
         requireNonNull(uri, "uri");
         authority = firstNonNull(uri.getRawAuthority(), FALLBACK_AUTHORITY);
-
-        final String schemeStr = uri.getScheme();
-        if (schemeStr != null && schemeStr.indexOf('+') < 0) {
-            sessionProtocol = SessionProtocol.find(schemeStr).orElseThrow(
-                    () -> new IllegalArgumentException("uri.scheme is not valid: " + uri));
-        } else {
-            sessionProtocol =
-                    Scheme.tryParse(schemeStr)
-                          .orElseThrow(() -> new IllegalArgumentException("uri.scheme is not valid: " + uri))
-                          .sessionProtocol();
-        }
+        sessionProtocol = getSessionProtocol(uri);
 
         final PathAndQuery pathAndQuery;
         if (uri.getRawQuery() != null) {
@@ -140,6 +140,27 @@ public abstract class AbstractRequestContextBuilder {
         checkArgument(pathAndQuery != null, "uri.path or uri.query is not valid: %s", uri);
         path = pathAndQuery.path();
         query = pathAndQuery.query();
+    }
+
+    private static SessionProtocol getSessionProtocol(URI uri) {
+        final String schemeStr = uri.getScheme();
+        if (schemeStr != null && schemeStr.indexOf('+') < 0) {
+            final SessionProtocol parsed = SessionProtocol.find(schemeStr);
+            if (parsed == null) {
+                throw newInvalidSchemeException(uri);
+            }
+            return parsed;
+        } else {
+            final Scheme parsed = Scheme.tryParse(schemeStr);
+            if (parsed == null) {
+                throw newInvalidSchemeException(uri);
+            }
+            return parsed.sessionProtocol();
+        }
+    }
+
+    private static IllegalArgumentException newInvalidSchemeException(URI uri) {
+        return new IllegalArgumentException("uri.scheme is not valid: " + uri);
     }
 
     /**
@@ -192,11 +213,19 @@ public abstract class AbstractRequestContextBuilder {
     }
 
     /**
-     * Returns the {@link Request} of the context.
+     * Returns the {@link HttpRequest} of the context.
      */
-    @SuppressWarnings("unchecked")
-    protected final <T extends Request> T request() {
-        return (T) request;
+    @Nullable
+    protected final HttpRequest request() {
+        return req;
+    }
+
+    /**
+     * Returns the {@link RpcRequest} of the context.
+     */
+    @Nullable
+    protected final RpcRequest rpcRequest() {
+        return rpcReq;
     }
 
     /**
@@ -216,7 +245,7 @@ public abstract class AbstractRequestContextBuilder {
      */
     public AbstractRequestContextBuilder sessionProtocol(SessionProtocol sessionProtocol) {
         requireNonNull(sessionProtocol, "sessionProtocol");
-        if (request instanceof RpcRequest) {
+        if (rpcReq != null) {
             checkArgument(sessionProtocol == this.sessionProtocol,
                           "sessionProtocol: %s (expected: same as the session protocol specified in 'uri')",
                           sessionProtocol);
@@ -229,7 +258,7 @@ public abstract class AbstractRequestContextBuilder {
     /**
      * Returns the remote socket address of the connection.
      */
-    protected final InetSocketAddress remoteAddress() {
+    protected final SocketAddress remoteAddress() {
         if (remoteAddress == null) {
             if (server) {
                 remoteAddress = new InetSocketAddress(NetUtil.LOCALHOST, randomClientPort());
@@ -245,7 +274,7 @@ public abstract class AbstractRequestContextBuilder {
      * Sets the remote socket address of the connection. If not set, it is auto-generated with the localhost
      * IP address (e.g. {@code "127.0.0.1"} or {@code "::1"}).
      */
-    public AbstractRequestContextBuilder remoteAddress(InetSocketAddress remoteAddress) {
+    public AbstractRequestContextBuilder remoteAddress(SocketAddress remoteAddress) {
         this.remoteAddress = requireNonNull(remoteAddress, "remoteAddress");
         return this;
     }
@@ -253,7 +282,7 @@ public abstract class AbstractRequestContextBuilder {
     /**
      * Returns the local socket address of the connection.
      */
-    protected final InetSocketAddress localAddress() {
+    protected final SocketAddress localAddress() {
         if (localAddress == null) {
             if (server) {
                 localAddress = new InetSocketAddress(NetUtil.LOCALHOST,
@@ -269,7 +298,7 @@ public abstract class AbstractRequestContextBuilder {
      * Sets the local socket address of the connection. If not set, it is auto-generated with the localhost
      * IP address (e.g. {@code "127.0.0.1"} or {@code "::1"}).
      */
-    public AbstractRequestContextBuilder localAddress(InetSocketAddress localAddress) {
+    public AbstractRequestContextBuilder localAddress(SocketAddress localAddress) {
         this.localAddress = requireNonNull(localAddress, "localAddress");
         return this;
     }
@@ -397,8 +426,8 @@ public abstract class AbstractRequestContextBuilder {
      */
     protected AbstractRequestContextBuilder method(HttpMethod method) {
         requireNonNull(method, "method");
-        if (request instanceof HttpRequest) {
-            checkArgument(method == ((HttpRequest) request).method(),
+        if (req != null) {
+            checkArgument(method == req.method(),
                           "method: %s (expected: same as request.method)", method);
         } else {
             this.method = method;
@@ -421,6 +450,25 @@ public abstract class AbstractRequestContextBuilder {
     }
 
     /**
+     * Sets the {@link RequestId}.
+     * If not set, a random {@link RequestId} is generated with {@link RequestId#random()}.
+     */
+    public AbstractRequestContextBuilder id(RequestId id) {
+        this.id = requireNonNull(id, "id");
+        return this;
+    }
+
+    /**
+     * Returns the {@link RequestId}.
+     */
+    protected final RequestId id() {
+        if (id == null) {
+            id = RequestId.random();
+        }
+        return id;
+    }
+
+    /**
      * Returns the query part of the request, excluding the leading question mark ({@code '?'}).
      *
      * @return the query string, or {@code null} if there is no query.
@@ -440,17 +488,35 @@ public abstract class AbstractRequestContextBuilder {
         return channel;
     }
 
+    /**
+     * Returns whether a timeout is set.
+     */
+    protected final boolean timedOut() {
+        return timedOut;
+    }
+
+    /**
+     * Sets the specified {@code timedOut}. If the specified {@code timedOut} is {@code true},
+     * {@link RequestContext#isTimedOut()} will always return {@code true}.
+     * This is useful for checking the behavior of a {@link Service} and {@link Client}
+     * when a request exceeds a deadline.
+     */
+    public AbstractRequestContextBuilder timedOut(boolean timedOut) {
+        this.timedOut = timedOut;
+        return this;
+    }
+
     @SuppressWarnings("ComparableImplementedButEqualsNotOverridden")
-    private static class FakeChannel implements Channel {
+    private static final class FakeChannel implements Channel {
 
         private final ChannelId id = DefaultChannelId.newInstance();
         private final EventLoop eventLoop;
         private final ByteBufAllocator alloc;
-        private final InetSocketAddress remoteAddress;
-        private final InetSocketAddress localAddress;
+        private final SocketAddress remoteAddress;
+        private final SocketAddress localAddress;
 
         FakeChannel(EventLoop eventLoop, ByteBufAllocator alloc,
-                    InetSocketAddress remoteAddress, InetSocketAddress localAddress) {
+                    SocketAddress remoteAddress, SocketAddress localAddress) {
             this.eventLoop = eventLoop;
             this.alloc = alloc;
             this.remoteAddress = remoteAddress;
@@ -672,6 +738,11 @@ public abstract class AbstractRequestContextBuilder {
         @Override
         public int compareTo(Channel o) {
             return id().compareTo(o.id());
+        }
+
+        @Override
+        public String toString() {
+            return "[id: 0x" + id.asShortText() + ", L:" + localAddress + " - " + "R:" + remoteAddress + ']';
         }
     }
 }

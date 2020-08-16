@@ -16,29 +16,23 @@
 
 package com.linecorp.armeria.client;
 
-import static com.linecorp.armeria.client.ClientOption.DECORATION;
-import static com.linecorp.armeria.client.ClientOption.HTTP_HEADERS;
-import static com.linecorp.armeria.client.ClientOption.MAX_RESPONSE_LENGTH;
-import static com.linecorp.armeria.client.ClientOption.REQ_CONTENT_PREVIEWER_FACTORY;
-import static com.linecorp.armeria.client.ClientOption.RESPONSE_TIMEOUT_MILLIS;
-import static com.linecorp.armeria.client.ClientOption.RES_CONTENT_PREVIEWER_FACTORY;
-import static com.linecorp.armeria.client.ClientOption.WRITE_TIMEOUT_MILLIS;
 import static java.util.Objects.requireNonNull;
 
 import java.util.Arrays;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.Map;
-import java.util.Optional;
+import java.util.List;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
+import com.google.common.collect.ImmutableList;
+
+import com.linecorp.armeria.client.endpoint.EndpointGroup;
 import com.linecorp.armeria.common.Flags;
 import com.linecorp.armeria.common.HttpHeaderNames;
 import com.linecorp.armeria.common.HttpHeaders;
+import com.linecorp.armeria.common.RequestId;
 import com.linecorp.armeria.common.SessionProtocol;
-import com.linecorp.armeria.common.logging.ContentPreviewerFactory;
 import com.linecorp.armeria.common.util.AbstractOptions;
-import com.linecorp.armeria.internal.ArmeriaHttpUtil;
+import com.linecorp.armeria.internal.common.ArmeriaHttpUtil;
 
 import io.netty.handler.codec.http2.HttpConversionUtil.ExtensionHeaderNames;
 import io.netty.util.AsciiString;
@@ -46,56 +40,138 @@ import io.netty.util.AsciiString;
 /**
  * A set of {@link ClientOption}s and their respective values.
  */
-public final class ClientOptions extends AbstractOptions {
-
-    private static final Collection<AsciiString> BLACKLISTED_HEADER_NAMES =
-            Collections.unmodifiableCollection(Arrays.asList(
-                    HttpHeaderNames.CONNECTION,
-                    HttpHeaderNames.HOST,
-                    HttpHeaderNames.HTTP2_SETTINGS,
-                    HttpHeaderNames.METHOD,
-                    HttpHeaderNames.PATH,
-                    HttpHeaderNames.SCHEME,
-                    HttpHeaderNames.STATUS,
-                    HttpHeaderNames.TRANSFER_ENCODING,
-                    HttpHeaderNames.UPGRADE,
-                    ArmeriaHttpUtil.HEADER_NAME_KEEP_ALIVE,
-                    ArmeriaHttpUtil.HEADER_NAME_PROXY_CONNECTION,
-                    ExtensionHeaderNames.PATH.text(),
-                    ExtensionHeaderNames.SCHEME.text(),
-                    ExtensionHeaderNames.STREAM_DEPENDENCY_ID.text(),
-                    ExtensionHeaderNames.STREAM_ID.text(),
-                    ExtensionHeaderNames.STREAM_PROMISE_ID.text()));
-
-    private static final ClientOptionValue<?>[] DEFAULT_OPTIONS = {
-            WRITE_TIMEOUT_MILLIS.newValue(Flags.defaultWriteTimeoutMillis()),
-            RESPONSE_TIMEOUT_MILLIS.newValue(Flags.defaultResponseTimeoutMillis()),
-            MAX_RESPONSE_LENGTH.newValue(Flags.defaultMaxResponseLength()),
-            DECORATION.newValue(ClientDecoration.NONE),
-            HTTP_HEADERS.newValue(HttpHeaders.of())
-    };
+public final class ClientOptions
+        extends AbstractOptions<ClientOption<Object>, ClientOptionValue<Object>> {
 
     /**
-     * The default {@link ClientOptions}.
+     * The {@link ClientFactory} used for creating a client.
      */
-    public static final ClientOptions DEFAULT = new ClientOptions(DEFAULT_OPTIONS);
+    public static final ClientOption<ClientFactory> FACTORY =
+            ClientOption.define("FACTORY", ClientFactory.ofDefault());
 
     /**
-     * Returns the {@link ClientOptions} with the specified {@link ClientOptionValue}s.
+     * The timeout of a socket write.
      */
-    public static ClientOptions of(ClientOptionValue<?>... options) {
-        requireNonNull(options, "options");
-        if (options.length == 0) {
-            return DEFAULT;
-        }
-        return new ClientOptions(DEFAULT, options);
+    public static final ClientOption<Long> WRITE_TIMEOUT_MILLIS =
+            ClientOption.define("WRITE_TIMEOUT_MILLIS", Flags.defaultWriteTimeoutMillis());
+
+    /**
+     * The timeout of a server reply to a client call.
+     */
+    public static final ClientOption<Long> RESPONSE_TIMEOUT_MILLIS =
+            ClientOption.define("RESPONSE_TIMEOUT_MILLIS", Flags.defaultResponseTimeoutMillis());
+
+    /**
+     * The maximum allowed length of a server response.
+     */
+    public static final ClientOption<Long> MAX_RESPONSE_LENGTH =
+            ClientOption.define("MAX_RESPONSE_LENGTH", Flags.defaultMaxResponseLength());
+
+    /**
+     * The {@link Function} that decorates the client components.
+     */
+    public static final ClientOption<ClientDecoration> DECORATION =
+            ClientOption.define("DECORATION", ClientDecoration.of(), Function.identity(),
+                                (oldValue, newValue) -> {
+                                    final ClientDecoration newDecoration = newValue.value();
+                                    if (newDecoration.isEmpty()) {
+                                        return oldValue;
+                                    }
+                                    final ClientDecoration oldDecoration = oldValue.value();
+                                    if (oldDecoration.isEmpty()) {
+                                        return newValue;
+                                    }
+                                    return newValue.option().newValue(
+                                            ClientDecoration.builder()
+                                                            .add(oldDecoration)
+                                                            .add(newDecoration)
+                                                            .build());
+                                });
+
+    /**
+     * The {@link Supplier} that generates a {@link RequestId}.
+     */
+    public static final ClientOption<Supplier<RequestId>> REQUEST_ID_GENERATOR = ClientOption.define(
+            "REQUEST_ID_GENERATOR", RequestId::random);
+
+    /**
+     * A {@link Function} that remaps a target {@link Endpoint} into an {@link EndpointGroup}.
+     *
+     * @see ClientBuilder#endpointRemapper(Function)
+     */
+    public static final ClientOption<Function<? super Endpoint, ? extends EndpointGroup>> ENDPOINT_REMAPPER =
+            ClientOption.define("ENDPOINT_REMAPPER", Function.identity());
+
+    private static final List<AsciiString> PROHIBITED_HEADER_NAMES = ImmutableList.of(
+            HttpHeaderNames.CONNECTION,
+            HttpHeaderNames.HOST,
+            HttpHeaderNames.HTTP2_SETTINGS,
+            HttpHeaderNames.METHOD,
+            HttpHeaderNames.PATH,
+            HttpHeaderNames.SCHEME,
+            HttpHeaderNames.STATUS,
+            HttpHeaderNames.TRANSFER_ENCODING,
+            HttpHeaderNames.UPGRADE,
+            ArmeriaHttpUtil.HEADER_NAME_KEEP_ALIVE,
+            ArmeriaHttpUtil.HEADER_NAME_PROXY_CONNECTION,
+            ExtensionHeaderNames.PATH.text(),
+            ExtensionHeaderNames.SCHEME.text(),
+            ExtensionHeaderNames.STREAM_DEPENDENCY_ID.text(),
+            ExtensionHeaderNames.STREAM_ID.text(),
+            ExtensionHeaderNames.STREAM_PROMISE_ID.text());
+
+    /**
+     * The additional HTTP headers to send with requests.
+     */
+    public static final ClientOption<HttpHeaders> HEADERS =
+            ClientOption.define("HEADERS", HttpHeaders.of(), newHeaders -> {
+                for (AsciiString name : PROHIBITED_HEADER_NAMES) {
+                    if (newHeaders.contains(name)) {
+                        throw new IllegalArgumentException("prohibited header name: " + name);
+                    }
+                }
+                return newHeaders;
+            }, (oldValue, newValue) -> {
+                final HttpHeaders newHeaders = newValue.value();
+                if (newHeaders.isEmpty()) {
+                    return oldValue;
+                }
+                final HttpHeaders oldHeaders = oldValue.value();
+                if (oldHeaders.isEmpty()) {
+                    return newValue;
+                }
+                return newValue.option().newValue(oldHeaders.toBuilder().set(newHeaders).build());
+            });
+
+    private static final ClientOptions EMPTY = new ClientOptions(ImmutableList.of());
+
+    /**
+     * Returns an empty singleton {@link ClientOptions}.
+     */
+    public static ClientOptions of() {
+        return EMPTY;
     }
 
     /**
      * Returns the {@link ClientOptions} with the specified {@link ClientOptionValue}s.
      */
-    public static ClientOptions of(Iterable<ClientOptionValue<?>> options) {
-        return new ClientOptions(DEFAULT, options);
+    public static ClientOptions of(ClientOptionValue<?>... values) {
+        requireNonNull(values, "values");
+        if (values.length == 0) {
+            return EMPTY;
+        }
+        return of(Arrays.asList(values));
+    }
+
+    /**
+     * Returns the {@link ClientOptions} with the specified {@link ClientOptionValue}s.
+     */
+    public static ClientOptions of(Iterable<? extends ClientOptionValue<?>> values) {
+        requireNonNull(values, "values");
+        if (values instanceof ClientOptions) {
+            return (ClientOptions) values;
+        }
+        return new ClientOptions(values);
     }
 
     /**
@@ -103,14 +179,13 @@ public final class ClientOptions extends AbstractOptions {
      *
      * @return the merged {@link ClientOptions}
      */
-    public static ClientOptions of(ClientOptions baseOptions, ClientOptionValue<?>... options) {
-        // TODO(trustin): Reduce the cost of creating a derived ClientOptions.
+    public static ClientOptions of(ClientOptions baseOptions, ClientOptionValue<?>... additionalValues) {
         requireNonNull(baseOptions, "baseOptions");
-        requireNonNull(options, "options");
-        if (options.length == 0) {
+        requireNonNull(additionalValues, "additionalValues");
+        if (additionalValues.length == 0) {
             return baseOptions;
         }
-        return new ClientOptions(baseOptions, options);
+        return new ClientOptions(baseOptions, Arrays.asList(additionalValues));
     }
 
     /**
@@ -118,168 +193,92 @@ public final class ClientOptions extends AbstractOptions {
      *
      * @return the merged {@link ClientOptions}
      */
-    public static ClientOptions of(ClientOptions baseOptions, Iterable<ClientOptionValue<?>> options) {
-        // TODO(trustin): Reduce the cost of creating a derived ClientOptions.
+    public static ClientOptions of(ClientOptions baseOptions,
+                                   Iterable<? extends ClientOptionValue<?>> additionalValues) {
         requireNonNull(baseOptions, "baseOptions");
-        requireNonNull(options, "options");
-        return new ClientOptions(baseOptions, options);
+        requireNonNull(additionalValues, "additionalValues");
+        return new ClientOptions(baseOptions, additionalValues);
     }
 
     /**
-     * Merges the specified two {@link ClientOptions} into one.
-     *
-     * @return the merged {@link ClientOptions}
+     * Returns a newly created {@link ClientOptionsBuilder}.
      */
-    public static ClientOptions of(ClientOptions baseOptions, ClientOptions options) {
-        // TODO(trustin): Reduce the cost of creating a derived ClientOptions.
-        requireNonNull(baseOptions, "baseOptions");
-        requireNonNull(options, "options");
-        return new ClientOptions(baseOptions, options);
+    public static ClientOptionsBuilder builder() {
+        return new ClientOptionsBuilder();
     }
 
-    private static <T> ClientOptionValue<T> filterValue(ClientOptionValue<T> optionValue) {
-        requireNonNull(optionValue, "optionValue");
-
-        final ClientOption<?> option = optionValue.option();
-        final T value = optionValue.value();
-
-        if (option == HTTP_HEADERS) {
-            @SuppressWarnings("unchecked")
-            final ClientOption<HttpHeaders> castOption = (ClientOption<HttpHeaders>) option;
-            @SuppressWarnings("unchecked")
-            final ClientOptionValue<T> castOptionValue =
-                    (ClientOptionValue<T>) castOption.newValue(filterHttpHeaders((HttpHeaders) value));
-            optionValue = castOptionValue;
-        }
-        return optionValue;
+    private ClientOptions(Iterable<? extends ClientOptionValue<?>> values) {
+        super(values);
     }
 
-    private static HttpHeaders filterHttpHeaders(HttpHeaders headers) {
-        requireNonNull(headers, "headers");
-        for (AsciiString name : BLACKLISTED_HEADER_NAMES) {
-            if (headers.contains(name)) {
-                throw new IllegalArgumentException("unallowed header name: " + name);
-            }
-        }
-
-        return headers;
-    }
-
-    private ClientOptions(ClientOptionValue<?>... options) {
-        super(ClientOptions::filterValue, options);
-    }
-
-    private ClientOptions(ClientOptions clientOptions, ClientOptionValue<?>... options) {
-        super(ClientOptions::filterValue, clientOptions, options);
-    }
-
-    private ClientOptions(ClientOptions clientOptions, Iterable<ClientOptionValue<?>> options) {
-        super(ClientOptions::filterValue, clientOptions, options);
-    }
-
-    private ClientOptions(ClientOptions clientOptions, ClientOptions options) {
-        super(clientOptions, options);
+    private ClientOptions(ClientOptions baseOptions,
+                          Iterable<? extends ClientOptionValue<?>> additionalValues) {
+        super(baseOptions, additionalValues);
     }
 
     /**
-     * Returns the value of the specified {@link ClientOption}.
-     *
-     * @return the value of the {@link ClientOption}, or
-     *         {@link Optional#empty()} if the default value of the specified {@link ClientOption} is not
-     *         available
+     * Returns the {@link ClientFactory} used for creating a client.
      */
-    public <T> Optional<T> get(ClientOption<T> option) {
-        return get0(option);
-    }
-
-    /**
-     * Returns the value of the specified {@link ClientOption}.
-     *
-     * @return the value of the {@link ClientOption}, or
-     *         {@code defaultValue} if the specified {@link ClientOption} is not set.
-     */
-    public <T> T getOrElse(ClientOption<T> option, T defaultValue) {
-        return getOrElse0(option, defaultValue);
-    }
-
-    /**
-     * Converts this {@link ClientOptions} to a {@link Map}.
-     */
-    public Map<ClientOption<Object>, ClientOptionValue<Object>> asMap() {
-        return asMap0();
-    }
-
-    /**
-     * Returns the timeout of a socket write.
-     *
-     * @deprecated Use {@link #writeTimeoutMillis()}.
-     */
-    @Deprecated
-    public long defaultWriteTimeoutMillis() {
-        return writeTimeoutMillis();
+    public ClientFactory factory() {
+        return get(FACTORY);
     }
 
     /**
      * Returns the timeout of a socket write.
      */
     public long writeTimeoutMillis() {
-        return getOrElse(WRITE_TIMEOUT_MILLIS, Flags.defaultWriteTimeoutMillis());
-    }
-
-    /**
-     * Returns the timeout of a server reply to a client call.
-     *
-     * @deprecated Use {@link #responseTimeoutMillis()}.
-     */
-    @Deprecated
-    public long defaultResponseTimeoutMillis1() {
-        return responseTimeoutMillis();
+        return get(WRITE_TIMEOUT_MILLIS);
     }
 
     /**
      * Returns the timeout of a server reply to a client call.
      */
     public long responseTimeoutMillis() {
-        return getOrElse(RESPONSE_TIMEOUT_MILLIS, Flags.defaultResponseTimeoutMillis());
-    }
-
-    /**
-     * Returns the maximum allowed length of a server response.
-     *
-     * @deprecated Use {@link #maxResponseLength()}.
-     */
-    @Deprecated
-    public long defaultMaxResponseLength() {
-        return maxResponseLength();
+        return get(RESPONSE_TIMEOUT_MILLIS);
     }
 
     /**
      * Returns the maximum allowed length of a server response.
      */
     public long maxResponseLength() {
-        return getOrElse(MAX_RESPONSE_LENGTH, Flags.defaultMaxResponseLength());
+        return get(MAX_RESPONSE_LENGTH);
     }
 
     /**
      * Returns the {@link Function}s that decorate the components of a client.
      */
     public ClientDecoration decoration() {
-        return getOrElse(DECORATION, ClientDecoration.NONE);
+        return get(DECORATION);
     }
 
     /**
      * Returns the additional HTTP headers to send with requests. Used only when the underlying
      * {@link SessionProtocol} is HTTP.
      */
-    public HttpHeaders httpHeaders() {
-        return getOrElse(HTTP_HEADERS, HttpHeaders.of());
+    public HttpHeaders headers() {
+        return get(HEADERS);
     }
 
-    public ContentPreviewerFactory requestContentPreviewerFactory() {
-        return getOrElse(REQ_CONTENT_PREVIEWER_FACTORY, ContentPreviewerFactory.disabled());
+    /**
+     * Returns the {@link Supplier} that generates a {@link RequestId}.
+     */
+    public Supplier<RequestId> requestIdGenerator() {
+        return get(REQUEST_ID_GENERATOR);
     }
 
-    public ContentPreviewerFactory responseContentPreviewerFactory() {
-        return getOrElse(RES_CONTENT_PREVIEWER_FACTORY, ContentPreviewerFactory.disabled());
+    /**
+     * Returns the {@link Function} that remaps a target {@link Endpoint} into an {@link EndpointGroup}.
+     *
+     * @see ClientBuilder#endpointRemapper(Function)
+     */
+    public Function<? super Endpoint, ? extends EndpointGroup> endpointRemapper() {
+        return get(ENDPOINT_REMAPPER);
+    }
+
+    /**
+     * Returns a new {@link ClientOptionsBuilder} created from this {@link ClientOptions}.
+     */
+    public ClientOptionsBuilder toBuilder() {
+        return new ClientOptionsBuilder(this);
     }
 }

@@ -15,9 +15,9 @@
  */
 package com.linecorp.armeria.server.healthcheck;
 
-import static com.linecorp.armeria.testing.internal.TestUtil.withTimeout;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.awaitility.Awaitility.await;
 
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -28,16 +28,19 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 
+import com.google.common.collect.ImmutableList;
 import com.google.common.io.ByteStreams;
 
-import com.linecorp.armeria.client.HttpClient;
+import com.linecorp.armeria.client.WebClient;
 import com.linecorp.armeria.common.AggregatedHttpResponse;
 import com.linecorp.armeria.common.HttpData;
 import com.linecorp.armeria.common.HttpHeaderNames;
+import com.linecorp.armeria.common.HttpHeaders;
 import com.linecorp.armeria.common.HttpMethod;
 import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.MediaType;
@@ -45,7 +48,7 @@ import com.linecorp.armeria.common.RequestHeaders;
 import com.linecorp.armeria.common.ResponseHeaders;
 import com.linecorp.armeria.server.HttpStatusException;
 import com.linecorp.armeria.server.ServerBuilder;
-import com.linecorp.armeria.testing.junit.server.ServerExtension;
+import com.linecorp.armeria.testing.junit5.server.ServerExtension;
 
 import io.netty.util.NetUtil;
 
@@ -94,6 +97,8 @@ class HealthCheckServiceTest {
                                          })
                                          .build());
             sb.gracefulShutdownTimeout(Duration.ofSeconds(10), Duration.ofSeconds(10));
+            sb.disableServerHeader();
+            sb.disableDateHeader();
         }
     };
 
@@ -102,12 +107,29 @@ class HealthCheckServiceTest {
         checker.setHealthy(true);
     }
 
+    @AfterEach
+    void ensureNoPendingResponses() {
+        server.server().serviceConfigs().forEach(cfg -> {
+            final HealthCheckService service = cfg.service().as(HealthCheckService.class);
+            if (service != null) {
+                await().untilAsserted(() -> {
+                    if (service.pendingHealthyResponses != null) {
+                        assertThat(service.pendingHealthyResponses).isEmpty();
+                    }
+                    if (service.pendingUnhealthyResponses != null) {
+                        assertThat(service.pendingUnhealthyResponses).isEmpty();
+                    }
+                });
+            }
+        });
+    }
+
     @Test
     void getWhenHealthy() throws Exception {
         assertResponseEquals("GET /hc HTTP/1.0",
                              "HTTP/1.1 200 OK\r\n" +
                              "content-type: application/json; charset=utf-8\r\n" +
-                             "armeria-lphc: 60\r\n" +
+                             "armeria-lphc: 60, 5\r\n" +
                              "content-length: 16\r\n\r\n" +
                              "{\"healthy\":true}");
     }
@@ -118,7 +140,7 @@ class HealthCheckServiceTest {
         assertResponseEquals("GET /hc HTTP/1.0",
                              "HTTP/1.1 503 Service Unavailable\r\n" +
                              "content-type: application/json; charset=utf-8\r\n" +
-                             "armeria-lphc: 60\r\n" +
+                             "armeria-lphc: 60, 5\r\n" +
                              "content-length: 17\r\n\r\n" +
                              "{\"healthy\":false}");
     }
@@ -128,7 +150,7 @@ class HealthCheckServiceTest {
         assertResponseEquals("HEAD /hc HTTP/1.0",
                              "HTTP/1.1 200 OK\r\n" +
                              "content-type: application/json; charset=utf-8\r\n" +
-                             "armeria-lphc: 60\r\n" +
+                             "armeria-lphc: 60, 5\r\n" +
                              "content-length: 16\r\n\r\n");
     }
 
@@ -138,7 +160,7 @@ class HealthCheckServiceTest {
         assertResponseEquals("HEAD /hc HTTP/1.0",
                              "HTTP/1.1 503 Service Unavailable\r\n" +
                              "content-type: application/json; charset=utf-8\r\n" +
-                             "armeria-lphc: 60\r\n" +
+                             "armeria-lphc: 60, 5\r\n" +
                              "content-length: 17\r\n\r\n");
     }
 
@@ -166,11 +188,15 @@ class HealthCheckServiceTest {
 
         // Make the server unhealthy so the response comes in.
         checker.setHealthy(false);
-        withTimeout(() -> assertThat(f.join()).isEqualTo(AggregatedHttpResponse.of(
+        assertThat(f.join()).isEqualTo(AggregatedHttpResponse.of(
+                ImmutableList.of(ResponseHeaders.builder(HttpStatus.PROCESSING)
+                                                .set("armeria-lphc", "60, 5")
+                                                .build()),
                 ResponseHeaders.of(HttpStatus.SERVICE_UNAVAILABLE,
                                    HttpHeaderNames.CONTENT_TYPE, MediaType.JSON_UTF_8,
-                                   "armeria-lphc", 60),
-                HttpData.ofUtf8("{\"healthy\":false}"))));
+                                   "armeria-lphc", "60, 5"),
+                HttpData.ofUtf8("{\"healthy\":false}"),
+                HttpHeaders.of()));
     }
 
     @Test
@@ -181,15 +207,15 @@ class HealthCheckServiceTest {
         final CompletableFuture<AggregatedHttpResponse> f = sendLongPollingGet("healthy");
 
         // The server is unhealthy already, so the response has to come in immediately.
-        withTimeout(() -> assertThat(f.get()).isEqualTo(AggregatedHttpResponse.of(
+        assertThat(f.get()).isEqualTo(AggregatedHttpResponse.of(
                 ResponseHeaders.of(HttpStatus.SERVICE_UNAVAILABLE,
                                    HttpHeaderNames.CONTENT_TYPE, MediaType.JSON_UTF_8,
-                                   "armeria-lphc", 60),
-                HttpData.ofUtf8("{\"healthy\":false}"))));
+                                   "armeria-lphc", "60, 5"),
+                HttpData.ofUtf8("{\"healthy\":false}")));
     }
 
     @Test
-    void waitUntilHealthy() {
+    void waitUntilHealthy() throws Exception {
         // Make the server unhealthy.
         checker.setHealthy(false);
 
@@ -201,11 +227,15 @@ class HealthCheckServiceTest {
 
         // Make the server healthy so the response comes in.
         checker.setHealthy(true);
-        withTimeout(() -> assertThat(f.get()).isEqualTo(AggregatedHttpResponse.of(
+        assertThat(f.get()).isEqualTo(AggregatedHttpResponse.of(
+                ImmutableList.of(ResponseHeaders.builder(HttpStatus.PROCESSING)
+                                                .set("armeria-lphc", "60, 5")
+                                                .build()),
                 ResponseHeaders.of(HttpStatus.OK,
                                    HttpHeaderNames.CONTENT_TYPE, MediaType.JSON_UTF_8,
-                                   "armeria-lphc", 60),
-                HttpData.ofUtf8("{\"healthy\":true}"))));
+                                   "armeria-lphc", "60, 5"),
+                HttpData.ofUtf8("{\"healthy\":true}"),
+                HttpHeaders.of()));
     }
 
     @Test
@@ -213,59 +243,56 @@ class HealthCheckServiceTest {
         final CompletableFuture<AggregatedHttpResponse> f = sendLongPollingGet("unhealthy");
 
         // The server is healthy already, so the response has to come in immediately.
-        withTimeout(() -> assertThat(f.get()).isEqualTo(AggregatedHttpResponse.of(
+        assertThat(f.get()).isEqualTo(AggregatedHttpResponse.of(
                 ResponseHeaders.of(HttpStatus.OK,
                                    HttpHeaderNames.CONTENT_TYPE, MediaType.JSON_UTF_8,
-                                   "armeria-lphc", 60),
-                HttpData.ofUtf8("{\"healthy\":true}"))));
+                                   "armeria-lphc", "60, 5"),
+                HttpData.ofUtf8("{\"healthy\":true}")));
     }
 
     @Test
     void waitTimeout() throws Exception {
-        withTimeout(() -> {
-            final AggregatedHttpResponse res = sendLongPollingGet("healthy", 1).get();
-            assertThat(res).isEqualTo(AggregatedHttpResponse.of(
-                    ResponseHeaders.builder()
-                                   .endOfStream(true)
-                                   .status(HttpStatus.NOT_MODIFIED)
-                                   .contentType(MediaType.JSON_UTF_8)
-                                   .setInt("armeria-lphc", 60)
-                                   .build()));
-        });
+        final AggregatedHttpResponse res = sendLongPollingGet("healthy", 1).get();
+        assertThat(res).isEqualTo(AggregatedHttpResponse.of(
+                ImmutableList.of(ResponseHeaders.builder(HttpStatus.PROCESSING)
+                                                .set("armeria-lphc", "60, 5")
+                                                .build()),
+                ResponseHeaders.builder()
+                               .endOfStream(true)
+                               .status(HttpStatus.NOT_MODIFIED)
+                               .contentType(MediaType.JSON_UTF_8)
+                               .set("armeria-lphc", "60, 5")
+                               .build(),
+                HttpData.empty(),
+                HttpHeaders.of()));
     }
 
     @Test
     void waitWithWrongMethod() throws Exception {
-        withTimeout(() -> {
-            final HttpClient client = HttpClient.of(server.httpUri("/"));
-            final CompletableFuture<AggregatedHttpResponse> f = client.execute(
-                    RequestHeaders.of(HttpMethod.POST, "/hc_custom",
-                                      HttpHeaderNames.PREFER, "wait=60",
-                                      HttpHeaderNames.IF_NONE_MATCH, "\"healthy\"")).aggregate();
-            assertThat(f.get().status()).isEqualTo(HttpStatus.METHOD_NOT_ALLOWED);
-        });
+        final WebClient client = WebClient.of(server.httpUri());
+        final CompletableFuture<AggregatedHttpResponse> f = client.execute(
+                RequestHeaders.of(HttpMethod.POST, "/hc_custom",
+                                  HttpHeaderNames.PREFER, "wait=60",
+                                  HttpHeaderNames.IF_NONE_MATCH, "\"healthy\"")).aggregate();
+        assertThat(f.get().status()).isEqualTo(HttpStatus.METHOD_NOT_ALLOWED);
     }
 
     @Test
     void waitWithWrongTimeout() throws Exception {
-        withTimeout(() -> {
-            final AggregatedHttpResponse res = sendLongPollingGet("healthy", -1).get();
-            assertThat(res.status()).isEqualTo(HttpStatus.BAD_REQUEST);
-        });
+        final AggregatedHttpResponse res = sendLongPollingGet("healthy", -1).get();
+        assertThat(res.status()).isEqualTo(HttpStatus.BAD_REQUEST);
     }
 
     @Test
     void waitWithOtherETag() throws Exception {
-        withTimeout(() -> {
-            // A never-matching etag must disable polling.
-            final AggregatedHttpResponse res = sendLongPollingGet("whatever", 1).get();
-            assertThat(res.status()).isEqualTo(HttpStatus.OK);
-        });
+        // A never-matching etag must disable polling.
+        final AggregatedHttpResponse res = sendLongPollingGet("whatever", 1).get();
+        assertThat(res.status()).isEqualTo(HttpStatus.OK);
     }
 
     @Test
     void longPollingDisabled() throws Exception {
-        final HttpClient client = HttpClient.of(server.httpUri("/"));
+        final WebClient client = WebClient.of(server.httpUri());
         final CompletableFuture<AggregatedHttpResponse> f = client.execute(
                 RequestHeaders.of(HttpMethod.GET, "/hc_long_polling_disabled",
                                   HttpHeaderNames.PREFER, "wait=60",
@@ -273,13 +300,13 @@ class HealthCheckServiceTest {
         assertThat(f.get(10, TimeUnit.SECONDS)).isEqualTo(AggregatedHttpResponse.of(
                 ResponseHeaders.of(HttpStatus.OK,
                                    HttpHeaderNames.CONTENT_TYPE, MediaType.JSON_UTF_8,
-                                   "armeria-lphc", 0),
+                                   "armeria-lphc", "0, 0"),
                 HttpData.ofUtf8("{\"healthy\":true}")));
     }
 
     @Test
     void notUpdatableByDefault() throws Exception {
-        final HttpClient client = HttpClient.of(server.httpUri("/"));
+        final WebClient client = WebClient.of(server.httpUri());
         final AggregatedHttpResponse res = client.execute(RequestHeaders.of(HttpMethod.POST, "/hc"),
                                                           "{\"healthy\":false}").aggregate().join();
         assertThat(res.status()).isEqualTo(HttpStatus.METHOD_NOT_ALLOWED);
@@ -287,7 +314,7 @@ class HealthCheckServiceTest {
 
     @Test
     void updateUsingPutOrPost() {
-        final HttpClient client = HttpClient.of(server.httpUri("/"));
+        final WebClient client = WebClient.of(server.httpUri());
 
         // Make unhealthy.
         final AggregatedHttpResponse res1 = client.execute(RequestHeaders.of(HttpMethod.PUT, "/hc_updatable"),
@@ -295,7 +322,7 @@ class HealthCheckServiceTest {
         assertThat(res1).isEqualTo(AggregatedHttpResponse.of(
                 ResponseHeaders.of(HttpStatus.SERVICE_UNAVAILABLE,
                                    HttpHeaderNames.CONTENT_TYPE, MediaType.JSON_UTF_8,
-                                   "armeria-lphc", 60),
+                                   "armeria-lphc", "60, 5"),
                 HttpData.ofUtf8("{\"healthy\":false}")));
 
         // Make healthy.
@@ -304,13 +331,13 @@ class HealthCheckServiceTest {
         assertThat(res2).isEqualTo(AggregatedHttpResponse.of(
                 ResponseHeaders.of(HttpStatus.OK,
                                    HttpHeaderNames.CONTENT_TYPE, MediaType.JSON_UTF_8,
-                                   "armeria-lphc", 60),
+                                   "armeria-lphc", "60, 5"),
                 HttpData.ofUtf8("{\"healthy\":true}")));
     }
 
     @Test
     void updateUsingPatch() {
-        final HttpClient client = HttpClient.of(server.httpUri("/"));
+        final WebClient client = WebClient.of(server.httpUri());
 
         // Make unhealthy.
         final AggregatedHttpResponse res1 = client.execute(
@@ -319,7 +346,7 @@ class HealthCheckServiceTest {
         assertThat(res1).isEqualTo(AggregatedHttpResponse.of(
                 ResponseHeaders.of(HttpStatus.SERVICE_UNAVAILABLE,
                                    HttpHeaderNames.CONTENT_TYPE, MediaType.JSON_UTF_8,
-                                   "armeria-lphc", 60),
+                                   "armeria-lphc", "60, 5"),
                 HttpData.ofUtf8("{\"healthy\":false}")));
 
         // Make healthy.
@@ -329,13 +356,13 @@ class HealthCheckServiceTest {
         assertThat(res2).isEqualTo(AggregatedHttpResponse.of(
                 ResponseHeaders.of(HttpStatus.OK,
                                    HttpHeaderNames.CONTENT_TYPE, MediaType.JSON_UTF_8,
-                                   "armeria-lphc", 60),
+                                   "armeria-lphc", "60, 5"),
                 HttpData.ofUtf8("{\"healthy\":true}")));
     }
 
     @Test
     void custom() {
-        final HttpClient client = HttpClient.of(server.httpUri("/"));
+        final WebClient client = WebClient.of(server.httpUri());
 
         // Make unhealthy.
         final AggregatedHttpResponse res1 = client.execute(RequestHeaders.of(HttpMethod.PUT, "/hc_custom"),
@@ -343,7 +370,7 @@ class HealthCheckServiceTest {
         assertThat(res1).isEqualTo(AggregatedHttpResponse.of(
                 ResponseHeaders.of(HttpStatus.SERVICE_UNAVAILABLE,
                                    HttpHeaderNames.CONTENT_TYPE, MediaType.PLAIN_TEXT_UTF_8,
-                                   "armeria-lphc", 60),
+                                   "armeria-lphc", "60, 5"),
                 HttpData.ofUtf8("not ok")));
 
         // Make healthy.
@@ -352,7 +379,7 @@ class HealthCheckServiceTest {
         assertThat(res2).isEqualTo(AggregatedHttpResponse.of(
                 ResponseHeaders.of(HttpStatus.OK,
                                    HttpHeaderNames.CONTENT_TYPE, MediaType.PLAIN_TEXT_UTF_8,
-                                   "armeria-lphc", 60),
+                                   "armeria-lphc", "60, 5"),
                 HttpData.ofUtf8("ok")));
 
         // Send a no-op request.
@@ -361,13 +388,13 @@ class HealthCheckServiceTest {
         assertThat(res3).isEqualTo(AggregatedHttpResponse.of(
                 ResponseHeaders.of(HttpStatus.OK,
                                    HttpHeaderNames.CONTENT_TYPE, MediaType.PLAIN_TEXT_UTF_8,
-                                   "armeria-lphc", 60),
+                                   "armeria-lphc", "60, 5"),
                 HttpData.ofUtf8("ok")));
     }
 
     @Test
     void customError() {
-        final HttpClient client = HttpClient.of(server.httpUri("/"));
+        final WebClient client = WebClient.of(server.httpUri());
 
         // Use an unsupported method.
         final AggregatedHttpResponse res1 = client.execute(RequestHeaders.of(HttpMethod.PATCH, "/hc_custom"))
@@ -386,7 +413,7 @@ class HealthCheckServiceTest {
 
     private static CompletableFuture<AggregatedHttpResponse> sendLongPollingGet(String healthiness,
                                                                                 int timeoutSeconds) {
-        final HttpClient client = HttpClient.of(server.httpUri("/"));
+        final WebClient client = WebClient.of(server.httpUri());
         return client.execute(RequestHeaders.of(HttpMethod.GET, "/hc",
                                                 HttpHeaderNames.PREFER, "wait=" + timeoutSeconds,
                                                 HttpHeaderNames.IF_NONE_MATCH,

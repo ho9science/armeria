@@ -1,7 +1,5 @@
 package example.armeria.server.annotated;
 
-import java.net.InetSocketAddress;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -22,11 +20,9 @@ public class Main {
         }));
 
         server.start().join();
-        final InetSocketAddress localAddress = server.activePort().get().localAddress();
-        final boolean isLocalAddress = localAddress.getAddress().isAnyLocalAddress() ||
-                                       localAddress.getAddress().isLoopbackAddress();
-        logger.info("Server has been started. Serving DocService at http://{}:{}/docs",
-                    isLocalAddress ? "127.0.0.1" : localAddress.getHostString(), localAddress.getPort());
+
+        logger.info("Server has been started. Serving DocService at http://127.0.0.1:{}/docs",
+                    server.activeLocalPort());
     }
 
     /**
@@ -35,7 +31,7 @@ public class Main {
      * @param port the port that the server is to be bound to
      */
     static Server newServer(int port) {
-        final ServerBuilder sb = new ServerBuilder();
+        final ServerBuilder sb = Server.builder();
         return sb.http(port)
                  .annotatedService("/pathPattern", new PathPatternService())
                  .annotatedService("/injection", new InjectionService())

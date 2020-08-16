@@ -1,5 +1,0 @@
-dependencies {
-    compile project(':testing:common')
-
-    compile 'org.junit.jupiter:junit-jupiter-api'
-}

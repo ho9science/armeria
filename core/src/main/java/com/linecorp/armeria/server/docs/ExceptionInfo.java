@@ -31,9 +31,12 @@ import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSortedSet;
 
+import com.linecorp.armeria.common.annotation.UnstableApi;
+
 /**
  * Metadata about an exception type.
  */
+@UnstableApi
 public final class ExceptionInfo implements NamedTypeInfo {
 
     private final String name;
@@ -83,7 +86,7 @@ public final class ExceptionInfo implements NamedTypeInfo {
     }
 
     @Override
-    public boolean equals(Object o) {
+    public boolean equals(@Nullable Object o) {
         if (this == o) {
             return true;
         }

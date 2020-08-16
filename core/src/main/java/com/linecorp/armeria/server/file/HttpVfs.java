@@ -13,15 +13,16 @@
  * License for the specific language governing permissions and limitations
  * under the License.
  */
-
 package com.linecorp.armeria.server.file;
 
 import static java.util.Objects.requireNonNull;
 
+import java.io.File;
 import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.time.Clock;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 
 import javax.annotation.Nullable;
 
@@ -31,42 +32,37 @@ import io.micrometer.core.instrument.Meter;
 import io.micrometer.core.instrument.Tag;
 
 /**
- * A virtual file system that provides the files requested by {@link HttpFileService}.
+ * A virtual file system that provides the files requested by {@link FileService}.
  */
 public interface HttpVfs {
 
     /**
      * Creates a new {@link HttpVfs} with the specified {@code rootDir} in an O/S file system.
      */
-    static HttpVfs ofFileSystem(String rootDir) {
-        return new FileSystemHttpVfs(Paths.get(requireNonNull(rootDir, "rootDir")));
+    static HttpVfs of(File rootDir) {
+        return of(requireNonNull(rootDir, "rootDir").toPath());
     }
 
     /**
      * Creates a new {@link HttpVfs} with the specified {@code rootDir} in an O/S file system.
      */
-    static HttpVfs ofFileSystem(Path rootDir) {
-        return new FileSystemHttpVfs(rootDir);
+    static HttpVfs of(Path rootDir) {
+        return new FileSystemHttpVfs(requireNonNull(rootDir, "rootDir"));
     }
 
     /**
      * Creates a new {@link HttpVfs} with the specified {@code rootDir} in the current class path.
      */
-    static HttpVfs ofClassPath(String rootDir) {
-        return ofClassPath(HttpVfs.class.getClassLoader(), rootDir);
-    }
-
-    /**
-     * Creates a new {@link HttpVfs} with the specified {@code rootDir} in the current class path.
-     */
-    static HttpVfs ofClassPath(ClassLoader classLoader, String rootDir) {
-        return new ClassPathHttpVfs(classLoader, rootDir);
+    static HttpVfs of(ClassLoader classLoader, String rootDir) {
+        return new ClassPathHttpVfs(requireNonNull(classLoader, "classLoader"),
+                                    requireNonNull(rootDir, "rootDir"));
     }
 
     /**
      * Finds the file at the specified {@code path}.
      *
-     * @param path an absolute path whose component separator is {@code '/'}
+     * @param fileReadExecutor the {@link Executor} which will perform the read operations against the file
+     * @param path an absolute path that starts with {@code '/'}, whose component separator is {@code '/'}
      * @param clock the {@link Clock} which provides the current date and time
      * @param contentEncoding the desired {@code 'content-encoding'} header value of the file.
      *                        {@code null} to omit the header.
@@ -74,26 +70,30 @@ public interface HttpVfs {
      *
      * @return the {@link HttpFile} at the specified {@code path}
      */
-    HttpFile get(String path, Clock clock, @Nullable String contentEncoding, HttpHeaders additionalHeaders);
+    HttpFile get(Executor fileReadExecutor, String path, Clock clock,
+                 @Nullable String contentEncoding, HttpHeaders additionalHeaders);
 
     /**
-     * Returns whether the file at the specified {@code path} is a directory.
+     * Returns whether the file at the specified {@code path} is a listable directory.
      *
-     * @param path an absolute path whose component separator is {@code '/'}.
-     * @return {@code true} if the file is a directory. {@code false} if the directory does not exist or
-     *         the file listing is not available.
+     * @param fileReadExecutor the {@link Executor} which will perform the read operations against the file
+     * @param path an absolute path that starts with {@code '/'}, whose component separator is {@code '/'}
+     * @return the {@link CompletableFuture} that will be completed with {@code true} if the file is
+     *         a listable directory. It will be completed with {@code false} if the directory does not exist
+     *         or the file listing is not available.
      */
-    boolean canList(String path);
+    CompletableFuture<Boolean> canList(Executor fileReadExecutor, String path);
 
     /**
      * Lists the files at the specified directory {@code path} non-recursively.
      *
-     * @param path an absolute path whose component separator is {@code '/'}.
-     * @return the list of the file names. If the file is a directory, the file name will end with
-     *         {@code '/'}. If the directory does not exist or the file listing is not available,
-     *         an empty {@link List} is returned.
+     * @param fileReadExecutor the {@link Executor} which will perform the read operations against the file
+     * @param path an absolute path that starts with {@code '/'}, whose component separator is {@code '/'}
+     * @return the {@link CompletableFuture} that will be completed with the list of the file names.
+     *         If the file is a directory, the file name will end with {@code '/'}. If the directory does not
+     *         exist or the file listing is not available, it will be completed with an empty {@link List}.
      */
-    List<String> list(String path);
+    CompletableFuture<List<String>> list(Executor fileReadExecutor, String path);
 
     /**
      * Returns the value of the {@code "vfs"} {@link Tag} in a {@link Meter}.

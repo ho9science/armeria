@@ -18,39 +18,35 @@ package com.linecorp.armeria.client.circuitbreaker;
 
 import java.util.function.Function;
 
-import com.linecorp.armeria.client.Client;
-import com.linecorp.armeria.common.RpcRequest;
+import com.linecorp.armeria.client.RpcClient;
 import com.linecorp.armeria.common.RpcResponse;
 
 /**
  * Builds a new {@link CircuitBreakerRpcClient} or its decorator function.
  */
 public final class CircuitBreakerRpcClientBuilder
-        extends CircuitBreakerClientBuilder<CircuitBreakerRpcClient, RpcRequest, RpcResponse> {
+        extends AbstractCircuitBreakerClientBuilder<RpcResponse> {
+
+    CircuitBreakerRpcClientBuilder(CircuitBreakerRuleWithContent<RpcResponse> ruleWithContent) {
+        super(ruleWithContent);
+    }
 
     /**
-     * Creates a new builder with the specified {@link CircuitBreakerStrategyWithContent}.
+     * Returns a newly-created {@link CircuitBreakerRpcClient} based on the properties of this builder.
      */
-    public CircuitBreakerRpcClientBuilder(CircuitBreakerStrategyWithContent<RpcResponse> strategyWithContent) {
-        super(strategyWithContent);
+    public CircuitBreakerRpcClient build(RpcClient delegate) {
+        return new CircuitBreakerRpcClient(delegate, mapping(), ruleWithContent());
     }
 
-    @Override
-    public CircuitBreakerRpcClient build(Client<RpcRequest, RpcResponse> delegate) {
-        return new CircuitBreakerRpcClient(delegate, mapping(), strategyWithContent());
-    }
-
-    @Override
-    public Function<Client<RpcRequest, RpcResponse>, CircuitBreakerRpcClient> newDecorator() {
+    /**
+     * Returns a newly-created decorator that decorates an {@link RpcClient} with a new
+     * {@link CircuitBreakerRpcClient} based on the properties of this builder.
+     */
+    public Function<? super RpcClient, CircuitBreakerRpcClient> newDecorator() {
         return this::build;
     }
 
     // Methods that were overridden to change the return type.
-
-    @Override
-    public CircuitBreakerRpcClientBuilder circuitBreakerMapping(CircuitBreakerMapping mapping) {
-        return mapping(mapping);
-    }
 
     @Override
     public CircuitBreakerRpcClientBuilder mapping(CircuitBreakerMapping mapping) {

@@ -16,6 +16,7 @@
 
 package com.linecorp.armeria.server;
 
+import static com.google.common.collect.ImmutableList.toImmutableList;
 import static java.util.Objects.requireNonNull;
 
 import java.io.OutputStream;
@@ -24,9 +25,7 @@ import java.util.function.Function;
 
 import com.google.common.collect.ImmutableList;
 
-import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.metric.MeterIdPrefix;
-import com.linecorp.armeria.common.util.Exceptions;
 
 import io.micrometer.core.instrument.MeterRegistry;
 
@@ -37,10 +36,6 @@ final class CompositeRouter<I, O> implements Router<O> {
 
     private final List<Router<I>> delegates;
     private final Function<Routed<I>, Routed<O>> resultMapper;
-
-    CompositeRouter(Router<I> delegate, Function<Routed<I>, Routed<O>> resultMapper) {
-        this(ImmutableList.of(requireNonNull(delegate, "delegate")), resultMapper);
-    }
 
     CompositeRouter(List<Router<I>> delegates, Function<Routed<I>, Routed<O>> resultMapper) {
         this.delegates = requireNonNull(delegates, "delegates");
@@ -55,13 +50,28 @@ final class CompositeRouter<I, O> implements Router<O> {
                 return resultMapper.apply(result);
             }
         }
-        if (routingCtx.isCorsPreflight()) {
-            // '403 Forbidden' is better for a CORS preflight request than '404 Not Found'.
-            throw HttpStatusException.of(HttpStatus.FORBIDDEN);
-        }
-        routingCtx.delayedThrowable().ifPresent(Exceptions::throwUnsafely);
 
         return Routed.empty();
+    }
+
+    @Override
+    public List<Routed<O>> findAll(RoutingContext routingContext) {
+        // TODO(trustin): Optimize for the case where `delegates.size() == 0 or 1`
+        //                by using a different implementation instead of a dynamic switch.
+        final int numDelegates = delegates.size();
+        switch (numDelegates) {
+            case 0:
+                return ImmutableList.of();
+            case 1:
+                return delegates.get(0).findAll(routingContext).stream()
+                                .map(resultMapper)
+                                .collect(toImmutableList());
+            default:
+                return delegates.stream()
+                                .flatMap(delegate -> delegate.findAll(routingContext).stream())
+                                .map(resultMapper)
+                                .collect(toImmutableList());
+        }
     }
 
     @Override

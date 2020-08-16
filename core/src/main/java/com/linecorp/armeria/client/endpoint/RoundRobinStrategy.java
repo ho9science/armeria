@@ -16,8 +16,6 @@
 
 package com.linecorp.armeria.client.endpoint;
 
-import static java.util.Objects.requireNonNull;
-
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -25,6 +23,10 @@ import com.linecorp.armeria.client.ClientRequestContext;
 import com.linecorp.armeria.client.Endpoint;
 
 final class RoundRobinStrategy implements EndpointSelectionStrategy {
+
+    static final RoundRobinStrategy INSTANCE = new RoundRobinStrategy();
+
+    private RoundRobinStrategy() {}
 
     @Override
     public EndpointSelector newSelector(EndpointGroup endpointGroup) {
@@ -36,33 +38,20 @@ final class RoundRobinStrategy implements EndpointSelectionStrategy {
      *
      * <p>For example, with node a, b and c, then select result is abc abc ...
      */
-    static class RoundRobinSelector implements EndpointSelector {
-        private final EndpointGroup endpointGroup;
-
+    static class RoundRobinSelector extends AbstractEndpointSelector {
         private final AtomicInteger sequence = new AtomicInteger();
 
         RoundRobinSelector(EndpointGroup endpointGroup) {
-            this.endpointGroup = requireNonNull(endpointGroup, "endpointGroup");
+            super(endpointGroup);
         }
 
         @Override
-        public EndpointGroup group() {
-            return endpointGroup;
-        }
-
-        @Override
-        public EndpointSelectionStrategy strategy() {
-            return ROUND_ROBIN;
-        }
-
-        @Override
-        public Endpoint select(ClientRequestContext ctx) {
-
-            final List<Endpoint> endpoints = endpointGroup.endpoints();
+        public Endpoint selectNow(ClientRequestContext ctx) {
+            final List<Endpoint> endpoints = group().endpoints();
             final int currentSequence = sequence.getAndIncrement();
 
             if (endpoints.isEmpty()) {
-                throw new EndpointGroupException(endpointGroup + " is empty");
+                return null;
             }
             return endpoints.get(Math.abs(currentSequence % endpoints.size()));
         }

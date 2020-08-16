@@ -18,6 +18,9 @@ package com.linecorp.armeria.server.file;
 import static com.google.common.base.Preconditions.checkArgument;
 
 import java.util.Date;
+import java.util.concurrent.Executor;
+
+import javax.annotation.Nullable;
 
 import com.google.common.base.MoreObjects;
 
@@ -26,7 +29,7 @@ import io.netty.handler.codec.DateFormatter;
 /**
  * The attributes of an {@link HttpFile}.
  *
- * @see HttpFile#readAttributes()
+ * @see HttpFile#readAttributes(Executor)
  */
 public final class HttpFileAttributes {
 
@@ -66,7 +69,7 @@ public final class HttpFileAttributes {
     }
 
     @Override
-    public boolean equals(Object obj) {
+    public boolean equals(@Nullable Object obj) {
         if (obj == null || obj.getClass() != HttpFileAttributes.class) {
             return false;
         }

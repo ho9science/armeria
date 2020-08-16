@@ -22,27 +22,29 @@ import java.nio.charset.StandardCharsets;
 import org.junit.jupiter.api.Test;
 
 import com.linecorp.armeria.common.AggregatedHttpResponse;
+import com.linecorp.armeria.common.HttpData;
 import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.MediaType;
+import com.linecorp.armeria.common.ResponseHeaders;
 import com.linecorp.armeria.common.stream.NoopSubscriber;
-import com.linecorp.armeria.unsafe.ByteBufHttpData;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.util.concurrent.ImmediateEventExecutor;
+import reactor.test.StepVerifier;
 
 class HttpEncodedResponseTest {
 
     @Test
     void testLeak() {
-        final ByteBuf buf = Unpooled.buffer();
+        final ByteBuf buf = Unpooled.directBuffer();
         buf.writeCharSequence("foo", StandardCharsets.UTF_8);
 
-        final HttpResponse orig = HttpResponse.of(
+        final HttpResponse orig =
                 AggregatedHttpResponse.of(HttpStatus.OK,
                                           MediaType.PLAIN_TEXT_UTF_8,
-                                          new ByteBufHttpData(buf, true)));
+                                          HttpData.wrap(buf).withEndOfStream()).toHttpResponse();
         final HttpEncodedResponse encoded = new HttpEncodedResponse(
                 orig, HttpEncodingType.DEFLATE, mediaType -> true, 1);
 
@@ -51,5 +53,22 @@ class HttpEncodedResponseTest {
 
         // 'buf' should be released.
         assertThat(buf.refCnt()).isZero();
+    }
+
+    @Test
+    void doNotEncodeWhenContentShouldBeEmpty() {
+        final ResponseHeaders headers = ResponseHeaders.builder(HttpStatus.NO_CONTENT).contentType(
+                MediaType.PLAIN_TEXT_UTF_8).build();
+        // Add CONTINUE not to validate when creating HttpResponse.
+        final HttpResponse orig = HttpResponse.of(ResponseHeaders.of(HttpStatus.CONTINUE), headers,
+                                                  HttpData.ofUtf8("foo"));
+        final HttpEncodedResponse encoded = new HttpEncodedResponse(
+                orig, HttpEncodingType.DEFLATE, mediaType -> true, 1);
+        StepVerifier.create(encoded)
+                    .expectNext(ResponseHeaders.of(HttpStatus.CONTINUE))
+                    .expectNext(headers)
+                    .expectNext(HttpData.ofUtf8("foo"))
+                    .expectComplete()
+                    .verify();
     }
 }

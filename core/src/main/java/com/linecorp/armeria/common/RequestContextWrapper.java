@@ -20,19 +20,18 @@ import static java.util.Objects.requireNonNull;
 
 import java.net.SocketAddress;
 import java.util.Iterator;
-import java.util.function.BiConsumer;
-import java.util.function.Consumer;
+import java.util.Map.Entry;
+import java.util.function.Function;
 
 import javax.annotation.Nullable;
 import javax.net.ssl.SSLSession;
 
-import com.linecorp.armeria.common.logging.RequestLog;
+import com.linecorp.armeria.common.logging.RequestLogAccess;
 import com.linecorp.armeria.common.logging.RequestLogBuilder;
+import com.linecorp.armeria.server.ServiceRequestContext;
 
 import io.micrometer.core.instrument.MeterRegistry;
 import io.netty.buffer.ByteBufAllocator;
-import io.netty.channel.EventLoop;
-import io.netty.util.Attribute;
 import io.netty.util.AttributeKey;
 
 /**
@@ -40,7 +39,7 @@ import io.netty.util.AttributeKey;
  *
  * @param <T> the self type
  */
-public abstract class RequestContextWrapper<T extends RequestContext> extends AbstractRequestContext {
+public abstract class RequestContextWrapper<T extends RequestContext> implements RequestContext {
 
     private final T delegate;
 
@@ -58,14 +57,71 @@ public abstract class RequestContextWrapper<T extends RequestContext> extends Ab
         return delegate;
     }
 
+    @Nullable
     @Override
-    public <E extends Request> E request() {
-        return delegate().request();
+    public ServiceRequestContext root() {
+        return delegate().root();
+    }
+
+    @Nullable
+    @Override
+    public <V> V attr(AttributeKey<V> key) {
+        return delegate().attr(key);
+    }
+
+    @Nullable
+    @Override
+    public <V> V ownAttr(AttributeKey<V> key) {
+        return delegate().ownAttr(key);
     }
 
     @Override
-    public boolean updateRequest(Request req) {
-        return delegate().updateRequest(req);
+    public Iterator<Entry<AttributeKey<?>, Object>> attrs() {
+        return delegate().attrs();
+    }
+
+    @Override
+    public Iterator<Entry<AttributeKey<?>, Object>> ownAttrs() {
+        return delegate().ownAttrs();
+    }
+
+    @Override
+    public <V> void setAttr(AttributeKey<V> key, @Nullable V value) {
+        delegate().setAttr(key, value);
+    }
+
+    @Nullable
+    @Override
+    public <V> V setAttrIfAbsent(AttributeKey<V> key, V value) {
+        return delegate().setAttrIfAbsent(key, value);
+    }
+
+    @Nullable
+    @Override
+    public <V> V computeAttrIfAbsent(AttributeKey<V> key,
+                                     Function<? super AttributeKey<V>, ? extends V> mappingFunction) {
+        return delegate().computeAttrIfAbsent(key, mappingFunction);
+    }
+
+    @Override
+    public HttpRequest request() {
+        return delegate().request();
+    }
+
+    @Nullable
+    @Override
+    public RpcRequest rpcRequest() {
+        return delegate().rpcRequest();
+    }
+
+    @Override
+    public void updateRequest(HttpRequest req) {
+        delegate().updateRequest(req);
+    }
+
+    @Override
+    public void updateRpcRequest(RpcRequest rpcReq) {
+        delegate().updateRpcRequest(rpcReq);
     }
 
     @Override
@@ -92,6 +148,11 @@ public abstract class RequestContextWrapper<T extends RequestContext> extends Ab
     }
 
     @Override
+    public RequestId id() {
+        return delegate().id();
+    }
+
+    @Override
     public HttpMethod method() {
         return delegate().method();
     }
@@ -112,7 +173,7 @@ public abstract class RequestContextWrapper<T extends RequestContext> extends Ab
     }
 
     @Override
-    public RequestLog log() {
+    public RequestLogAccess log() {
         return delegate().log();
     }
 
@@ -127,57 +188,17 @@ public abstract class RequestContextWrapper<T extends RequestContext> extends Ab
     }
 
     @Override
-    public Iterator<Attribute<?>> attrs() {
-        return delegate().attrs();
-    }
-
-    @Override
-    public EventLoop eventLoop() {
+    public ContextAwareEventLoop eventLoop() {
         return delegate().eventLoop();
-    }
-
-    @Override
-    public void onEnter(Consumer<? super RequestContext> callback) {
-        delegate().onEnter(callback);
-    }
-
-    @Override
-    public void onExit(Consumer<? super RequestContext> callback) {
-        delegate().onExit(callback);
-    }
-
-    @Override
-    public void onChild(BiConsumer<? super RequestContext, ? super RequestContext> callback) {
-        delegate().onChild(callback);
-    }
-
-    @Override
-    public void invokeOnEnterCallbacks() {
-        delegate().invokeOnEnterCallbacks();
-    }
-
-    @Override
-    public void invokeOnExitCallbacks() {
-        delegate().invokeOnExitCallbacks();
-    }
-
-    @Override
-    public void invokeOnChildCallbacks(RequestContext newCtx) {
-        delegate().invokeOnChildCallbacks(newCtx);
-    }
-
-    @Override
-    public <V> Attribute<V> attr(AttributeKey<V> key) {
-        return delegate().attr(key);
-    }
-
-    @Override
-    public <V> boolean hasAttr(AttributeKey<V> key) {
-        return delegate().hasAttr(key);
     }
 
     @Override
     public ByteBufAllocator alloc() {
         return delegate().alloc();
+    }
+
+    @Override
+    public String toString() {
+        return delegate().toString();
     }
 }

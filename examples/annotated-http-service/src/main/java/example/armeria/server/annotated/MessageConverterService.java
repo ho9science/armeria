@@ -1,5 +1,6 @@
 package example.armeria.server.annotated;
 
+import java.lang.reflect.ParameterizedType;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 
@@ -33,7 +34,7 @@ import com.linecorp.armeria.server.annotation.decorator.LoggingDecorator;
 /**
  * Examples how to use {@link RequestConverter} and {@link ResponseConverter}.
  *
- * @see <a href="https://line.github.io/armeria/server-annotated-service.html#conversion-between-an-http-message-and-a-java-object">
+ * @see <a href="https://armeria.dev/docs/server-annotated-service#conversion-between-an-http-message-and-a-java-object">
  *      Conversion between an HTTP message and a Java object</a>
  */
 @LoggingDecorator(
@@ -78,10 +79,12 @@ public class MessageConverterService {
      *                 new ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT)
      *                                   .enable(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS));
      * // Register the converter when adding an annotated service to the ServerBuilder.
-     * final Server = new ServerBuilder().port(0, SessionProtocol.HTTP)
-     *                                   .annotatedService("/messageConverter", new MessageConverterService(),
-     *                                                     requestConverterFunction)
-     *                                   .build();
+     * final Server = Server.builder()
+     *                      .port(0, SessionProtocol.HTTP)
+     *                      .annotatedService("/messageConverter",
+     *                                        new MessageConverterService(),
+     *                                        requestConverterFunction)
+     *                      .build();
      * }</pre>
      */
     @Post("/obj/obj")
@@ -95,7 +98,7 @@ public class MessageConverterService {
      * be executed after the future is completed with the {@link Response} object.
      *
      * <p>Note that the {@link ServiceRequestContext} of the request is also automatically injected. See
-     * <a href="https://line.github.io/armeria/server-annotated-service.html#other-classes-automatically-injected">
+     * <a href="https://armeria.dev/docs/server-annotated-service#other-classes-automatically-injected">
      * Other classes automatically injected</a> for more information.
      */
     @Post("/obj/future")
@@ -169,8 +172,10 @@ public class MessageConverterService {
 
     public static final class CustomRequestConverter implements RequestConverterFunction {
         @Override
-        public Object convertRequest(ServiceRequestContext ctx, AggregatedHttpRequest request,
-                                     Class<?> expectedResultType) throws Exception {
+        public Object convertRequest(
+                ServiceRequestContext ctx, AggregatedHttpRequest request, Class<?> expectedResultType,
+                @Nullable ParameterizedType expectedParameterizedResultType) throws Exception {
+
             final MediaType mediaType = request.contentType();
             if (mediaType != null && mediaType.is(MediaType.PLAIN_TEXT_UTF_8)) {
                 return new Request(request.contentUtf8());
@@ -181,10 +186,10 @@ public class MessageConverterService {
 
     public static final class CustomResponseConverter implements ResponseConverterFunction {
         @Override
-        public HttpResponse convertResponse(ServiceRequestContext ctx,
-                                            ResponseHeaders headers,
-                                            @Nullable Object result,
-                                            HttpHeaders trailers) throws Exception {
+        public HttpResponse convertResponse(
+                ServiceRequestContext ctx, ResponseHeaders headers,
+                @Nullable Object result, HttpHeaders trailers) throws Exception {
+
             if (result instanceof Response) {
                 final Response response = (Response) result;
                 final HttpData body = HttpData.ofUtf8(response.result() + ':' + response.from());

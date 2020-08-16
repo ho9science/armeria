@@ -17,14 +17,17 @@
 package com.linecorp.armeria.client.endpoint.healthcheck;
 
 import static com.google.common.base.Preconditions.checkArgument;
-import static com.linecorp.armeria.client.endpoint.healthcheck.HealthCheckedEndpointGroup.DEFAULT_HEALTH_CHECK_RETRY_BACKOFF;
+import static com.google.common.base.Preconditions.checkState;
 import static java.util.Objects.requireNonNull;
 
 import java.time.Duration;
 import java.util.function.Function;
 
+import javax.annotation.Nullable;
+
 import com.linecorp.armeria.client.Client;
 import com.linecorp.armeria.client.ClientFactory;
+import com.linecorp.armeria.client.ClientOptions;
 import com.linecorp.armeria.client.ClientOptionsBuilder;
 import com.linecorp.armeria.client.Endpoint;
 import com.linecorp.armeria.client.endpoint.EndpointGroup;
@@ -37,13 +40,18 @@ import com.linecorp.armeria.common.util.AsyncCloseable;
  */
 public abstract class AbstractHealthCheckedEndpointGroupBuilder {
 
+    static final Backoff DEFAULT_HEALTH_CHECK_RETRY_BACKOFF = Backoff.fixed(3000).withJitter(0.2);
+
     private final EndpointGroup delegate;
 
     private SessionProtocol protocol = SessionProtocol.HTTP;
     private Backoff retryBackoff = DEFAULT_HEALTH_CHECK_RETRY_BACKOFF;
-    private ClientFactory clientFactory = ClientFactory.DEFAULT;
-    private Function<? super ClientOptionsBuilder, ClientOptionsBuilder> configurator = Function.identity();
+    private ClientOptionsBuilder clientOptionsBuilder = ClientOptions.builder();
     private int port;
+    @Nullable
+    private Double maxEndpointRatio;
+    @Nullable
+    private Integer maxEndpointCount;
 
     /**
      * Creates a new {@link AbstractHealthCheckedEndpointGroupBuilder}.
@@ -60,7 +68,7 @@ public abstract class AbstractHealthCheckedEndpointGroupBuilder {
      * {@link EndpointGroup}.
      */
     public AbstractHealthCheckedEndpointGroupBuilder clientFactory(ClientFactory clientFactory) {
-        this.clientFactory = requireNonNull(clientFactory, "clientFactory");
+        clientOptionsBuilder.factory(requireNonNull(clientFactory, "clientFactory"));
         return this;
     }
 
@@ -70,18 +78,6 @@ public abstract class AbstractHealthCheckedEndpointGroupBuilder {
     public AbstractHealthCheckedEndpointGroupBuilder protocol(SessionProtocol protocol) {
         this.protocol = requireNonNull(protocol, "protocol");
         return this;
-    }
-
-    /**
-     * Sets the port where a health check request will be sent instead of the original port number
-     * specified by {@link EndpointGroup}'s {@link Endpoint}s. This property is useful when your
-     * server listens to health check requests on a different port.
-     *
-     * @deprecated Use {@link #port(int)}.
-     */
-    @Deprecated
-    public AbstractHealthCheckedEndpointGroupBuilder healthCheckPort(int port) {
-        return port(port);
     }
 
     /**
@@ -102,7 +98,7 @@ public abstract class AbstractHealthCheckedEndpointGroupBuilder {
     public AbstractHealthCheckedEndpointGroupBuilder retryInterval(Duration retryInterval) {
         requireNonNull(retryInterval, "retryInterval");
         checkArgument(!retryInterval.isNegative() && !retryInterval.isZero(),
-                      "retryInterval: %s (expected > 0)", retryInterval);
+                      "retryInterval: %s (expected: > 0)", retryInterval);
         return retryIntervalMillis(retryInterval.toMillis());
     }
 
@@ -111,7 +107,7 @@ public abstract class AbstractHealthCheckedEndpointGroupBuilder {
      */
     public AbstractHealthCheckedEndpointGroupBuilder retryIntervalMillis(long retryIntervalMillis) {
         checkArgument(retryIntervalMillis > 0,
-                      "retryIntervalMillis: %s (expected > 0)", retryIntervalMillis);
+                      "retryIntervalMillis: %s (expected: > 0)", retryIntervalMillis);
         return retryBackoff(Backoff.fixed(retryIntervalMillis).withJitter(0.2));
     }
 
@@ -124,27 +120,93 @@ public abstract class AbstractHealthCheckedEndpointGroupBuilder {
     }
 
     /**
+     * Sets the {@link ClientOptions} of the {@link Client} that sends health check requests.
+     * This method can be useful if you already have an Armeria client and want to reuse its configuration,
+     * such as using the same decorators.
+     * <pre>{@code
+     * WebClient myClient = ...;
+     * // Use the same settings and decorators with `myClient` when sending health check requests.
+     * builder.clientOptions(myClient.options());
+     * }</pre>
+     */
+    public AbstractHealthCheckedEndpointGroupBuilder clientOptions(ClientOptions clientOptions) {
+        clientOptionsBuilder.options(requireNonNull(clientOptions, "clientOptions"));
+        return this;
+    }
+
+    /**
      * Sets the {@link Function} that customizes a {@link Client} that sends health check requests.
      * <pre>{@code
      * builder.withClientOptions(b -> {
-     *     return b.setHttpHeader(HttpHeaders.AUTHORIZATION,
-     *                            "bearer my-access-token")
+     *     return b.setHeader(HttpHeaders.AUTHORIZATION,
+     *                        "bearer my-access-token")
      *             .responseTimeout(Duration.ofSeconds(3));
      * });
      * }</pre>
      */
     public AbstractHealthCheckedEndpointGroupBuilder withClientOptions(
             Function<? super ClientOptionsBuilder, ClientOptionsBuilder> configurator) {
-        this.configurator = this.configurator.andThen(requireNonNull(configurator, "configurator"));
+        final ClientOptionsBuilder newBuilder =
+                requireNonNull(configurator, "configurator").apply(clientOptionsBuilder);
+        checkState(newBuilder != null, "configurator returned null.");
+        clientOptionsBuilder = newBuilder;
+        return this;
+    }
+
+    /**
+     * Sets the maximum endpoint ratio of target selected candidates.
+     * @see PartialHealthCheckStrategyBuilder#maxEndpointRatio(double)
+     */
+    public AbstractHealthCheckedEndpointGroupBuilder maxEndpointRatio(double maxEndpointRatio) {
+        if (maxEndpointCount != null) {
+            throw new IllegalArgumentException("Maximum endpoint count is already set.");
+        }
+
+        checkArgument(maxEndpointRatio > 0 && maxEndpointRatio <= 1.0,
+                      "maxEndpointRatio: %s (expected: 0.0 < maxEndpointRatio <= 1.0)",
+                      maxEndpointRatio);
+
+        this.maxEndpointRatio = maxEndpointRatio;
+        return this;
+    }
+
+    /**
+     * Sets the maximum endpoint count of target selected candidates.
+     * @see PartialHealthCheckStrategyBuilder#maxEndpointCount(int)
+     */
+    public AbstractHealthCheckedEndpointGroupBuilder maxEndpointCount(int maxEndpointCount) {
+        if (maxEndpointRatio != null) {
+            throw new IllegalArgumentException("Maximum endpoint ratio is already set.");
+        }
+
+        checkArgument(maxEndpointCount > 0, "maxEndpointCount: %s (expected: > 0)", maxEndpointCount);
+
+        this.maxEndpointCount = maxEndpointCount;
         return this;
     }
 
     /**
      * Returns a newly created {@link HealthCheckedEndpointGroup} based on the properties set so far.
      */
-    public HealthCheckedEndpointGroup build() {
-        return new HealthCheckedEndpointGroup(delegate, clientFactory, protocol, port,
-                                              retryBackoff, configurator, newCheckerFactory());
+    public final HealthCheckedEndpointGroup build() {
+        final HealthCheckStrategy healthCheckStrategy;
+        if (maxEndpointCount != null) {
+            healthCheckStrategy = new PartialHealthCheckStrategyBuilder()
+                                            .maxEndpointCount(maxEndpointCount)
+                                            .build();
+        } else {
+            if (maxEndpointRatio == null || maxEndpointRatio == 1.0) {
+                healthCheckStrategy = new AllHealthCheckStrategy();
+            } else {
+                healthCheckStrategy = new PartialHealthCheckStrategyBuilder()
+                                                .maxEndpointRatio(maxEndpointRatio)
+                                                .build();
+            }
+        }
+
+        return new HealthCheckedEndpointGroup(delegate, protocol, port, retryBackoff,
+                                              clientOptionsBuilder.build(),
+                                              newCheckerFactory(), healthCheckStrategy);
     }
 
     /**

@@ -17,11 +17,9 @@
 package com.linecorp.armeria.common.stream;
 
 import static com.linecorp.armeria.common.stream.StreamMessageTest.newPooledBuffer;
-import static com.linecorp.armeria.common.stream.SubscriptionOption.NOTIFY_CANCELLATION;
-import static com.linecorp.armeria.common.stream.SubscriptionOption.WITH_POOLED_OBJECTS;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.fail;
 import static org.awaitility.Awaitility.await;
-import static org.junit.jupiter.api.Assertions.fail;
 import static org.junit.jupiter.params.provider.Arguments.of;
 
 import java.util.ArrayList;
@@ -38,34 +36,34 @@ import org.junit.jupiter.params.provider.ArgumentsSource;
 import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
 
-import com.linecorp.armeria.unsafe.ByteBufHttpData;
+import com.linecorp.armeria.common.HttpData;
 
-import io.netty.buffer.ByteBufHolder;
+import io.netty.buffer.ByteBuf;
 
 class SubscriptionOptionTest {
 
     @ParameterizedTest
-    @ArgumentsSource(ByteBufHolderStreamProvider.class)
-    void withPooledObjects_true(ByteBufHolder data, StreamMessage<ByteBufHolder> stream) {
+    @ArgumentsSource(PooledHttpDataStreamProvider.class)
+    void withPooledObjects_true(HttpData data, ByteBuf buf, StreamMessage<HttpData> stream) {
         final boolean withPooledObjects = true;
         final int expectedRefCnt = 1;
 
-        withPooledObjects(data, stream, withPooledObjects, expectedRefCnt);
+        withPooledObjects(data, buf, stream, withPooledObjects, expectedRefCnt);
     }
 
     @ParameterizedTest
-    @ArgumentsSource(ByteBufHolderStreamProvider.class)
-    void withPooledObjects_false(ByteBufHolder data, StreamMessage<ByteBufHolder> stream) {
+    @ArgumentsSource(PooledHttpDataStreamProvider.class)
+    void withPooledObjects_false(HttpData data, ByteBuf buf, StreamMessage<HttpData> stream) {
         final boolean withPooledObjects = false;
         final int expectedRefCnt = 0;
 
-        withPooledObjects(data, stream, withPooledObjects, expectedRefCnt);
+        withPooledObjects(data, buf, stream, withPooledObjects, expectedRefCnt);
     }
 
-    private static void withPooledObjects(ByteBufHolder data, StreamMessage<ByteBufHolder> stream,
+    private static void withPooledObjects(HttpData data, ByteBuf buf, StreamMessage<HttpData> stream,
                                           boolean withPooledObjects, int expectedRefCnt) {
         final AtomicBoolean completed = new AtomicBoolean();
-        stream.subscribe(new Subscriber<ByteBufHolder>() {
+        stream.subscribe(new Subscriber<HttpData>() {
             @Nullable
             Subscription subscription;
 
@@ -76,46 +74,47 @@ class SubscriptionOptionTest {
             }
 
             @Override
-            public void onNext(ByteBufHolder b) {
-                assertThat(data.refCnt()).isEqualTo(expectedRefCnt);
+            public void onNext(HttpData b) {
+                assertThat(data.isPooled()).isTrue();
+                assertThat(buf.refCnt()).isEqualTo(expectedRefCnt);
                 subscription.cancel();
-                b.release();
+                b.close();
                 completed.set(true);
             }
 
             @Override
             public void onError(Throwable throwable) {
                 // This is not called because we didn't specify NOTIFY_CANCELLATION when subscribe.
-                fail();
+                fail("onError() invoked unexpectedly");
             }
 
             @Override
             public void onComplete() {
-                fail();
+                fail("onComplete() invoked unexpectedly");
             }
         }, subscriptionOptions(withPooledObjects));
 
         await().untilAsserted(() -> assertThat(completed).isTrue());
-        assertThat(data.refCnt()).isZero();
+        assertThat(buf.refCnt()).isZero();
     }
 
     @ParameterizedTest
-    @ArgumentsSource(ByteBufHolderStreamProvider.class)
-    void notifyCancellation(ByteBufHolder unused, StreamMessage<ByteBufHolder> stream) {
+    @ArgumentsSource(PooledHttpDataStreamProvider.class)
+    void notifyCancellation(HttpData unused1, ByteBuf unused2, StreamMessage<HttpData> stream) {
         notifyCancellation(stream);
     }
 
-    static void notifyCancellation(StreamMessage<ByteBufHolder> stream) {
+    static void notifyCancellation(StreamMessage<HttpData> stream) {
         final AtomicBoolean completed = new AtomicBoolean();
-        stream.subscribe(new Subscriber<ByteBufHolder>() {
+        stream.subscribe(new Subscriber<HttpData>() {
             @Override
             public void onSubscribe(Subscription s) {
                 s.cancel();
             }
 
             @Override
-            public void onNext(ByteBufHolder b) {
-                fail();
+            public void onNext(HttpData b) {
+                fail("onNext() invoked unexpectedly");
             }
 
             @Override
@@ -126,23 +125,23 @@ class SubscriptionOptionTest {
 
             @Override
             public void onComplete() {
-                fail();
+                fail("onComplete() invoked unexpectedly");
             }
-        }, NOTIFY_CANCELLATION);
+        }, SubscriptionOption.NOTIFY_CANCELLATION);
 
         await().untilAsserted(() -> assertThat(completed).isTrue());
-        await().untilAsserted(() -> assertThat(stream.completionFuture().isCompletedExceptionally()));
+        await().untilAsserted(() -> assertThat(stream.whenComplete()).isCompletedExceptionally());
     }
 
     static SubscriptionOption[] subscriptionOptions(boolean subscribedWithPooledObjects) {
         final ArrayList<SubscriptionOption> options = new ArrayList<>(1);
         if (subscribedWithPooledObjects) {
-            options.add(WITH_POOLED_OBJECTS);
+            options.add(SubscriptionOption.WITH_POOLED_OBJECTS);
         }
         return options.toArray(new SubscriptionOption[0]);
     }
 
-    private static class ByteBufHolderStreamProvider implements ArgumentsProvider {
+    private static class PooledHttpDataStreamProvider implements ArgumentsProvider {
 
         @Override
         public Stream<? extends Arguments> provideArguments(ExtensionContext context) {
@@ -150,27 +149,30 @@ class SubscriptionOptionTest {
         }
 
         private static Arguments defaultStream() {
-            final DefaultStreamMessage<ByteBufHolder> defaultStream = new DefaultStreamMessage<>();
-            final ByteBufHttpData data = new ByteBufHttpData(newPooledBuffer(), true);
+            final DefaultStreamMessage<HttpData> defaultStream = new DefaultStreamMessage<>();
+            final ByteBuf buf = newPooledBuffer();
+            final HttpData data = HttpData.wrap(buf).withEndOfStream();
             defaultStream.write(data);
             defaultStream.close();
-            return of(data, defaultStream);
+            return of(data, buf, defaultStream);
         }
 
         private static Arguments fixedStream() {
-            final ByteBufHttpData data = new ByteBufHttpData(newPooledBuffer(), true);
-            final StreamMessage<ByteBufHttpData> fixedStream = StreamMessage.of(data);
-            return of(data, fixedStream);
+            final ByteBuf buf = newPooledBuffer();
+            final HttpData data = HttpData.wrap(buf).withEndOfStream();
+            final StreamMessage<HttpData> fixedStream = StreamMessage.of(data);
+            return of(data, buf, fixedStream);
         }
 
         private static Arguments deferredStream() {
-            final DeferredStreamMessage<ByteBufHttpData> deferredStream = new DeferredStreamMessage<>();
-            final DefaultStreamMessage<ByteBufHttpData> d = new DefaultStreamMessage<>();
+            final DeferredStreamMessage<HttpData> deferredStream = new DeferredStreamMessage<>();
+            final DefaultStreamMessage<HttpData> d = new DefaultStreamMessage<>();
             deferredStream.delegate(d);
-            final ByteBufHttpData data = new ByteBufHttpData(newPooledBuffer(), true);
+            final ByteBuf buf = newPooledBuffer();
+            final HttpData data = HttpData.wrap(buf).withEndOfStream();
             d.write(data);
             d.close();
-            return of(data, deferredStream);
+            return of(data, buf, deferredStream);
         }
     }
 }

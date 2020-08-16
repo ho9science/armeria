@@ -20,15 +20,25 @@ import static java.util.Objects.requireNonNull;
 
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ScheduledExecutorService;
 
+import com.linecorp.armeria.client.ClientRequestContext;
 import com.linecorp.armeria.client.Endpoint;
 import com.linecorp.armeria.common.util.AbstractListenable;
+import com.linecorp.armeria.common.util.AsyncCloseableSupport;
+import com.linecorp.armeria.common.util.ListenableAsyncCloseable;
 
-final class OrElseEndpointGroup extends AbstractListenable<List<Endpoint>> implements EndpointGroup {
+final class OrElseEndpointGroup
+        extends AbstractListenable<List<Endpoint>>
+        implements EndpointGroup, ListenableAsyncCloseable {
+
     private final EndpointGroup first;
     private final EndpointGroup second;
 
     private final CompletableFuture<List<Endpoint>> initialEndpointsFuture;
+    private final EndpointSelector selector;
+
+    private final AsyncCloseableSupport closeable = AsyncCloseableSupport.of(this::closeAsync);
 
     OrElseEndpointGroup(EndpointGroup first, EndpointGroup second) {
         this.first = requireNonNull(first, "first");
@@ -37,8 +47,10 @@ final class OrElseEndpointGroup extends AbstractListenable<List<Endpoint>> imple
         second.addListener(unused -> notifyListeners(endpoints()));
 
         initialEndpointsFuture = CompletableFuture
-                .allOf(first.initialEndpointsFuture(), second.initialEndpointsFuture())
+                .anyOf(first.whenReady(), second.whenReady())
                 .thenApply(unused -> endpoints());
+
+        selector = first.selectionStrategy().newSelector(this);
     }
 
     @Override
@@ -51,15 +63,60 @@ final class OrElseEndpointGroup extends AbstractListenable<List<Endpoint>> imple
     }
 
     @Override
-    public CompletableFuture<List<Endpoint>> initialEndpointsFuture() {
+    public EndpointSelectionStrategy selectionStrategy() {
+        return first.selectionStrategy();
+    }
+
+    @Override
+    public Endpoint selectNow(ClientRequestContext ctx) {
+        return selector.selectNow(ctx);
+    }
+
+    @Override
+    public CompletableFuture<Endpoint> select(ClientRequestContext ctx,
+                                              ScheduledExecutorService executor,
+                                              long timeoutMillis) {
+        return selector.select(ctx, executor, timeoutMillis);
+    }
+
+    @Override
+    public CompletableFuture<List<Endpoint>> whenReady() {
         return initialEndpointsFuture;
     }
 
     @Override
+    public boolean isClosing() {
+        return closeable.isClosing();
+    }
+
+    @Override
+    public boolean isClosed() {
+        return closeable.isClosed();
+    }
+
+    @Override
+    public CompletableFuture<?> whenClosed() {
+        return closeable.whenClosed();
+    }
+
+    @Override
+    public CompletableFuture<?> closeAsync() {
+        return closeable.closeAsync();
+    }
+
+    private void closeAsync(CompletableFuture<?> future) {
+        CompletableFuture.allOf(first.closeAsync(), second.closeAsync()).handle((unused, cause) -> {
+            if (cause != null) {
+                future.completeExceptionally(cause);
+            } else {
+                future.complete(null);
+            }
+            return null;
+        });
+    }
+
+    @Override
     public void close() {
-        try (EndpointGroup first = this.first;
-             EndpointGroup second = this.second) {
-            // Just want to ensure closure.
-        }
+        closeable.close();
     }
 }

@@ -16,116 +16,106 @@
 
 package com.linecorp.armeria.server;
 
-import static com.linecorp.armeria.server.ServerConfig.validateMaxRequestLength;
-import static com.linecorp.armeria.server.ServerConfig.validateRequestTimeoutMillis;
 import static java.util.Objects.requireNonNull;
 
-import java.util.Optional;
 import java.util.function.Function;
-import java.util.regex.Pattern;
 
 import javax.annotation.Nullable;
 
 import com.google.common.base.MoreObjects;
 import com.google.common.base.MoreObjects.ToStringHelper;
 
-import com.linecorp.armeria.common.HttpRequest;
-import com.linecorp.armeria.common.HttpResponse;
-import com.linecorp.armeria.common.logging.ContentPreviewer;
-import com.linecorp.armeria.common.logging.ContentPreviewerFactory;
+import com.linecorp.armeria.common.logging.RequestLog;
+import com.linecorp.armeria.common.logging.RequestLogBuilder;
+import com.linecorp.armeria.server.annotation.decorator.CorsDecorator;
+import com.linecorp.armeria.server.cors.CorsService;
 import com.linecorp.armeria.server.logging.AccessLogWriter;
 
 /**
- * A {@link Service} configuration.
+ * An {@link HttpService} configuration.
  *
  * @see ServerConfig#serviceConfigs()
  * @see VirtualHost#serviceConfigs()
  */
 public final class ServiceConfig {
 
-    private static final Pattern LOGGER_NAME_PATTERN =
-            Pattern.compile("^\\p{javaJavaIdentifierStart}\\p{javaJavaIdentifierPart}*" +
-                            "(?:\\.\\p{javaJavaIdentifierStart}\\p{javaJavaIdentifierPart}*)*$");
-
     @Nullable
     private final VirtualHost virtualHost;
 
     private final Route route;
+    private final HttpService service;
     @Nullable
-    private final String loggerName;
-    private final Service<HttpRequest, HttpResponse> service;
+    private final String defaultServiceName;
+    @Nullable
+    private final String defaultLogName;
 
     private final long requestTimeoutMillis;
     private final long maxRequestLength;
     private final boolean verboseResponses;
 
-    private final ContentPreviewerFactory requestContentPreviewerFactory;
-    private final ContentPreviewerFactory responseContentPreviewerFactory;
     private final AccessLogWriter accessLogWriter;
     private final boolean shutdownAccessLogWriterOnStop;
+    private final boolean handlesCorsPreflight;
 
     /**
      * Creates a new instance.
      */
-    ServiceConfig(Route route,
-                  Service<HttpRequest, HttpResponse> service,
-                  @Nullable String loggerName, long requestTimeoutMillis,
-                  long maxRequestLength, boolean verboseResponses,
-                  ContentPreviewerFactory requestContentPreviewerFactory,
-                  ContentPreviewerFactory responseContentPreviewerFactory, AccessLogWriter accessLogWriter,
-                  boolean shutdownAccessLogWriterOnStop) {
-        this(null, route, service, loggerName, requestTimeoutMillis, maxRequestLength,
-             verboseResponses, requestContentPreviewerFactory, responseContentPreviewerFactory,
-             accessLogWriter, shutdownAccessLogWriterOnStop);
+    ServiceConfig(Route route, HttpService service,
+                  @Nullable String defaultServiceName, @Nullable String defaultLogName,
+                  long requestTimeoutMillis, long maxRequestLength, boolean verboseResponses,
+                  AccessLogWriter accessLogWriter, boolean shutdownAccessLogWriterOnStop) {
+        this(null, route, service, defaultServiceName, defaultLogName, requestTimeoutMillis, maxRequestLength,
+             verboseResponses, accessLogWriter, shutdownAccessLogWriterOnStop);
     }
 
     /**
      * Creates a new instance.
      */
-    private ServiceConfig(@Nullable VirtualHost virtualHost, Route route,
-                          Service<HttpRequest, HttpResponse> service,
-                          @Nullable String loggerName, long requestTimeoutMillis,
-                          long maxRequestLength, boolean verboseResponses,
-                          ContentPreviewerFactory requestContentPreviewerFactory,
-                          ContentPreviewerFactory responseContentPreviewerFactory,
+    private ServiceConfig(@Nullable VirtualHost virtualHost, Route route, HttpService service,
+                          @Nullable String defaultServiceName, @Nullable String defaultLogName,
+                          long requestTimeoutMillis, long maxRequestLength, boolean verboseResponses,
                           AccessLogWriter accessLogWriter, boolean shutdownAccessLogWriterOnStop) {
         this.virtualHost = virtualHost;
         this.route = requireNonNull(route, "route");
         this.service = requireNonNull(service, "service");
-        this.loggerName = loggerName != null ? validateLoggerName(loggerName, "loggerName") : null;
+        this.defaultServiceName = defaultServiceName;
+        this.defaultLogName = defaultLogName;
         this.requestTimeoutMillis = validateRequestTimeoutMillis(requestTimeoutMillis);
         this.maxRequestLength = validateMaxRequestLength(maxRequestLength);
         this.verboseResponses = verboseResponses;
-        this.requestContentPreviewerFactory = requireNonNull(requestContentPreviewerFactory,
-                                                             "requestContentPreviewerFactory");
-        this.responseContentPreviewerFactory = requireNonNull(responseContentPreviewerFactory,
-                                                              "responseContentPreviewerFactory");
         this.accessLogWriter = requireNonNull(accessLogWriter, "accessLogWriter");
         this.shutdownAccessLogWriterOnStop = shutdownAccessLogWriterOnStop;
+
+        handlesCorsPreflight = service.as(CorsService.class) != null;
     }
 
-    static String validateLoggerName(String value, String propertyName) {
-        requireNonNull(value, propertyName);
-        if (!LOGGER_NAME_PATTERN.matcher(value).matches()) {
-            throw new IllegalArgumentException(propertyName + ": " + value);
+    static long validateRequestTimeoutMillis(long requestTimeoutMillis) {
+        if (requestTimeoutMillis < 0) {
+            throw new IllegalArgumentException(
+                    "requestTimeoutMillis: " + requestTimeoutMillis + " (expected: >= 0)");
         }
-        return value;
+        return requestTimeoutMillis;
+    }
+
+    static long validateMaxRequestLength(long maxRequestLength) {
+        if (maxRequestLength < 0) {
+            throw new IllegalArgumentException("maxRequestLength: " + maxRequestLength + " (expected: >= 0)");
+        }
+        return maxRequestLength;
     }
 
     ServiceConfig withVirtualHost(VirtualHost virtualHost) {
         requireNonNull(virtualHost, "virtualHost");
-        return new ServiceConfig(virtualHost, route, service, loggerName, requestTimeoutMillis,
-                                 maxRequestLength, verboseResponses, requestContentPreviewerFactory,
-                                 responseContentPreviewerFactory, accessLogWriter,
-                                 shutdownAccessLogWriterOnStop);
+        return new ServiceConfig(virtualHost, route, service, defaultServiceName, defaultLogName,
+                                 requestTimeoutMillis, maxRequestLength, verboseResponses,
+                                 accessLogWriter, shutdownAccessLogWriterOnStop);
     }
 
-    ServiceConfig withDecoratedService(
-            Function<Service<HttpRequest, HttpResponse>, Service<HttpRequest, HttpResponse>> decorator) {
+    ServiceConfig withDecoratedService(Function<? super HttpService, ? extends HttpService> decorator) {
         requireNonNull(decorator, "decorator");
-        return new ServiceConfig(virtualHost, route, service.decorate(decorator), loggerName,
+        return new ServiceConfig(virtualHost, route, service.decorate(decorator),
+                                 defaultServiceName, defaultLogName,
                                  requestTimeoutMillis, maxRequestLength, verboseResponses,
-                                 requestContentPreviewerFactory, responseContentPreviewerFactory,
                                  accessLogWriter, shutdownAccessLogWriterOnStop);
     }
 
@@ -154,26 +144,48 @@ public final class ServiceConfig {
     }
 
     /**
-     * Returns the {@link Service}.
+     * Returns the {@link HttpService}.
      */
-    @SuppressWarnings("unchecked")
-    public <T extends Service<HttpRequest, HttpResponse>> T service() {
-        return (T) service;
+    public HttpService service() {
+        return service;
     }
 
     /**
-     * Returns the logger name for the {@link Service}.
-     *
-     * @deprecated Use a logging framework integration such as {@code RequestContextExportingAppender} in
-     *             {@code armeria-logback}.
+     * Returns the default value of the {@link RequestLog#serviceName()} property which is used when
+     * no service name was set via {@link RequestLogBuilder#name(String, String)}.
+     * If {@code null}, one of the following values will be used instead:
+     * <ul>
+     *   <li>gRPC - a service name (e.g, {@code com.foo.GrpcService})</li>
+     *   <li>Thrift - a service type (e.g, {@code com.foo.ThriftService$AsyncIface} or
+     *       {@code com.foo.ThriftService$Iface})</li>
+     *   <li>{@link HttpService} and annotated service - an innermost class name</li>
+     * </ul>
      */
-    @Deprecated
-    public Optional<String> loggerName() {
-        return Optional.ofNullable(loggerName);
+    @Nullable
+    public String defaultServiceName() {
+        return defaultServiceName;
+    }
+
+    /**
+     * Returns the default value of the {@link RequestLog#name()} property which is used when no name was set
+     * via {@link RequestLogBuilder#name(String, String)}.
+     * If {@code null}, one of the following values will be used instead:
+     * <ul>
+     *   <li>gRPC - A capitalized method name defined in {@code io.grpc.MethodDescriptor}
+     *       (e.g, {@code GetItems})</li>
+     *   <li>Thrift and annotated service - a method name (e.g, {@code getItems})</li>
+     *   <li>{@link HttpService} - an HTTP method name</li>
+     * </ul>
+     */
+    @Nullable
+    public String defaultLogName() {
+        return defaultLogName;
     }
 
     /**
      * Returns the timeout of a request.
+     *
+     * @see VirtualHost#requestTimeoutMillis()
      */
     public long requestTimeoutMillis() {
         return requestTimeoutMillis;
@@ -182,6 +194,8 @@ public final class ServiceConfig {
     /**
      * Returns the maximum allowed length of the content decoded at the session layer.
      * e.g. the content length of an HTTP request.
+     *
+     * @see VirtualHost#maxRequestLength()
      */
     public long maxRequestLength() {
         return maxRequestLength;
@@ -191,29 +205,17 @@ public final class ServiceConfig {
      * Returns whether the verbose response mode is enabled. When enabled, the service response will contain
      * the exception type and its full stack trace, which may be useful for debugging while potentially
      * insecure. When disabled, the service response will not expose such server-side details to the client.
+     *
+     * @see VirtualHost#verboseResponses()
      */
     public boolean verboseResponses() {
         return verboseResponses;
     }
 
     /**
-     * Returns the {@link ContentPreviewerFactory} used for creating a new {@link ContentPreviewer}
-     * which produces the request content preview of this {@link Service}.
-     */
-    public ContentPreviewerFactory requestContentPreviewerFactory() {
-        return requestContentPreviewerFactory;
-    }
-
-    /**
-     * Returns the {@link ContentPreviewerFactory} used for creating a new {@link ContentPreviewer}
-     * which produces the response content preview of this {@link Service}.
-     */
-    public ContentPreviewerFactory responseContentPreviewerFactory() {
-        return responseContentPreviewerFactory;
-    }
-
-    /**
      * Returns the access log writer.
+     *
+     * @see VirtualHost#accessLogWriter()
      */
     public AccessLogWriter accessLogWriter() {
         return accessLogWriter;
@@ -221,9 +223,18 @@ public final class ServiceConfig {
 
     /**
      * Tells whether the {@link AccessLogWriter} is shut down when the {@link Server} stops.
+     *
+     * @see VirtualHost#shutdownAccessLogWriterOnStop()
      */
     public boolean shutdownAccessLogWriterOnStop() {
         return shutdownAccessLogWriterOnStop;
+    }
+
+    /**
+     * Returns {@code true} if the service has {@link CorsDecorator} in the decorator chain.
+     */
+    boolean handlesCorsPreflight() {
+        return handlesCorsPreflight;
     }
 
     @Override
@@ -233,13 +244,11 @@ public final class ServiceConfig {
             toStringHelper.add("hostnamePattern", virtualHost.hostnamePattern());
         }
         return toStringHelper.add("route", route)
-                             .add("loggerName", loggerName)
                              .add("service", service)
+                             .add("defaultLogName", defaultLogName)
                              .add("requestTimeoutMillis", requestTimeoutMillis)
                              .add("maxRequestLength", maxRequestLength)
                              .add("verboseResponses", verboseResponses)
-                             .add("requestContentPreviewerFactory", requestContentPreviewerFactory)
-                             .add("responseContentPreviewerFactory", responseContentPreviewerFactory)
                              .add("accessLogWriter", accessLogWriter)
                              .add("shutdownAccessLogWriterOnStop", shutdownAccessLogWriterOnStop)
                              .toString();

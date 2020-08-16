@@ -26,10 +26,13 @@ import com.google.common.base.MoreObjects;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterables;
 
+import com.linecorp.armeria.common.annotation.UnstableApi;
+
 /**
  * Creates a new {@link FieldInfo} using the builder pattern.
  */
-public class FieldInfoBuilder {
+@UnstableApi
+public final class FieldInfoBuilder {
 
     private final String name;
     private final TypeSignature typeSignature;
@@ -40,30 +43,21 @@ public class FieldInfoBuilder {
     @Nullable
     private String docString;
 
-    /**
-     * Creates a new {@link FieldInfoBuilder}.
-     */
-    public FieldInfoBuilder(String name, TypeSignature typeSignature) {
+    FieldInfoBuilder(String name, TypeSignature typeSignature) {
         this.name = requireNonNull(name, "name");
         this.typeSignature = requireNonNull(typeSignature, "typeSignature");
         childFieldInfos = ImmutableList.of();
     }
 
-    /**
-     * Creates a new {@link FieldInfoBuilder}.
-     */
-    public FieldInfoBuilder(String name, TypeSignature typeSignature, FieldInfo... childFieldInfos) {
+    FieldInfoBuilder(String name, TypeSignature typeSignature, FieldInfo... childFieldInfos) {
         this(name, typeSignature, ImmutableList.copyOf(childFieldInfos));
     }
 
-    /**
-     * Creates a new {@link FieldInfoBuilder}.
-     */
-    public FieldInfoBuilder(String name, TypeSignature typeSignature, Iterable<FieldInfo> childFieldInfos) {
+    FieldInfoBuilder(String name, TypeSignature typeSignature, Iterable<FieldInfo> childFieldInfos) {
         this.name = requireNonNull(name, "name");
         this.typeSignature = typeSignature;
         checkArgument(!Iterables.isEmpty(requireNonNull(childFieldInfos, "childFieldInfos")),
-                      "childFieldInfos can't be empty");
+                      "childFieldInfos can't be empty.");
         this.childFieldInfos = ImmutableList.copyOf(childFieldInfos);
     }
 

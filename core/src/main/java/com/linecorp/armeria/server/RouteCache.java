@@ -16,23 +16,26 @@
 
 package com.linecorp.armeria.server;
 
+import static com.google.common.collect.ImmutableList.toImmutableList;
 import static java.util.Objects.requireNonNull;
 
 import java.io.OutputStream;
+import java.util.Collections;
+import java.util.IdentityHashMap;
+import java.util.List;
+import java.util.Set;
 import java.util.function.Function;
 
 import javax.annotation.Nullable;
 
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.MoreObjects;
 
 import com.linecorp.armeria.common.Flags;
-import com.linecorp.armeria.common.Request;
-import com.linecorp.armeria.common.Response;
 import com.linecorp.armeria.common.metric.MeterIdPrefix;
-import com.linecorp.armeria.internal.metric.CaffeineMetricSupport;
-import com.linecorp.armeria.server.composition.CompositeServiceEntry;
+import com.linecorp.armeria.internal.common.metric.CaffeineMetricSupport;
 
 import io.micrometer.core.instrument.MeterRegistry;
 
@@ -42,35 +45,43 @@ import io.micrometer.core.instrument.MeterRegistry;
 final class RouteCache {
 
     @Nullable
-    private static final Cache<RoutingContext, ServiceConfig> CACHE =
-            Flags.routeCacheSpec().map(RouteCache::<ServiceConfig>buildCache)
-                 .orElse(null);
+    private static final Cache<RoutingContext, ServiceConfig> FIND_CACHE =
+            Flags.routeCacheSpec() != null ? buildCache(Flags.routeCacheSpec()) : null;
+
+    @Nullable
+    private static final Cache<RoutingContext, List<ServiceConfig>> FIND_ALL_CACHE =
+            Flags.routeCacheSpec() != null ? buildCache(Flags.routeCacheSpec()) : null;
+
+    @Nullable
+    private static final Cache<RoutingContext, RouteDecoratingService> DECORATOR_FIND_CACHE =
+            Flags.routeDecoratorCacheSpec() != null ? buildCache(Flags.routeDecoratorCacheSpec()) : null;
+
+    @Nullable
+    private static final Cache<RoutingContext, List<RouteDecoratingService>> DECORATOR_FIND_ALL_CACHE =
+            Flags.routeDecoratorCacheSpec() != null ? buildCache(Flags.routeDecoratorCacheSpec()) : null;
 
     /**
      * Returns a {@link Router} which is wrapped with a {@link Cache} layer in order to improve the
      * performance of the {@link ServiceConfig} search.
      */
-    static Router<ServiceConfig> wrapVirtualHostRouter(Router<ServiceConfig> delegate) {
-        return CACHE == null ? delegate
-                             : new CachingRouter<>(delegate, CACHE, ServiceConfig::route);
+    static Router<ServiceConfig> wrapVirtualHostRouter(Router<ServiceConfig> delegate,
+                                                       Set<Route> ambiguousRoutes) {
+        return FIND_CACHE == null ? delegate
+                                  : new CachingRouter<>(delegate, ServiceConfig::route,
+                                                        FIND_CACHE, FIND_ALL_CACHE, ambiguousRoutes);
     }
 
     /**
      * Returns a {@link Router} which is wrapped with a {@link Cache} layer in order to improve the
-     * performance of the {@link CompositeServiceEntry} search.
+     * performance of the {@link RouteDecoratingService} search.
      */
-    static <I extends Request, O extends Response>
-    Router<CompositeServiceEntry<I, O>> wrapCompositeServiceRouter(
-            Router<CompositeServiceEntry<I, O>> delegate) {
-
-        final Cache<RoutingContext, CompositeServiceEntry<I, O>> cache =
-                Flags.compositeServiceCacheSpec().map(RouteCache::<CompositeServiceEntry<I, O>>buildCache)
-                     .orElse(null);
-        if (cache == null) {
-            return delegate;
-        }
-
-        return new CachingRouter<>(delegate, cache, CompositeServiceEntry::route);
+    static Router<RouteDecoratingService> wrapRouteDecoratingServiceRouter(
+            Router<RouteDecoratingService> delegate, Set<Route> ambiguousRoutes) {
+        return DECORATOR_FIND_CACHE == null ? delegate
+                                            : new CachingRouter<>(delegate, RouteDecoratingService::route,
+                                                                  DECORATOR_FIND_CACHE,
+                                                                  DECORATOR_FIND_ALL_CACHE,
+                                                                  ambiguousRoutes);
     }
 
     private static <T> Cache<RoutingContext, T> buildCache(String spec) {
@@ -85,19 +96,29 @@ final class RouteCache {
     private static final class CachingRouter<V> implements Router<V> {
 
         private final Router<V> delegate;
-        private final Cache<RoutingContext, V> cache;
         private final Function<V, Route> routeResolver;
+        private final Cache<RoutingContext, V> findCache;
+        private final Cache<RoutingContext, List<V>> findAllCache;
+        private final Set<Route> ambiguousRoutes;
 
-        CachingRouter(Router<V> delegate, Cache<RoutingContext, V> cache,
-                      Function<V, Route> routeResolver) {
+        CachingRouter(Router<V> delegate, Function<V, Route> routeResolver,
+                      Cache<RoutingContext, V> findCache,
+                      Cache<RoutingContext, List<V>> findAllCache,
+                      Set<Route> ambiguousRoutes) {
             this.delegate = requireNonNull(delegate, "delegate");
-            this.cache = requireNonNull(cache, "cache");
             this.routeResolver = requireNonNull(routeResolver, "routeResolver");
+            this.findCache = requireNonNull(findCache, "findCache");
+            this.findAllCache = requireNonNull(findAllCache, "findAllCache");
+
+            final Set<Route> newAmbiguousRoutes =
+                    Collections.newSetFromMap(new IdentityHashMap<>(ambiguousRoutes.size()));
+            newAmbiguousRoutes.addAll(requireNonNull(ambiguousRoutes, "ambiguousRoutes"));
+            this.ambiguousRoutes = Collections.unmodifiableSet(newAmbiguousRoutes);
         }
 
         @Override
         public Routed<V> find(RoutingContext routingCtx) {
-            final V cached = cache.getIfPresent(routingCtx);
+            final V cached = findCache.getIfPresent(routingCtx);
             if (cached != null) {
                 // RoutingResult may be different to each other for every requests, so we cannot
                 // use it as a cache value.
@@ -107,15 +128,42 @@ final class RouteCache {
             }
 
             final Routed<V> result = delegate.find(routingCtx);
-            if (result.isPresent()) {
-                cache.put(routingCtx, result.value());
+            if (result.isPresent() && !ambiguousRoutes.contains(result.route())) {
+                findCache.put(routingCtx, result.value());
             }
             return result;
         }
 
         @Override
+        public List<Routed<V>> findAll(RoutingContext routingCtx) {
+            final List<V> cachedList = findAllCache.getIfPresent(routingCtx);
+            if (cachedList != null) {
+                return filterRoutes(cachedList, routingCtx);
+            }
+
+            // Disable matching headers and/or query parameters only if there's ambiguous routes.
+            final List<Routed<V>> result = delegate.findAll(
+                    ambiguousRoutes.isEmpty() ? routingCtx : new CachingRoutingContext(routingCtx));
+            final List<V> valid = result.stream()
+                                        .filter(Routed::isPresent)
+                                        .map(Routed::value)
+                                        .collect(toImmutableList());
+            findAllCache.put(routingCtx, valid);
+            return filterRoutes(valid, routingCtx);
+        }
+
+        private List<Routed<V>> filterRoutes(List<V> list, RoutingContext routingCtx) {
+            return list.stream().map(cached -> {
+                final Route route = routeResolver.apply(cached);
+                final RoutingResult routingResult = route.apply(routingCtx);
+                return routingResult.isPresent() ? Routed.of(route, routingResult, cached)
+                                                 : Routed.<V>empty();
+            }).filter(Routed::isPresent).collect(toImmutableList());
+        }
+
+        @Override
         public boolean registerMetrics(MeterRegistry registry, MeterIdPrefix idPrefix) {
-            CaffeineMetricSupport.setup(registry, idPrefix, cache);
+            CaffeineMetricSupport.setup(registry, idPrefix, findCache);
             return true;
         }
 
@@ -128,8 +176,27 @@ final class RouteCache {
         public String toString() {
             return MoreObjects.toStringHelper(this)
                               .add("delegate", delegate)
-                              .add("cache", cache)
+                              .add("findCache", findCache)
+                              .add("findAllCache", findAllCache)
                               .toString();
+        }
+    }
+
+    @VisibleForTesting
+    static final class CachingRoutingContext extends RoutingContextWrapper {
+
+        CachingRoutingContext(RoutingContext delegate) {
+            super(delegate);
+        }
+
+        @Override
+        public boolean requiresMatchingParamsPredicates() {
+            return false;
+        }
+
+        @Override
+        public boolean requiresMatchingHeadersPredicates() {
+            return false;
         }
     }
 }

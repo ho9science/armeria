@@ -13,46 +13,152 @@
  * License for the specific language governing permissions and limitations
  * under the License.
  */
-
 package com.linecorp.armeria.client.logging;
 
+import java.util.function.BiFunction;
 import java.util.function.Function;
 
-import com.linecorp.armeria.client.Client;
-import com.linecorp.armeria.common.Request;
-import com.linecorp.armeria.common.Response;
-import com.linecorp.armeria.common.logging.LoggingDecoratorBuilder;
-import com.linecorp.armeria.internal.logging.Sampler;
+import org.slf4j.Logger;
+
+import com.linecorp.armeria.client.ClientRequestContext;
+import com.linecorp.armeria.client.HttpClient;
+import com.linecorp.armeria.common.HttpHeaders;
+import com.linecorp.armeria.common.RequestContext;
+import com.linecorp.armeria.common.logging.LogLevel;
+import com.linecorp.armeria.common.logging.RequestLog;
+import com.linecorp.armeria.common.logging.RequestOnlyLog;
+import com.linecorp.armeria.common.util.Sampler;
 
 /**
  * Builds a new {@link LoggingClient}.
  */
-public class LoggingClientBuilder extends LoggingDecoratorBuilder<LoggingClientBuilder> {
+public final class LoggingClientBuilder extends AbstractLoggingClientBuilder {
+
+    LoggingClientBuilder() {}
 
     /**
      * Returns a newly-created {@link LoggingClient} decorating {@code delegate} based on the properties of
      * this builder.
      */
-    public <I extends Request, O extends Response> LoggingClient<I, O> build(Client<I, O> delegate) {
-        return new LoggingClient<>(delegate,
-                                   requestLogLevel(),
-                                   successfulResponseLogLevel(),
-                                   failedResponseLogLevel(),
-                                   requestHeadersSanitizer(),
-                                   requestContentSanitizer(),
-                                   requestTrailersSanitizer(),
-                                   responseHeadersSanitizer(),
-                                   responseContentSanitizer(),
-                                   responseTrailersSanitizer(),
-                                   responseCauseSanitizer(),
-                                   Sampler.create(samplingRate()));
+    public LoggingClient build(HttpClient delegate) {
+        return new LoggingClient(delegate,
+                                 logger(),
+                                 requestLogLevelMapper(),
+                                 responseLogLevelMapper(),
+                                 requestHeadersSanitizer(),
+                                 requestContentSanitizer(),
+                                 requestTrailersSanitizer(),
+                                 responseHeadersSanitizer(),
+                                 responseContentSanitizer(),
+                                 responseTrailersSanitizer(),
+                                 responseCauseSanitizer(),
+                                 sampler());
     }
 
     /**
      * Returns a newly-created {@link LoggingClient} decorator based on the properties of this builder.
      */
-    public <I extends Request, O extends Response> Function<Client<I, O>, LoggingClient<I, O>>
-    newDecorator() {
+    public Function<? super HttpClient, LoggingClient> newDecorator() {
         return this::build;
+    }
+
+    // Override the return type of the chaining methods in the superclass.
+
+    @Override
+    public LoggingClientBuilder samplingRate(float samplingRate) {
+        return (LoggingClientBuilder) super.samplingRate(samplingRate);
+    }
+
+    @Override
+    public LoggingClientBuilder sampler(Sampler<? super ClientRequestContext> sampler) {
+        return (LoggingClientBuilder) super.sampler(sampler);
+    }
+
+    // Override the return type of the chaining methods in the super-superclass.
+
+    @Override
+    public LoggingClientBuilder logger(Logger logger) {
+        return (LoggingClientBuilder) super.logger(logger);
+    }
+
+    @Override
+    public LoggingClientBuilder requestLogLevel(LogLevel requestLogLevel) {
+        return (LoggingClientBuilder) super.requestLogLevel(requestLogLevel);
+    }
+
+    @Override
+    public LoggingClientBuilder successfulResponseLogLevel(LogLevel successfulResponseLogLevel) {
+        return (LoggingClientBuilder) super.successfulResponseLogLevel(successfulResponseLogLevel);
+    }
+
+    @Override
+    public LoggingClientBuilder failureResponseLogLevel(LogLevel failedResponseLogLevel) {
+        return (LoggingClientBuilder) super.failureResponseLogLevel(failedResponseLogLevel);
+    }
+
+    @Override
+    public LoggingClientBuilder requestLogLevelMapper(
+            Function<? super RequestOnlyLog, LogLevel> requestLogLevelMapper) {
+        return (LoggingClientBuilder) super.requestLogLevelMapper(requestLogLevelMapper);
+    }
+
+    @Override
+    public LoggingClientBuilder responseLogLevelMapper(
+            Function<? super RequestLog, LogLevel> responseLogLevelMapper) {
+        return (LoggingClientBuilder) super.responseLogLevelMapper(responseLogLevelMapper);
+    }
+
+    @Override
+    public LoggingClientBuilder requestHeadersSanitizer(
+            BiFunction<? super RequestContext, ? super HttpHeaders, ?> requestHeadersSanitizer) {
+        return (LoggingClientBuilder) super.requestHeadersSanitizer(requestHeadersSanitizer);
+    }
+
+    @Override
+    public LoggingClientBuilder responseHeadersSanitizer(
+            BiFunction<? super RequestContext, ? super HttpHeaders, ?> responseHeadersSanitizer) {
+        return (LoggingClientBuilder) super.responseHeadersSanitizer(responseHeadersSanitizer);
+    }
+
+    @Override
+    public LoggingClientBuilder requestTrailersSanitizer(
+            BiFunction<? super RequestContext, ? super HttpHeaders, ?> requestTrailersSanitizer) {
+        return (LoggingClientBuilder) super.requestTrailersSanitizer(requestTrailersSanitizer);
+    }
+
+    @Override
+    public LoggingClientBuilder responseTrailersSanitizer(
+            BiFunction<? super RequestContext, ? super HttpHeaders, ?> responseTrailersSanitizer) {
+        return (LoggingClientBuilder) super.responseTrailersSanitizer(responseTrailersSanitizer);
+    }
+
+    @Override
+    public LoggingClientBuilder headersSanitizer(
+            BiFunction<? super RequestContext, ? super HttpHeaders, ?> headersSanitizer) {
+        return (LoggingClientBuilder) super.headersSanitizer(headersSanitizer);
+    }
+
+    @Override
+    public LoggingClientBuilder requestContentSanitizer(
+            BiFunction<? super RequestContext, Object, ?> requestContentSanitizer) {
+        return (LoggingClientBuilder) super.requestContentSanitizer(requestContentSanitizer);
+    }
+
+    @Override
+    public LoggingClientBuilder responseContentSanitizer(
+            BiFunction<? super RequestContext, Object, ?> responseContentSanitizer) {
+        return (LoggingClientBuilder) super.responseContentSanitizer(responseContentSanitizer);
+    }
+
+    @Override
+    public LoggingClientBuilder contentSanitizer(
+            BiFunction<? super RequestContext, Object, ?> contentSanitizer) {
+        return (LoggingClientBuilder) super.contentSanitizer(contentSanitizer);
+    }
+
+    @Override
+    public LoggingClientBuilder responseCauseSanitizer(
+            BiFunction<? super RequestContext, ? super Throwable, ?> responseCauseSanitizer) {
+        return (LoggingClientBuilder) super.responseCauseSanitizer(responseCauseSanitizer);
     }
 }

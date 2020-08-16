@@ -13,7 +13,6 @@
  * License for the specific language governing permissions and limitations
  * under the License.
  */
-
 package com.linecorp.armeria.server.logging;
 
 import static com.google.common.base.MoreObjects.firstNonNull;
@@ -38,17 +37,19 @@ import java.util.stream.Collectors;
 import javax.annotation.Nullable;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.net.UrlEscapers;
 
 import com.linecorp.armeria.common.HttpHeaderNames;
 import com.linecorp.armeria.common.HttpHeaders;
+import com.linecorp.armeria.common.RequestId;
 import com.linecorp.armeria.common.ResponseHeaders;
 import com.linecorp.armeria.common.RpcRequest;
 import com.linecorp.armeria.common.logging.RequestLog;
 import com.linecorp.armeria.common.util.Exceptions;
+import com.linecorp.armeria.internal.common.util.TemporaryThreadLocals;
 import com.linecorp.armeria.server.ServiceRequestContext;
 
 import io.netty.util.AsciiString;
-import io.netty.util.Attribute;
 import io.netty.util.AttributeKey;
 
 /**
@@ -125,10 +126,14 @@ interface AccessLogComponent {
 
         private static final Map<String, DateTimeFormatter> predefinedFormatters =
                 getFields(DateTimeFormatter.class, field -> {
-                    final int m = field.getModifiers();
-                    // public static final DateTimeFormatter ...
-                    return Modifier.isPublic(m) && Modifier.isStatic(m) && Modifier.isFinal(m) &&
-                           (field.getType() == DateTimeFormatter.class);
+                    if (field == null) {
+                        return false;
+                    } else {
+                        final int m = field.getModifiers();
+                        // public static final DateTimeFormatter ...
+                        return Modifier.isPublic(m) && Modifier.isStatic(m) && Modifier.isFinal(m) &&
+                               (field.getType() == DateTimeFormatter.class);
+                    }
                 }).stream().collect(Collectors.toMap(Field::getName, f -> {
                     try {
                         return (DateTimeFormatter) f.get(null);
@@ -237,6 +242,7 @@ interface AccessLogComponent {
                 case REQUEST_LINE:
                 case RESPONSE_STATUS_CODE:
                 case RESPONSE_LENGTH:
+                case REQUEST_ID:
                     return true;
                 default:
                     return false;
@@ -252,8 +258,7 @@ interface AccessLogComponent {
                         @Nullable String variable) {
             super(condition, addQuote);
             checkArgument(isSupported(requireNonNull(type, "type")),
-                          "Type '" + type + "' is not acceptable by " +
-                          CommonComponent.class.getName());
+                          "Type '%s' is not acceptable by %s", type, CommonComponent.class.getName());
             this.type = type;
             this.variable = variable;
         }
@@ -287,28 +292,57 @@ interface AccessLogComponent {
                     return null;
 
                 case REQUEST_LINE:
-                    final StringBuilder requestLine = new StringBuilder();
+                    final String httpMethodName = log.requestHeaders().method().name();
+                    final String path = log.requestHeaders().path();
+                    final String name = log.name();
+                    final RpcRequest rpcRequest = log.context().rpcRequest();
+                    final boolean isGrpc = rpcRequest != null &&
+                                           "com.linecorp.armeria.internal.common.grpc.GrpcLogUtil".equals(
+                                                   rpcRequest.serviceType().getName());
 
-                    requestLine.append(log.method())
-                               .append(' ')
-                               .append(log.requestHeaders().path());
+                    final String logName;
+                    if (name != null && !isGrpc) {
+                        String serviceName = log.serviceName();
+                        if (serviceName != null) {
+                            final int idx = serviceName.lastIndexOf('.') + 1;
+                            if (idx > 0) {
+                                serviceName = serviceName.substring(idx);
+                            }
+                        }
 
-                    final Object requestContent = log.requestContent();
-                    if (requestContent instanceof RpcRequest) {
-                        requestLine.append('#')
-                                   .append(((RpcRequest) requestContent).method());
+                        if (rpcRequest == null && httpMethodName.equals(name)) {
+                            logName = serviceName;
+                        } else {
+                            logName = serviceName + '/' + name;
+                        }
+                    } else {
+                        logName = null;
                     }
 
-                    requestLine.append(' ')
-                               .append(firstNonNull(log.sessionProtocol(),
-                                                    log.context().sessionProtocol()).uriText());
+                    final String protocol = firstNonNull(log.sessionProtocol(),
+                                                         log.context().sessionProtocol()).uriText();
+
+                    final StringBuilder requestLine = TemporaryThreadLocals.get().stringBuilder();
+                    requestLine.append(httpMethodName).append(' ').append(path);
+
+                    if (logName != null) {
+                        requestLine.append('#')
+                                   .append(UrlEscapers.urlFragmentEscaper().escape(logName));
+                    }
+                    requestLine.append(' ').append(protocol);
                     return requestLine.toString();
 
                 case RESPONSE_STATUS_CODE:
-                    return log.statusCode();
-
+                    return log.responseHeaders().status().code();
                 case RESPONSE_LENGTH:
                     return log.responseLength();
+                case REQUEST_ID:
+                    final RequestId id = log.context().id();
+                    if ("short".equals(variable)) {
+                        return id.shortText();
+                    } else {
+                        return id.text();
+                    }
             }
             return null;
         }
@@ -377,8 +411,8 @@ interface AccessLogComponent {
         @Nullable
         @Override
         Object getMessage0(RequestLog log) {
-            final Attribute<?> value = log.context().attr(key);
-            return value != null ? stringifer.apply(value.get()) : null;
+            final Object value = log.context().attr(key);
+            return value != null ? stringifer.apply(value) : null;
         }
     }
 
@@ -420,11 +454,11 @@ interface AccessLogComponent {
             // The same order as methods in the RequestLog interface.
             switch (variable) {
                 case "method":
-                    return RequestLog::method;
+                    return log -> log.requestHeaders().method();
                 case "path":
-                    return RequestLog::path;
+                    return log -> log.context().path();
                 case "query":
-                    return RequestLog::query;
+                    return log -> log.context().query();
 
                 case "requestStartTimeMillis":
                     return RequestLog::requestStartTimeMillis;
@@ -466,7 +500,7 @@ interface AccessLogComponent {
                 case "sessionProtocol":
                     return RequestLog::sessionProtocol;
                 case "serializationFormat":
-                    return RequestLog::serializationFormat;
+                    return log -> log.scheme().serializationFormat();
                 case "scheme":
                     return RequestLog::scheme;
                 case "host":
@@ -480,9 +514,9 @@ interface AccessLogComponent {
                         return authority;
                     };
                 case "status":
-                    return RequestLog::status;
+                    return log -> log.responseHeaders().status();
                 case "statusCode":
-                    return RequestLog::statusCode;
+                    return log -> log.responseHeaders().status().code();
 
                 default:
                     throw new IllegalArgumentException("unexpected request log variable: " + variable);

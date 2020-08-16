@@ -34,12 +34,13 @@ import com.google.common.base.Strings;
 
 import com.linecorp.armeria.common.HttpHeaderNames;
 import com.linecorp.armeria.common.RequestHeaders;
+import com.linecorp.armeria.common.auth.BasicToken;
 
 import io.netty.util.AsciiString;
 
 /**
  * Extracts {@link BasicToken} from {@link RequestHeaders}, in order to be used by
- * {@link HttpAuthServiceBuilder}.
+ * {@link AuthServiceBuilder}.
  */
 final class BasicTokenExtractor implements Function<RequestHeaders, BasicToken> {
 

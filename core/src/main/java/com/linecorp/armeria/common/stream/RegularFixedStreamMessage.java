@@ -16,17 +16,20 @@
 
 package com.linecorp.armeria.common.stream;
 
+import static com.linecorp.armeria.common.util.Exceptions.throwIfFatal;
 import static java.util.Objects.requireNonNull;
 
 import org.reactivestreams.Subscriber;
 
-import io.netty.util.ReferenceCountUtil;
+import com.linecorp.armeria.common.annotation.UnstableApi;
+import com.linecorp.armeria.unsafe.PooledObjects;
 
 /**
  * A {@link FixedStreamMessage} that publishes an arbitrary number of objects. It is recommended to use
  * {@link EmptyFixedStreamMessage}, {@link OneElementFixedStreamMessage}, or
  * {@link TwoElementFixedStreamMessage} when publishing less than three objects.
  */
+@UnstableApi
 public class RegularFixedStreamMessage<T> extends FixedStreamMessage<T> {
 
     private final T[] objs;
@@ -57,7 +60,7 @@ public class RegularFixedStreamMessage<T> extends FixedStreamMessage<T> {
             try {
                 onRemoval(obj);
             } finally {
-                ReferenceCountUtil.safeRelease(obj);
+                PooledObjects.close(obj);
             }
         }
     }
@@ -131,6 +134,12 @@ public class RegularFixedStreamMessage<T> extends FixedStreamMessage<T> {
                 inOnNext = true;
                 try {
                     subscriber.onNext(o);
+                } catch (Throwable t) {
+                    // Just abort this stream so subscriber().onError(e) is called and resources are cleaned up.
+                    abort(t);
+                    throwIfFatal(t);
+                    logger.warn("Subscriber.onNext({}) should not raise an exception. subscriber: {}",
+                                o, subscriber, t);
                 } finally {
                     inOnNext = false;
                 }
@@ -139,7 +148,7 @@ public class RegularFixedStreamMessage<T> extends FixedStreamMessage<T> {
     }
 
     @Override
-    public boolean isEmpty() {
+    public final boolean isEmpty() {
         return false;
     }
 }

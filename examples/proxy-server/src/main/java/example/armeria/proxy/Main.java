@@ -1,15 +1,12 @@
 package example.armeria.proxy;
 
-import java.net.InetSocketAddress;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.linecorp.armeria.common.ServerCacheControl;
 import com.linecorp.armeria.server.Server;
-import com.linecorp.armeria.server.ServerBuilder;
-import com.linecorp.armeria.server.file.HttpFileBuilder;
-import com.linecorp.armeria.server.healthcheck.HttpHealthCheckService;
+import com.linecorp.armeria.server.file.HttpFile;
+import com.linecorp.armeria.server.healthcheck.HealthCheckService;
 import com.linecorp.armeria.server.logging.LoggingService;
 
 public final class Main {
@@ -44,39 +41,36 @@ public final class Main {
 
         proxyServer.start().join();
 
-        final InetSocketAddress localAddress = proxyServer.activePort().get().localAddress();
-        final boolean isLocalAddress = localAddress.getAddress().isAnyLocalAddress() ||
-                                       localAddress.getAddress().isLoopbackAddress();
-        logger.info("The proxy server has been started. Connect at http://{}:{}/",
-                    isLocalAddress ? "127.0.0.1" : localAddress.getHostString(), localAddress.getPort());
+        logger.info("The proxy server has been started. Connect at http://127.0.0.1:{}/",
+                    proxyServer.activeLocalPort());
     }
 
     static Server newBackendServer(int port, int frameIntervalMillis) throws Exception {
-        return new ServerBuilder()
-                .http(port)
-                // Disable timeout to serve infinite streaming response.
-                .requestTimeoutMillis(0)
-                // Serve /index.html file.
-                .service("/", HttpFileBuilder.ofResource(Main.class.getClassLoader(), "index.html")
-                                             .cacheControl(ServerCacheControl.REVALIDATED)
-                                             .build()
-                                             .asService())
-                .service("/animation", new AnimationService(frameIntervalMillis))
-                // Serve health check.
-                .service("/internal/l7check", new HttpHealthCheckService())
-                .build();
+        return Server.builder()
+                     .http(port)
+                     // Disable timeout to serve infinite streaming response.
+                     .requestTimeoutMillis(0)
+                     // Serve /index.html file.
+                     .service("/", HttpFile.builder(Main.class.getClassLoader(), "index.html")
+                                           .cacheControl(ServerCacheControl.REVALIDATED)
+                                           .build()
+                                           .asService())
+                     .service("/animation", new AnimationService(frameIntervalMillis))
+                     // Serve health check.
+                     .service("/internal/l7check", HealthCheckService.of())
+                     .build();
     }
 
     static Server newProxyServer(int httpPort, int httpsPort) throws Exception {
-        return new ServerBuilder()
-                .http(httpPort)
-                .https(httpsPort)
-                .tlsSelfSigned()
-                // Disable timeout to serve infinite streaming response.
-                .requestTimeoutMillis(0)
-                .serviceUnder("/", new ProxyService())
-                .decorator(LoggingService.newDecorator())
-                .build();
+        return Server.builder()
+                     .http(httpPort)
+                     .https(httpsPort)
+                     .tlsSelfSigned()
+                     // Disable timeout to serve infinite streaming response.
+                     .requestTimeoutMillis(0)
+                     .serviceUnder("/", new ProxyService())
+                     .decorator(LoggingService.newDecorator())
+                     .build();
     }
 
     private Main() {}

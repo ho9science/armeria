@@ -13,10 +13,7 @@
  * License for the specific language governing permissions and limitations
  * under the License.
  */
-
 package com.linecorp.armeria.common.logging;
-
-import static java.util.Objects.requireNonNull;
 
 import javax.annotation.Nullable;
 import javax.net.ssl.SSLSession;
@@ -24,37 +21,22 @@ import javax.net.ssl.SSLSession;
 import com.linecorp.armeria.common.HttpData;
 import com.linecorp.armeria.common.HttpHeaders;
 import com.linecorp.armeria.common.Request;
+import com.linecorp.armeria.common.RequestContext;
 import com.linecorp.armeria.common.RequestHeaders;
 import com.linecorp.armeria.common.Response;
 import com.linecorp.armeria.common.ResponseHeaders;
+import com.linecorp.armeria.common.RpcRequest;
 import com.linecorp.armeria.common.SerializationFormat;
 import com.linecorp.armeria.common.SessionProtocol;
-import com.linecorp.armeria.internal.ChannelUtil;
+import com.linecorp.armeria.common.util.SystemInfo;
+import com.linecorp.armeria.server.HttpService;
 
 import io.netty.channel.Channel;
 
 /**
  * Updates a {@link RequestLog} with newly available information.
  */
-public interface RequestLogBuilder {
-
-    /**
-     * A dummy {@link RequestLogBuilder} that discards everything it collected.
-     */
-    RequestLogBuilder NOOP = new NoopRequestLogBuilder();
-
-    /**
-     * Adds the specified {@link RequestLog} so that the logs are propagated from the {@code child}.
-     * Note that only the request-side logs of the first added child will be propagated. To fill the
-     * response-side logs you need to call {@link #endResponseWithLastChild()}.
-     */
-    void addChild(RequestLog child);
-
-    /**
-     * Fills the response-side logs from the last added child. Note that already fulfilled
-     * {@link RequestLogAvailability}s in the child log will be propagated immediately.
-     */
-    void endResponseWithLastChild();
+public interface RequestLogBuilder extends RequestLogAccess {
 
     // Methods related with a request:
 
@@ -64,19 +46,10 @@ public interface RequestLogBuilder {
      *   <li>{@link RequestLog#requestStartTimeMillis()}</li>
      *   <li>{@link RequestLog#requestStartTimeMicros()}</li>
      *   <li>{@link RequestLog#requestStartTimeNanos()}</li>
-     *   <li>{@link RequestLog#channel()}</li>
-     *   <li>{@link RequestLog#sessionProtocol()}</li>
-     *   <li>{@link RequestLog#authority()}</li>
-     *   <li>{@link RequestLog#sslSession()}</li>
      * </ul>
-     *
-     * @param channel the {@link Channel} which handled the {@link Request}.
-     * @param sessionProtocol the {@link SessionProtocol} of the connection.
      */
-    default void startRequest(Channel channel, SessionProtocol sessionProtocol) {
-        requireNonNull(channel, "channel");
-        requireNonNull(sessionProtocol, "sessionProtocol");
-        startRequest(channel, sessionProtocol, ChannelUtil.findSslSession(channel, sessionProtocol));
+    default void startRequest() {
+        startRequest(System.nanoTime(), SystemInfo.currentTimeMicros());
     }
 
     /**
@@ -85,9 +58,33 @@ public interface RequestLogBuilder {
      *   <li>{@link RequestLog#requestStartTimeMillis()}</li>
      *   <li>{@link RequestLog#requestStartTimeMicros()}</li>
      *   <li>{@link RequestLog#requestStartTimeNanos()}</li>
+     * </ul>
+     *
+     * @param requestStartTimeNanos {@link System#nanoTime()} value when the request started.
+     * @param requestStartTimeMicros the number of microseconds since the epoch,
+     *                               e.g. {@code System.currentTimeMillis() * 1000}.
+     */
+    void startRequest(long requestStartTimeNanos, long requestStartTimeMicros);
+
+    /**
+     * Sets the properties related with socket connection. This method sets the following properties:
+     * <ul>
      *   <li>{@link RequestLog#channel()}</li>
      *   <li>{@link RequestLog#sessionProtocol()}</li>
-     *   <li>{@link RequestLog#authority()}</li>
+     *   <li>{@link RequestLog#sslSession()}</li>
+     * </ul>
+     *
+     * @param channel the {@link Channel} which handled the {@link Request}.
+     * @param sessionProtocol the {@link SessionProtocol} of the connection.
+     */
+    void session(@Nullable Channel channel, SessionProtocol sessionProtocol,
+                 @Nullable ClientConnectionTimings connectionTimings);
+
+    /**
+     * Sets the properties related with socket connection. This method sets the following properties:
+     * <ul>
+     *   <li>{@link RequestLog#channel()}</li>
+     *   <li>{@link RequestLog#sessionProtocol()}</li>
      *   <li>{@link RequestLog#sslSession()}</li>
      * </ul>
      *
@@ -95,60 +92,30 @@ public interface RequestLogBuilder {
      * @param sessionProtocol the {@link SessionProtocol} of the connection.
      * @param sslSession the {@link SSLSession} of the connection, or {@code null}.
      */
-    void startRequest(Channel channel, SessionProtocol sessionProtocol, @Nullable SSLSession sslSession);
-
-    /**
-     * Starts the collection of the {@link Request} information. This method sets the following properties:
-     * <ul>
-     *   <li>{@link RequestLog#requestStartTimeMillis()}</li>
-     *   <li>{@link RequestLog#requestStartTimeMicros()}</li>
-     *   <li>{@link RequestLog#requestStartTimeNanos()}</li>
-     *   <li>{@link RequestLog#channel()}</li>
-     *   <li>{@link RequestLog#sessionProtocol()}</li>
-     *   <li>{@link RequestLog#authority()}</li>
-     *   <li>{@link RequestLog#sslSession()}</li>
-     * </ul>
-     *
-     * @param channel the {@link Channel} which handled the {@link Request}.
-     * @param sessionProtocol the {@link SessionProtocol} of the connection.
-     * @param requestStartTimeNanos {@link System#nanoTime()} value when the request started.
-     * @param requestStartTimeMicros the number of microseconds since the epoch,
-     *                               e.g. {@code System.currentTimeMillis() * 1000}.
-     */
-    default void startRequest(Channel channel, SessionProtocol sessionProtocol,
-                              long requestStartTimeNanos, long requestStartTimeMicros) {
-        requireNonNull(channel, "channel");
-        requireNonNull(sessionProtocol, "sessionProtocol");
-        startRequest(channel, sessionProtocol, ChannelUtil.findSslSession(channel, sessionProtocol),
-                     requestStartTimeNanos, requestStartTimeMicros);
-    }
-
-    /**
-     * Starts the collection of the {@link Request} information. This method sets the following properties:
-     * <ul>
-     *   <li>{@link RequestLog#requestStartTimeMillis()}</li>
-     *   <li>{@link RequestLog#requestStartTimeMicros()}</li>
-     *   <li>{@link RequestLog#requestStartTimeNanos()}</li>
-     *   <li>{@link RequestLog#channel()}</li>
-     *   <li>{@link RequestLog#sessionProtocol()}</li>
-     *   <li>{@link RequestLog#authority()}</li>
-     *   <li>{@link RequestLog#sslSession()}</li>
-     * </ul>
-     *
-     * @param channel the {@link Channel} which handled the {@link Request}.
-     * @param sessionProtocol the {@link SessionProtocol} of the connection.
-     * @param sslSession the {@link SSLSession} of the connection, or {@code null}.
-     * @param requestStartTimeNanos {@link System#nanoTime()} value when the request started.
-     * @param requestStartTimeMicros the number of microseconds since the epoch,
-     *                               e.g. {@code System.currentTimeMillis() * 1000}.
-     */
-    void startRequest(Channel channel, SessionProtocol sessionProtocol, @Nullable SSLSession sslSession,
-                      long requestStartTimeNanos, long requestStartTimeMicros);
+    void session(@Nullable Channel channel, SessionProtocol sessionProtocol, @Nullable SSLSession sslSession,
+                 @Nullable ClientConnectionTimings connectionTimings);
 
     /**
      * Sets the {@link SerializationFormat}.
      */
     void serializationFormat(SerializationFormat serializationFormat);
+
+    /**
+     * Sets the human-readable service name and method name of the {@link Request} such as:
+     * <ul>
+     *    <li>A service and method name for gRPC and Thrift</li>
+     *    <li>An innermost class and method name for annotated service</li>
+     *    <li>A path pattern and HTTP method name for {@link HttpService}</li>
+     * </ul>
+     * This property is often used as a meter tag or distributed trace's span name.
+     */
+    void name(String serviceName, String name);
+
+    /**
+     * Sets the human-readable name of the {@link Request}, such as RPC method name, annotated service method
+     * name or HTTP method name. This property is often used as a meter tag or distributed trace's span name.
+     */
+    void name(String name);
 
     /**
      * Increases the {@link RequestLog#requestLength()} by {@code deltaBytes}.
@@ -183,6 +150,9 @@ public interface RequestLogBuilder {
 
     /**
      * Sets the {@link RequestLog#requestContent()} and the {@link RequestLog#rawRequestContent()}.
+     * If the specified {@code requestContent} is an {@link RpcRequest} and
+     * the {@link RequestContext#rpcRequest()} is {@code null}, this method will call
+     * {@link RequestContext#updateRpcRequest(RpcRequest)}.
      */
     void requestContent(@Nullable Object requestContent, @Nullable Object rawRequestContent);
 
@@ -190,20 +160,6 @@ public interface RequestLogBuilder {
      * Sets the {@link RequestLog#requestContentPreview()}.
      */
     void requestContentPreview(@Nullable String requestContentPreview);
-
-    /**
-     * Allows the {@link #requestContent(Object, Object)} called after {@link #endRequest()}.
-     * By default, if {@link #requestContent(Object, Object)} was not called yet, {@link #endRequest()} will
-     * call {@code requestContent(null, null)} automatically. This method turns off this default behavior.
-     * Note, however, this method will not prevent {@link #endRequest(Throwable)} from calling
-     * {@code requestContent(null, null)} automatically.
-     */
-    void deferRequestContent();
-
-    /**
-     * Returns {@code true} if {@link #deferRequestContent()} was ever called.
-     */
-    boolean isRequestContentDeferred();
 
     /**
      * Sets the {@link RequestLog#requestTrailers()}.
@@ -325,20 +281,6 @@ public interface RequestLogBuilder {
     void responseContentPreview(@Nullable String responseContentPreview);
 
     /**
-     * Allows the {@link #responseContent(Object, Object)} called after {@link #endResponse()}.
-     * By default, if {@link #responseContent(Object, Object)} was not called yet, {@link #endResponse()} will
-     * call {@code responseContent(null, null)} automatically. This method turns off this default behavior.
-     * Note, however, this method will not prevent {@link #endResponse(Throwable)} from calling
-     * {@code responseContent(null, null)} automatically.
-     */
-    void deferResponseContent();
-
-    /**
-     * Returns {@code true} if {@link #deferResponseContent()} was ever called.
-     */
-    boolean isResponseContentDeferred();
-
-    /**
      * Sets the {@link RequestLog#responseTrailers()}.
      */
     void responseTrailers(HttpHeaders responseTrailers);
@@ -393,4 +335,90 @@ public interface RequestLogBuilder {
      * @param responseEndTimeNanos {@link System#nanoTime()} value when the response ended.
      */
     void endResponse(Throwable responseCause, long responseEndTimeNanos);
+
+    // Methods related with deferred properties
+
+    /**
+     * Returns {@code true} if the specified {@link RequestLogProperty} has been deferred with
+     * {@link #defer(RequestLogProperty)}.
+     */
+    boolean isDeferred(RequestLogProperty property);
+
+    /**
+     * Returns {@code true} if all of the specified {@link RequestLogProperty}s have been deferred with
+     * {@link #defer(RequestLogProperty)}.
+     */
+    boolean isDeferred(RequestLogProperty... properties);
+
+    /**
+     * Returns {@code true} if all of the specified {@link RequestLogProperty}s have been deferred with
+     * {@link #defer(RequestLogProperty)}.
+     */
+    boolean isDeferred(Iterable<RequestLogProperty> properties);
+
+    /**
+     * Allows setting the specified {@link RequestLogProperty} even after {@link #endResponse()} or
+     * {@link #endResponse(Throwable)} called. Once this method is called, the caller must ensure to call
+     * the setter of the specified {@link RequestLogProperty}, because otherwise the {@link RequestLog}
+     * will never be completed.
+     *
+     * <p>Note, however, the following {@link RequestLogProperty}s will be set automatically when the
+     * {@link RequestLog} has ended with an exception:
+     * <ul>
+     *   <li>{@link RequestLogProperty#REQUEST_CONTENT}</li>
+     *   <li>{@link RequestLogProperty#REQUEST_CONTENT_PREVIEW}</li>
+     *   <li>{@link RequestLogProperty#RESPONSE_CONTENT}</li>
+     *   <li>{@link RequestLogProperty#RESPONSE_CONTENT_PREVIEW}</li>
+     * </ul></p>
+     */
+    void defer(RequestLogProperty property);
+
+    /**
+     * Allows setting the specified {@link RequestLogProperty}s even after {@link #endResponse()} or
+     * {@link #endResponse(Throwable)} called. Once this method is called, the caller must ensure to call
+     * the setters of the specified {@link RequestLogProperty}s, because otherwise the {@link RequestLog}
+     * will never be completed.
+     *
+     * <p>Note, however, the following {@link RequestLogProperty}s will be set automatically when the
+     * {@link RequestLog} has ended with an exception:
+     * <ul>
+     *   <li>{@link RequestLogProperty#REQUEST_CONTENT}</li>
+     *   <li>{@link RequestLogProperty#REQUEST_CONTENT_PREVIEW}</li>
+     *   <li>{@link RequestLogProperty#RESPONSE_CONTENT}</li>
+     *   <li>{@link RequestLogProperty#RESPONSE_CONTENT_PREVIEW}</li>
+     * </ul></p>
+     */
+    void defer(RequestLogProperty... properties);
+
+    /**
+     * Allows setting the specified {@link RequestLogProperty}s even after {@link #endResponse()} or
+     * {@link #endResponse(Throwable)} called. Once this method is called, the caller must ensure to call
+     * the setters of the specified {@link RequestLogProperty}s, because otherwise the {@link RequestLog}
+     * will never be completed.
+     *
+     * <p>Note, however, the following {@link RequestLogProperty}s will be set automatically when the
+     * {@link RequestLog} has ended with an exception:
+     * <ul>
+     *   <li>{@link RequestLogProperty#REQUEST_CONTENT}</li>
+     *   <li>{@link RequestLogProperty#REQUEST_CONTENT_PREVIEW}</li>
+     *   <li>{@link RequestLogProperty#RESPONSE_CONTENT}</li>
+     *   <li>{@link RequestLogProperty#RESPONSE_CONTENT_PREVIEW}</li>
+     * </ul></p>
+     */
+    void defer(Iterable<RequestLogProperty> properties);
+
+    // Methods related with nested logs
+
+    /**
+     * Adds the specified {@link RequestLogAccess} so that the logs are propagated from the {@code child}.
+     * Note that only the request-side logs of the first added child will be propagated. To fill the
+     * response-side logs you need to call {@link #endResponseWithLastChild()}.
+     */
+    void addChild(RequestLogAccess child);
+
+    /**
+     * Fills the response-side logs from the last added child. Note that already collected properties
+     * in the child log will be propagated immediately.
+     */
+    void endResponseWithLastChild();
 }

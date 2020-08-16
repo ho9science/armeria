@@ -16,51 +16,41 @@
 
 package com.linecorp.armeria.client.endpoint;
 
+import static com.linecorp.armeria.client.endpoint.EndpointSelectionStrategy.roundRobin;
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.catchThrowable;
 
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
 import com.linecorp.armeria.client.ClientRequestContext;
 import com.linecorp.armeria.client.Endpoint;
 import com.linecorp.armeria.common.HttpMethod;
 import com.linecorp.armeria.common.HttpRequest;
 
-public class RoundRobinStrategyTest {
-    private static final EndpointGroup ENDPOINT_GROUP =
-            new StaticEndpointGroup(Endpoint.parse("localhost:1234"),
-                                    Endpoint.parse("localhost:2345"));
+class RoundRobinStrategyTest {
+    private static final EndpointGroup group =
+            EndpointGroup.of(roundRobin(),
+                             Endpoint.parse("localhost:1234"),
+                             Endpoint.parse("localhost:2345"));
 
-    private static final EndpointGroup EMPTY_ENDPOINT_GROUP = new StaticEndpointGroup();
-
-    private final RoundRobinStrategy strategy = new RoundRobinStrategy();
+    private static final EndpointGroup emptyGroup = EndpointGroup.of();
 
     private final ClientRequestContext ctx = ClientRequestContext.of(HttpRequest.of(HttpMethod.GET, "/"));
 
-    @Before
-    public void setup() {
-        EndpointGroupRegistry.register("endpoint", ENDPOINT_GROUP, strategy);
-        EndpointGroupRegistry.register("empty", EMPTY_ENDPOINT_GROUP, strategy);
+    @Test
+    void select() {
+        assertThat(group.selectNow(ctx))
+                .isEqualTo(group.endpoints().get(0));
+        assertThat(group.selectNow(ctx))
+                .isEqualTo(group.endpoints().get(1));
+        assertThat(group.selectNow(ctx))
+                .isEqualTo(group.endpoints().get(0));
+        assertThat(group.selectNow(ctx))
+                .isEqualTo(group.endpoints().get(1));
     }
 
     @Test
-    public void select() {
-        assertThat(EndpointGroupRegistry.selectNode(ctx, "endpoint"))
-                .isEqualTo(ENDPOINT_GROUP.endpoints().get(0));
-        assertThat(EndpointGroupRegistry.selectNode(ctx, "endpoint"))
-                .isEqualTo(ENDPOINT_GROUP.endpoints().get(1));
-        assertThat(EndpointGroupRegistry.selectNode(ctx, "endpoint"))
-                .isEqualTo(ENDPOINT_GROUP.endpoints().get(0));
-        assertThat(EndpointGroupRegistry.selectNode(ctx, "endpoint"))
-                .isEqualTo(ENDPOINT_GROUP.endpoints().get(1));
-    }
-
-    @Test
-    public void select_empty() {
-        assertThat(EndpointGroupRegistry.selectNode(ctx, "endpoint")).isNotNull();
-
-        assertThat(catchThrowable(() -> EndpointGroupRegistry.selectNode(ctx, "empty")))
-                .isInstanceOf(EndpointGroupException.class);
+    void selectEmpty() {
+        assertThat(group.selectNow(ctx)).isNotNull();
+        assertThat(emptyGroup.selectNow(ctx)).isNull();
     }
 }

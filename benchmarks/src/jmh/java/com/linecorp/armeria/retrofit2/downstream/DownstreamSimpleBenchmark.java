@@ -20,12 +20,11 @@ import org.openjdk.jmh.annotations.Scope;
 import org.openjdk.jmh.annotations.State;
 
 import com.linecorp.armeria.client.ClientFactory;
-import com.linecorp.armeria.client.ClientFactoryBuilder;
-import com.linecorp.armeria.client.retrofit2.ArmeriaRetrofitBuilder;
+import com.linecorp.armeria.client.WebClient;
+import com.linecorp.armeria.client.retrofit2.ArmeriaRetrofit;
 import com.linecorp.armeria.retrofit2.shared.SimpleBenchmarkBase;
 import com.linecorp.armeria.retrofit2.shared.SimpleBenchmarkClient;
 
-import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 import retrofit2.converter.jackson.JacksonConverterFactory;
 
 @State(Scope.Benchmark)
@@ -33,14 +32,12 @@ public class DownstreamSimpleBenchmark extends SimpleBenchmarkBase {
 
     @Override
     protected SimpleBenchmarkClient newClient() {
-        final ClientFactory factory =
-                new ClientFactoryBuilder()
-                        .sslContextCustomizer(ssl -> ssl.trustManager(InsecureTrustManagerFactory.INSTANCE))
-                        .build();
-        return new ArmeriaRetrofitBuilder(factory)
-                .baseUrl(baseUrl())
-                .addConverterFactory(JacksonConverterFactory.create())
-                .build()
-                .create(SimpleBenchmarkClient.class);
+        final WebClient webClient = WebClient.builder(baseUrl())
+                                             .factory(ClientFactory.insecure())
+                                             .build();
+        return ArmeriaRetrofit.builder(webClient)
+                              .addConverterFactory(JacksonConverterFactory.create())
+                              .build()
+                              .create(SimpleBenchmarkClient.class);
     }
 }

@@ -16,13 +16,14 @@
 
 package com.linecorp.armeria.common.stream;
 
+import static com.linecorp.armeria.common.util.Exceptions.throwIfFatal;
+import static java.util.Objects.requireNonNull;
+
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 
 import javax.annotation.Nullable;
 
 import org.reactivestreams.Subscriber;
-
-import com.linecorp.armeria.common.Flags;
 
 import io.netty.util.concurrent.ImmediateEventExecutor;
 
@@ -112,18 +113,28 @@ abstract class FixedStreamMessage<T> extends AbstractStreamMessage<T> {
 
         final Subscriber<Object> subscriber = subscription.subscriber();
         if (subscription.needsDirectInvocation()) {
-            subscriber.onSubscribe(subscription);
+            subscribe(subscription, subscriber);
         } else {
-            subscription.executor().execute(() -> subscriber.onSubscribe(subscription));
+            subscription.executor().execute(() -> subscribe(subscription, subscriber));
         }
 
         return subscription;
     }
 
-    @Override
+    private void subscribe(SubscriptionImpl subscription, Subscriber<Object> subscriber) {
+        try {
+            subscriber.onSubscribe(subscription);
+        } catch (Throwable t) {
+            abort(t);
+            throwIfFatal(t);
+            logger.warn("Subscriber.onSubscribe() should not raise an exception. subscriber: {}",
+                        subscriber, t);
+        }
+    }
+
     final void notifySubscriberOfCloseEvent(SubscriptionImpl subscription, CloseEvent event) {
         try {
-            event.notifySubscriber(subscription, completionFuture());
+            event.notifySubscriber(subscription, whenComplete());
         } finally {
             subscription.clearSubscriber();
             cleanup(subscription);
@@ -132,33 +143,37 @@ abstract class FixedStreamMessage<T> extends AbstractStreamMessage<T> {
 
     @Override
     final void cancel() {
-        cancelOrAbort(true);
+        cancelOrAbort(CancelledSubscriptionException.get());
     }
 
     @Override
     public final void abort() {
+        abort0(AbortedStreamException.get());
+    }
+
+    @Override
+    public final void abort(Throwable cause) {
+        requireNonNull(cause, "cause");
+        abort0(cause);
+    }
+
+    private void abort0(Throwable cause) {
         final SubscriptionImpl currentSubscription = subscription;
         if (currentSubscription != null) {
-            cancelOrAbort(false);
+            cancelOrAbort(cause);
             return;
         }
 
         final SubscriptionImpl newSubscription = new SubscriptionImpl(
-                this, AbortingSubscriber.get(), ImmediateEventExecutor.INSTANCE, false, false);
+                this, AbortingSubscriber.get(cause), ImmediateEventExecutor.INSTANCE, false, false);
         subscriptionUpdater.compareAndSet(this, null, newSubscription);
-        cancelOrAbort(false);
+        cancelOrAbort(cause);
     }
 
-    private void cancelOrAbort(boolean cancel) {
-        final CloseEvent closeEvent;
-        if (cancel) {
-            closeEvent = Flags.verboseExceptions() ?
-                         new CloseEvent(CancelledSubscriptionException.get()) : CANCELLED_CLOSE;
-        } else {
-            closeEvent = Flags.verboseExceptions() ?
-                         new CloseEvent(AbortedStreamException.get()) : ABORTED_CLOSE;
-        }
-        if (closeEventUpdater.compareAndSet(this, null, closeEvent)) {
+    private void cancelOrAbort(Throwable cause) {
+        if (closeEventUpdater.compareAndSet(this, null, newCloseEvent(cause))) {
+            final SubscriptionImpl subscription = this.subscription;
+            assert subscription != null;
             if (subscription.needsDirectInvocation()) {
                 cleanup(subscription);
             } else {

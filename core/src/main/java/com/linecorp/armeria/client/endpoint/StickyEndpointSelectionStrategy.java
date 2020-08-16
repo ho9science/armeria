@@ -44,9 +44,9 @@ import com.linecorp.armeria.common.HttpRequest;
  * final StickyEndpointSelectionStrategy strategy = new StickyEndpointSelectionStrategy(hasher);
  * }</pre>
  */
-public final class StickyEndpointSelectionStrategy implements EndpointSelectionStrategy {
+final class StickyEndpointSelectionStrategy implements EndpointSelectionStrategy {
 
-    private final ToLongFunction<ClientRequestContext> requestContextHasher;
+    private final ToLongFunction<? super ClientRequestContext> requestContextHasher;
 
     /**
      * Creates a new {@link StickyEndpointSelectionStrategy}
@@ -54,7 +54,7 @@ public final class StickyEndpointSelectionStrategy implements EndpointSelectionS
      *
      * @param requestContextHasher The default {@link ToLongFunction} of {@link ClientRequestContext}
      */
-    public StickyEndpointSelectionStrategy(ToLongFunction<ClientRequestContext> requestContextHasher) {
+    StickyEndpointSelectionStrategy(ToLongFunction<? super ClientRequestContext> requestContextHasher) {
         this.requestContextHasher = requireNonNull(requestContextHasher, "requestContextHasher");
     }
 
@@ -66,36 +66,25 @@ public final class StickyEndpointSelectionStrategy implements EndpointSelectionS
      */
     @Override
     public EndpointSelector newSelector(EndpointGroup endpointGroup) {
-        return new StickyEndpointSelector(requestContextHasher, endpointGroup);
+        return new StickyEndpointSelector(endpointGroup, requestContextHasher);
     }
 
-    private final class StickyEndpointSelector implements EndpointSelector {
+    private static final class StickyEndpointSelector extends AbstractEndpointSelector {
 
-        private final ToLongFunction<ClientRequestContext> requestContextHasher;
-        private final EndpointGroup endpointGroup;
+        private final ToLongFunction<? super ClientRequestContext> requestContextHasher;
 
-        StickyEndpointSelector(ToLongFunction<ClientRequestContext> requestContextHasher,
-                               EndpointGroup endpointGroup) {
+        StickyEndpointSelector(EndpointGroup endpointGroup,
+                               ToLongFunction<? super ClientRequestContext> requestContextHasher) {
+            super(endpointGroup);
             this.requestContextHasher = requireNonNull(requestContextHasher, "requestContextHasher");
-            this.endpointGroup = requireNonNull(endpointGroup, "endpointGroup");
         }
 
         @Override
-        public EndpointGroup group() {
-            return endpointGroup;
-        }
+        public Endpoint selectNow(ClientRequestContext ctx) {
 
-        @Override
-        public EndpointSelectionStrategy strategy() {
-            return StickyEndpointSelectionStrategy.this;
-        }
-
-        @Override
-        public Endpoint select(ClientRequestContext ctx) {
-
-            final List<Endpoint> endpoints = endpointGroup.endpoints();
+            final List<Endpoint> endpoints = group().endpoints();
             if (endpoints.isEmpty()) {
-                throw new EndpointGroupException(endpointGroup + " is empty");
+                return null;
             }
 
             final long key = requestContextHasher.applyAsLong(ctx);

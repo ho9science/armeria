@@ -18,41 +18,53 @@ import Button from '@material-ui/core/Button';
 import TextField from '@material-ui/core/TextField';
 import Typography from '@material-ui/core/Typography';
 import React, { ChangeEvent } from 'react';
+import Dropdown, { Option } from 'react-dropdown';
 
 const endpointPathPlaceHolder = '/foo/bar';
 
 interface Props {
+  editable: boolean;
   endpointPathOpen: boolean;
-  endpointPath: string;
-  onEditEndpointPathClick: () => void;
-  onEndpointPathChange: (e: ChangeEvent<HTMLInputElement>) => void;
+  examplePaths: Option[];
+  additionalPath: string;
+  onSelectedPathChange: (selectedPath: Option) => void;
+  onEditEndpointPathClick: React.Dispatch<unknown>;
+  onPathFormChange: (e: ChangeEvent<HTMLInputElement>) => void;
 }
 
-const EndpointPath: React.SFC<Props> = (props) => {
-  return (
-    <>
-      <Typography variant="body2" paragraph />
-      <Button color="secondary" onClick={props.onEditEndpointPathClick}>
-        Endpoint path
-      </Button>
-      <Typography variant="body2" paragraph />
-      {props.endpointPathOpen && (
-        <>
-          <TextField
-            multiline
-            fullWidth
-            rows={1}
-            value={props.endpointPath}
-            placeholder={endpointPathPlaceHolder}
-            onChange={props.onEndpointPathChange}
-            inputProps={{
-              className: 'code',
-            }}
-          />
-        </>
-      )}
-    </>
-  );
-};
+const EndpointPath: React.FunctionComponent<Props> = (props) => (
+  <>
+    <Typography variant="body2" paragraph />
+    <Button color="secondary" onClick={props.onEditEndpointPathClick}>
+      Endpoint path
+    </Button>
+    <Typography variant="body2" paragraph />
+    {props.endpointPathOpen && (
+      <>
+        {props.examplePaths.length > 0 && (
+          <>
+            <Typography variant="body2" paragraph />
+            <Dropdown
+              placeholder="Select an example path..."
+              options={props.examplePaths}
+              onChange={props.onSelectedPathChange}
+            />
+          </>
+        )}
+        <Typography variant="body2" paragraph />
+        <TextField
+          fullWidth
+          value={props.additionalPath}
+          placeholder={endpointPathPlaceHolder}
+          onChange={props.onPathFormChange}
+          inputProps={{
+            readOnly: !props.editable,
+            className: 'code',
+          }}
+        />
+      </>
+    )}
+  </>
+);
 
-export default EndpointPath;
+export default React.memo(EndpointPath);

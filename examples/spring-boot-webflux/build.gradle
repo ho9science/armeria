@@ -9,18 +9,13 @@ buildscript {
 
 apply plugin: 'org.springframework.boot'
 
-springBoot {
-    mainClassName = 'example.springframework.boot.webflux.Main'
-}
-
 dependencies {
-    compile project(':spring:boot-webflux-starter')
+    implementation project(':spring:boot2-webflux-starter')
 
-    compileOnly 'org.springframework.boot:spring-boot-configuration-processor'
     annotationProcessor 'org.springframework.boot:spring-boot-configuration-processor'
 
-    runtime project(':spring:boot-actuator-starter')
+    runtimeOnly project(':spring:boot2-actuator-starter')
 
-    testCompile 'junit:junit'
-    testCompile 'org.springframework.boot:spring-boot-starter-test'
+    testImplementation 'org.junit.jupiter:junit-jupiter-api'
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
 }

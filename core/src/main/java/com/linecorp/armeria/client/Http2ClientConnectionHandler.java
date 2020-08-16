@@ -16,8 +16,17 @@
 
 package com.linecorp.armeria.client;
 
-import com.linecorp.armeria.internal.AbstractHttp2ConnectionHandler;
+import javax.annotation.Nullable;
 
+import com.google.common.collect.ImmutableList;
+
+import com.linecorp.armeria.common.SessionProtocol;
+import com.linecorp.armeria.common.metric.MoreMeters;
+import com.linecorp.armeria.internal.common.AbstractHttp2ConnectionHandler;
+import com.linecorp.armeria.internal.common.Http2KeepAliveHandler;
+
+import io.micrometer.core.instrument.Tag;
+import io.micrometer.core.instrument.Timer;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.http2.Http2ConnectionDecoder;
@@ -28,15 +37,28 @@ final class Http2ClientConnectionHandler extends AbstractHttp2ConnectionHandler 
 
     private final HttpClientFactory clientFactory;
     private final Http2ResponseDecoder responseDecoder;
+    @Nullable
+    private final Http2KeepAliveHandler keepAliveHandler;
 
     Http2ClientConnectionHandler(Http2ConnectionDecoder decoder, Http2ConnectionEncoder encoder,
                                  Http2Settings initialSettings, Channel channel,
-                                 HttpClientFactory clientFactory) {
+                                 HttpClientFactory clientFactory, SessionProtocol protocol) {
 
         super(decoder, encoder, initialSettings);
-
         this.clientFactory = clientFactory;
-        responseDecoder = new Http2ResponseDecoder(channel, encoder(), clientFactory);
+
+        if (clientFactory.idleTimeoutMillis() > 0 || clientFactory.pingIntervalMillis() > 0) {
+            final Timer keepAliveTimer =
+                    MoreMeters.newTimer(clientFactory.meterRegistry(), "armeria.client.connections.lifespan",
+                                        ImmutableList.of(Tag.of("protocol", protocol.uriText())));
+            keepAliveHandler = new Http2ClientKeepAliveHandler(
+                    channel, encoder.frameWriter(), keepAliveTimer,
+                    clientFactory.idleTimeoutMillis(), clientFactory.pingIntervalMillis());
+        } else {
+            keepAliveHandler = null;
+        }
+
+        responseDecoder = new Http2ResponseDecoder(channel, encoder(), clientFactory, keepAliveHandler);
         connection().addListener(responseDecoder);
         decoder().frameListener(responseDecoder);
 
@@ -54,21 +76,60 @@ final class Http2ClientConnectionHandler extends AbstractHttp2ConnectionHandler 
         return responseDecoder;
     }
 
+    @Nullable
+    Http2KeepAliveHandler keepAliveHandler() {
+        return keepAliveHandler;
+    }
+
+    @Override
+    public void handlerAdded(ChannelHandlerContext ctx) throws Exception {
+        maybeInitializeKeepAliveHandler(ctx);
+        super.handlerAdded(ctx);
+    }
+
+    @Override
+    protected void handlerRemoved0(ChannelHandlerContext ctx) throws Exception {
+        destroyKeepAliveHandler();
+        super.handlerRemoved0(ctx);
+    }
+
+    @Override
+    public void channelRegistered(ChannelHandlerContext ctx) throws Exception {
+        maybeInitializeKeepAliveHandler(ctx);
+        super.channelRegistered(ctx);
+    }
+
     @Override
     public void channelActive(ChannelHandlerContext ctx) throws Exception {
-        super.channelActive(ctx);
+        maybeInitializeKeepAliveHandler(ctx);
 
+        super.channelActive(ctx);
         // NB: Http2ConnectionHandler does not flush the preface string automatically.
         ctx.flush();
     }
 
     @Override
-    protected void onCloseRequest(ChannelHandlerContext ctx) throws Exception {
-        HttpSession.get(ctx.channel()).deactivate();
+    protected boolean needsImmediateDisconnection() {
+        return clientFactory.isClosing() ||
+               responseDecoder.goAwayHandler().receivedErrorGoAway() ||
+               (keepAliveHandler != null && keepAliveHandler.isClosing());
     }
 
     @Override
-    protected boolean needsImmediateDisconnection() {
-        return clientFactory.isClosing() || responseDecoder.goAwayHandler().receivedErrorGoAway();
+    public void channelInactive(final ChannelHandlerContext ctx) throws Exception {
+        destroyKeepAliveHandler();
+        super.channelInactive(ctx);
+    }
+
+    private void maybeInitializeKeepAliveHandler(ChannelHandlerContext ctx) {
+        if (keepAliveHandler != null && ctx.channel().isActive() && ctx.channel().isRegistered()) {
+            keepAliveHandler.initialize(ctx);
+        }
+    }
+
+    private void destroyKeepAliveHandler() {
+        if (keepAliveHandler != null) {
+            keepAliveHandler.destroy();
+        }
     }
 }

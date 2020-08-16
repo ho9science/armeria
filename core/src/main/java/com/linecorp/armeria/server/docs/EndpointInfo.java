@@ -32,13 +32,23 @@ import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableSortedSet;
 
 import com.linecorp.armeria.common.MediaType;
+import com.linecorp.armeria.common.annotation.UnstableApi;
 import com.linecorp.armeria.server.Service;
 
 /**
  * Metadata about the endpoints exposed by a {@link Service}.
  */
+@UnstableApi
 @JsonInclude(Include.NON_NULL)
 public final class EndpointInfo {
+
+    /**
+     * Returns a newly created {@link EndpointInfoBuilder} that builds the {@link EndpointInfo} with
+     * the specified {@code hostnamePattern} and {@code pathMapping}.
+     */
+    public static EndpointInfoBuilder builder(String hostnamePattern, String pathMapping) {
+        return new EndpointInfoBuilder(hostnamePattern, pathMapping);
+    }
 
     private final String hostnamePattern;
     private final String pathMapping;
@@ -128,7 +138,7 @@ public final class EndpointInfo {
     }
 
     @Override
-    public boolean equals(Object obj) {
+    public boolean equals(@Nullable Object obj) {
         if (!(obj instanceof EndpointInfo)) {
             return false;
         }

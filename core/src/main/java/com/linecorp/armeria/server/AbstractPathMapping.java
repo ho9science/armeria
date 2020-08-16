@@ -16,8 +16,7 @@
 
 package com.linecorp.armeria.server;
 
-import static com.linecorp.armeria.internal.RouteUtil.UNKNOWN_LOGGER_NAME;
-import static com.linecorp.armeria.internal.RouteUtil.ensureAbsolutePath;
+import static com.linecorp.armeria.internal.server.RouteUtil.ensureAbsolutePath;
 import static java.util.Objects.requireNonNull;
 
 import javax.annotation.Nullable;
@@ -42,7 +41,7 @@ abstract class AbstractPathMapping implements PathMapping {
      * Invoked by {@link #apply(RoutingContext)} to perform the actual path matching and path parameter
      * extraction.
      *
-     * @param routingCtx a context to find the {@link Service}
+     * @param routingCtx a context to find the {@link HttpService}
      *
      * @return a non-empty {@link RoutingResultBuilder} if the specified {@code path} matches this mapping.
      *         {@code null} otherwise.
@@ -51,12 +50,7 @@ abstract class AbstractPathMapping implements PathMapping {
     abstract RoutingResultBuilder doApply(RoutingContext routingCtx);
 
     @Override
-    public String loggerName() {
-        return UNKNOWN_LOGGER_NAME;
-    }
-
-    @Override
-    public String meterTag() {
-        return "__UNKNOWN_PATH__";
+    public String toString() {
+        return patternString();
     }
 }

@@ -19,8 +19,6 @@ package com.linecorp.armeria.server.docs;
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.collect.ImmutableMap.toImmutableMap;
 import static com.google.common.collect.ImmutableSet.toImmutableSet;
-import static com.linecorp.armeria.server.composition.CompositeServiceEntry.ofCatchAll;
-import static com.linecorp.armeria.server.composition.CompositeServiceEntry.ofExact;
 import static java.util.Objects.requireNonNull;
 
 import java.time.Clock;
@@ -29,8 +27,11 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.ServiceLoader;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executor;
 import java.util.function.BiFunction;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import javax.annotation.Nullable;
 
@@ -44,11 +45,13 @@ import com.google.common.collect.ListMultimap;
 import com.google.common.collect.Streams;
 
 import com.linecorp.armeria.common.HttpData;
+import com.linecorp.armeria.common.HttpHeaderNames;
 import com.linecorp.armeria.common.HttpHeaders;
 import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.MediaType;
 import com.linecorp.armeria.common.ServerCacheControl;
+import com.linecorp.armeria.common.util.Version;
 import com.linecorp.armeria.server.HttpService;
 import com.linecorp.armeria.server.Server;
 import com.linecorp.armeria.server.ServerConfig;
@@ -56,12 +59,14 @@ import com.linecorp.armeria.server.ServerListenerAdapter;
 import com.linecorp.armeria.server.Service;
 import com.linecorp.armeria.server.ServiceConfig;
 import com.linecorp.armeria.server.ServiceRequestContext;
+import com.linecorp.armeria.server.SimpleDecoratingHttpService;
 import com.linecorp.armeria.server.VirtualHost;
-import com.linecorp.armeria.server.composition.AbstractCompositeService;
 import com.linecorp.armeria.server.file.AbstractHttpVfs;
+import com.linecorp.armeria.server.file.AggregatedHttpFile;
+import com.linecorp.armeria.server.file.FileService;
 import com.linecorp.armeria.server.file.HttpFile;
 import com.linecorp.armeria.server.file.HttpFileBuilder;
-import com.linecorp.armeria.server.file.HttpFileService;
+import com.linecorp.armeria.server.file.HttpVfs;
 
 /**
  * An {@link HttpService} that provides information about the {@link Service}s running in a
@@ -77,9 +82,7 @@ import com.linecorp.armeria.server.file.HttpFileService;
  * @see DocServiceBuilder#include(DocServiceFilter)
  * @see DocServiceBuilder#exclude(DocServiceFilter)
  */
-public class DocService extends AbstractCompositeService<HttpRequest, HttpResponse> {
-
-    private static final int SPECIFICATION_INDEX = 0;
+public final class DocService extends SimpleDecoratingHttpService {
 
     private static final ObjectMapper jsonMapper = new ObjectMapper()
             .setSerializationInclusion(Include.NON_ABSENT);
@@ -87,8 +90,18 @@ public class DocService extends AbstractCompositeService<HttpRequest, HttpRespon
     static final List<DocServicePlugin> plugins = Streams.stream(ServiceLoader.load(
             DocServicePlugin.class, DocService.class.getClassLoader())).collect(toImmutableList());
 
-    private final Map<String, ListMultimap<String, HttpHeaders>> exampleHttpHeaders;
+    /**
+     * Returns a new {@link DocServiceBuilder}.
+     */
+    public static DocServiceBuilder builder() {
+        return new DocServiceBuilder();
+    }
+
+    private final Map<String, ListMultimap<String, HttpHeaders>> exampleHeaders;
     private final Map<String, ListMultimap<String, String>> exampleRequests;
+    private final Map<String, ListMultimap<String, String>> examplePaths;
+    private final Map<String, ListMultimap<String, String>> exampleQueries;
+    private final List<BiFunction<ServiceRequestContext, HttpRequest, String>> injectedScriptSuppliers;
     private final DocServiceFilter filter;
 
     @Nullable
@@ -98,27 +111,28 @@ public class DocService extends AbstractCompositeService<HttpRequest, HttpRespon
      * Creates a new instance.
      */
     public DocService() {
-        this(ImmutableMap.of(), ImmutableMap.of(), ImmutableList.of(), DocServiceBuilder.ALL_SERVICES);
+        this(/* exampleHeaders */ ImmutableMap.of(), /* exampleRequests */ ImmutableMap.of(),
+             /* examplePaths */ ImmutableMap.of(), /* exampleQueries */ ImmutableMap.of(),
+             /* injectedScriptSuppliers */ ImmutableList.of(), DocServiceBuilder.ALL_SERVICES);
     }
 
     /**
      * Creates a new instance with example HTTP headers and example requests and injected scripts.
      */
-    DocService(Map<String, ListMultimap<String, HttpHeaders>> exampleHttpHeaders,
+    DocService(Map<String, ListMultimap<String, HttpHeaders>> exampleHeaders,
                Map<String, ListMultimap<String, String>> exampleRequests,
+               Map<String, ListMultimap<String, String>> examplePaths,
+               Map<String, ListMultimap<String, String>> exampleQueries,
                List<BiFunction<ServiceRequestContext, HttpRequest, String>> injectedScriptSuppliers,
                DocServiceFilter filter) {
 
-        super(ofExact("/specification.json", HttpFileService.forVfs(new DocServiceVfs())),
-              ofExact("/injected.js",
-                      (ctx, req) -> HttpResponse.of(MediaType.JAVASCRIPT_UTF_8,
-                                                    injectedScriptSuppliers.stream()
-                                                                           .map(f -> f.apply(ctx, req))
-                                                                           .collect(Collectors.joining("\n")))),
-              ofCatchAll(HttpFileService.forClassPath(DocService.class.getClassLoader(),
-                                                      "com/linecorp/armeria/server/docs")));
-        this.exampleHttpHeaders = immutableCopyOf(exampleHttpHeaders, "exampleHttpHeaders");
+        super(FileService.of(new DocServiceVfs()));
+
+        this.exampleHeaders = immutableCopyOf(exampleHeaders, "exampleHeaders");
         this.exampleRequests = immutableCopyOf(exampleRequests, "exampleRequests");
+        this.examplePaths = immutableCopyOf(examplePaths, "examplePaths");
+        this.exampleQueries = immutableCopyOf(exampleQueries, "exampleQueries");
+        this.injectedScriptSuppliers = requireNonNull(injectedScriptSuppliers, "injectedScriptSuppliers");
         this.filter = requireNonNull(filter, "filter");
     }
 
@@ -161,8 +175,13 @@ public class DocService extends AbstractCompositeService<HttpRequest, HttpRespon
                 spec = addDocStrings(spec, services);
                 spec = addExamples(spec);
 
-                vfs(SPECIFICATION_INDEX).setContent(jsonMapper.writerWithDefaultPrettyPrinter()
-                                                              .writeValueAsBytes(spec));
+                final List<Version> versions = ImmutableList.copyOf(
+                        Version.getAll(DocService.class.getClassLoader()).values());
+
+                vfs().put("/specification.json",
+                          jsonMapper.writerWithDefaultPrettyPrinter().writeValueAsBytes(spec));
+                vfs().put("/versions.json",
+                          jsonMapper.writerWithDefaultPrettyPrinter().writeValueAsBytes(versions));
             }
         });
     }
@@ -195,7 +214,7 @@ public class DocService extends AbstractCompositeService<HttpRequest, HttpRespon
                 spec.exceptions().stream()
                     .map(e -> addExceptionDocStrings(e, docStrings))
                     .collect(toImmutableList()),
-                spec.exampleHttpHeaders());
+                spec.exampleHeaders());
     }
 
     private static ServiceInfo addServiceDocStrings(ServiceInfo service, Map<String, String> docStrings) {
@@ -204,7 +223,7 @@ public class DocService extends AbstractCompositeService<HttpRequest, HttpRespon
                 service.methods().stream()
                        .map(method -> addMethodDocStrings(service, method, docStrings))
                        .collect(toImmutableList()),
-                service.exampleHttpHeaders(),
+                service.exampleHeaders(),
                 docString(service.name(), service.docString(), docStrings));
     }
 
@@ -217,8 +236,10 @@ public class DocService extends AbstractCompositeService<HttpRequest, HttpRespon
                                     .collect(toImmutableList()),
                               method.exceptionTypeSignatures(),
                               method.endpoints(),
-                              method.exampleHttpHeaders(),
+                              method.exampleHeaders(),
                               method.exampleRequests(),
+                              method.examplePaths(),
+                              method.exampleQueries(),
                               method.httpMethod(),
                               docString(service.name() + '/' + method.name(), method.docString(), docStrings));
     }
@@ -245,6 +266,7 @@ public class DocService extends AbstractCompositeService<HttpRequest, HttpRespon
     private static EnumValueInfo addEnumValueDocString(EnumInfo e, EnumValueInfo v,
                                                        Map<String, String> docStrings) {
         return new EnumValueInfo(v.name(),
+                                 v.intValue(),
                                  docString(e.name() + '/' + v.name(), v.docString(), docStrings));
     }
 
@@ -274,6 +296,7 @@ public class DocService extends AbstractCompositeService<HttpRequest, HttpRespon
                              docString(parent.name() + '/' + field.name(), field.docString(), docStrings));
     }
 
+    @Nullable
     private static String docString(
             String key, @Nullable String currentDocString, Map<String, String> docStrings) {
         return currentDocString != null ? currentDocString : docStrings.get(key);
@@ -285,15 +308,19 @@ public class DocService extends AbstractCompositeService<HttpRequest, HttpRespon
                     .map(this::addServiceExamples)
                     .collect(toImmutableList()),
                 spec.enums(), spec.structs(), spec.exceptions(),
-                Iterables.concat(spec.exampleHttpHeaders(),
-                                 exampleHttpHeaders.getOrDefault("", ImmutableListMultimap.of()).get("")));
+                Iterables.concat(spec.exampleHeaders(),
+                                 exampleHeaders.getOrDefault("", ImmutableListMultimap.of()).get("")));
     }
 
     private ServiceInfo addServiceExamples(ServiceInfo service) {
-        final ListMultimap<String, HttpHeaders> exampleHttpHeaders =
-                this.exampleHttpHeaders.getOrDefault(service.name(), ImmutableListMultimap.of());
+        final ListMultimap<String, HttpHeaders> exampleHeaders =
+                this.exampleHeaders.getOrDefault(service.name(), ImmutableListMultimap.of());
         final ListMultimap<String, String> exampleRequests =
                 this.exampleRequests.getOrDefault(service.name(), ImmutableListMultimap.of());
+        final ListMultimap<String, String> examplePaths =
+                this.examplePaths.getOrDefault(service.name(), ImmutableListMultimap.of());
+        final ListMultimap<String, String> exampleQueries =
+                this.exampleQueries.getOrDefault(service.name(), ImmutableListMultimap.of());
 
         // Reconstruct ServiceInfo with the examples.
         return new ServiceInfo(
@@ -302,16 +329,23 @@ public class DocService extends AbstractCompositeService<HttpRequest, HttpRespon
                 service.methods().stream().map(m -> new MethodInfo(
                         m.name(), m.returnTypeSignature(), m.parameters(), m.exceptionTypeSignatures(),
                         m.endpoints(),
-                        Iterables.concat(m.exampleHttpHeaders(), exampleHttpHeaders.get(m.name())),
-                        Iterables.concat(m.exampleRequests(), exampleRequests.get(m.name())),
+                        // Show the examples added via `DocServiceBuilder` before the examples
+                        // generated by the plugin.
+                        concatAndDedup(exampleHeaders.get(m.name()), m.exampleHeaders()),
+                        concatAndDedup(exampleRequests.get(m.name()), m.exampleRequests()),
+                        examplePaths.get(m.name()),
+                        exampleQueries.get(m.name()),
                         m.httpMethod(), m.docString()))::iterator,
-                Iterables.concat(service.exampleHttpHeaders(),
-                                 exampleHttpHeaders.get("")),
+                Iterables.concat(service.exampleHeaders(), exampleHeaders.get("")),
                 service.docString());
     }
 
-    private DocServiceVfs vfs(int index) {
-        return (DocServiceVfs) ((HttpFileService) serviceAt(index)).config().vfs();
+    private static <T> Iterable<T> concatAndDedup(Iterable<T> first, Iterable<T> second) {
+        return Stream.concat(Streams.stream(first), Streams.stream(second)).distinct()::iterator;
+    }
+
+    private DocServiceVfs vfs() {
+        return (DocServiceVfs) ((FileService) unwrap()).config().vfs();
     }
 
     private static Set<ServiceConfig> findSupportedServices(
@@ -324,17 +358,50 @@ public class DocService extends AbstractCompositeService<HttpRequest, HttpRespon
 
     private static boolean isSupported(
             ServiceConfig serviceCfg, Set<Class<? extends Service<?, ?>>> supportedServiceTypes) {
-        return supportedServiceTypes.stream().anyMatch(type -> serviceCfg.service().as(type).isPresent());
+        return supportedServiceTypes.stream().anyMatch(type -> serviceCfg.service().as(type) != null);
+    }
+
+    @Override
+    public HttpResponse serve(ServiceRequestContext ctx, HttpRequest req) throws Exception {
+        if ("/injected.js".equals(ctx.mappedPath())) {
+            return HttpResponse.of(MediaType.JAVASCRIPT_UTF_8,
+                                   injectedScriptSuppliers.stream()
+                                                          .map(f -> f.apply(ctx, req))
+                                                          .collect(Collectors.joining("\n")));
+        }
+
+        return unwrap().serve(ctx, req);
     }
 
     static final class DocServiceVfs extends AbstractHttpVfs {
 
-        private volatile HttpFile file = HttpFile.nonExistent();
+        private final HttpVfs staticFiles = HttpVfs.of(DocService.class.getClassLoader(),
+                                                       "com/linecorp/armeria/server/docs");
+
+        private final Map<String, AggregatedHttpFile> files = new ConcurrentHashMap<>();
 
         @Override
-        public HttpFile get(String path, Clock clock, @Nullable String contentEncoding,
-                            HttpHeaders additionalHeaders) {
-            return file;
+        public HttpFile get(
+                Executor fileReadExecutor, String path, Clock clock,
+                @Nullable String contentEncoding, HttpHeaders additionalHeaders) {
+
+            final AggregatedHttpFile file = files.get(path);
+            if (file != null) {
+                assert file != AggregatedHttpFile.nonExistent();
+
+                final HttpFileBuilder builder = HttpFile.builder(file.content(),
+                                                                 file.attributes().lastModifiedMillis());
+                builder.autoDetectedContentType(false);
+                builder.clock(clock);
+                builder.setHeaders(file.headers());
+                builder.setHeaders(additionalHeaders);
+                if (contentEncoding != null) {
+                    builder.setHeader(HttpHeaderNames.CONTENT_ENCODING, contentEncoding);
+                }
+                return builder.build();
+            }
+
+            return staticFiles.get(fileReadExecutor, path, clock, contentEncoding, additionalHeaders);
         }
 
         @Override
@@ -342,16 +409,15 @@ public class DocService extends AbstractCompositeService<HttpRequest, HttpRespon
             return DocService.class.getSimpleName();
         }
 
-        void setContent(byte[] content) {
-            setContent(content, MediaType.JSON_UTF_8);
+        void put(String path, byte[] content) {
+            put(path, content, MediaType.JSON_UTF_8);
         }
 
-        void setContent(byte[] content, MediaType mediaType) {
-            assert file == HttpFile.nonExistent();
-            file = HttpFileBuilder.of(HttpData.wrap(content))
-                                  .contentType(mediaType)
-                                  .cacheControl(ServerCacheControl.REVALIDATED)
-                                  .build();
+        private void put(String path, byte[] content, MediaType mediaType) {
+            files.put(path, AggregatedHttpFile.builder(HttpData.wrap(content))
+                                              .contentType(mediaType)
+                                              .cacheControl(ServerCacheControl.REVALIDATED)
+                                              .build());
         }
     }
 }

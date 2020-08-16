@@ -20,29 +20,44 @@ import java.util.function.Function;
 
 import com.linecorp.armeria.common.HttpHeaderNames;
 import com.linecorp.armeria.common.RequestHeaders;
+import com.linecorp.armeria.common.auth.BasicToken;
+import com.linecorp.armeria.common.auth.OAuth1aToken;
+import com.linecorp.armeria.common.auth.OAuth2Token;
 
 /**
  * A utility class that provides singleton instances of authorization token extractor functions.
  */
 public final class AuthTokenExtractors {
 
-    /**
-     * A {@link BasicToken} extractor function instance.
-     */
-    public static final Function<RequestHeaders, BasicToken> BASIC =
+    private static final Function<? super RequestHeaders, BasicToken> BASIC =
             new BasicTokenExtractor(HttpHeaderNames.AUTHORIZATION);
 
-    /**
-     * An {@link OAuth1aToken} extractor function instance.
-     */
-    public static final Function<RequestHeaders, OAuth1aToken> OAUTH1A =
+    private static final Function<? super RequestHeaders, OAuth1aToken> OAUTH1A =
             new OAuth1aTokenExtractor(HttpHeaderNames.AUTHORIZATION);
 
-    /**
-     * An {@link OAuth2Token} extractor function instance.
-     */
-    public static final Function<RequestHeaders, OAuth2Token> OAUTH2 =
+    private static final Function<? super RequestHeaders, OAuth2Token> OAUTH2 =
             new OAuth2TokenExtractor(HttpHeaderNames.AUTHORIZATION);
+
+    /**
+     * Returns a {@link BasicToken} extractor function.
+     */
+    public static Function<? super RequestHeaders, BasicToken> basic() {
+        return BASIC;
+    }
+
+    /**
+     * Returns an {@link OAuth1aToken} extractor function.
+     */
+    public static Function<? super RequestHeaders, OAuth1aToken> oAuth1a() {
+        return OAUTH1A;
+    }
+
+    /**
+     * Returns an {@link OAuth2Token} extractor function.
+     */
+    public static Function<? super RequestHeaders, OAuth2Token> oAuth2() {
+        return OAUTH2;
+    }
 
     private AuthTokenExtractors() {}
 }

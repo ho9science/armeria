@@ -35,7 +35,7 @@ import static java.util.Objects.requireNonNull;
 import java.util.EnumSet;
 import java.util.Set;
 
-import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Sets;
 
 /**
  * HTTP request method.
@@ -108,12 +108,13 @@ public enum HttpMethod {
      */
     UNKNOWN;
 
-    private static final Set<HttpMethod> knownMethods;
+    private static final Set<HttpMethod> knownMethods; // ImmutableEnumSet
+    private static final Set<HttpMethod> idempotentMethods = Sets.immutableEnumSet(GET, HEAD, PUT, DELETE);
 
     static {
         final Set<HttpMethod> allMethods = EnumSet.allOf(HttpMethod.class);
         allMethods.remove(UNKNOWN);
-        knownMethods = ImmutableSet.copyOf(allMethods);
+        knownMethods = Sets.immutableEnumSet(allMethods);
     }
 
     /**
@@ -137,6 +138,14 @@ public enum HttpMethod {
         }
 
         return false;
+    }
+
+    /**
+     * Returns the <a href="https://developer.mozilla.org/en-US/docs/Glossary/Idempotent">idempotent</a>
+     * HTTP methods - {@link #GET}, {@link #HEAD}, {@link #PUT} and {@link #DELETE}.
+     */
+    public static Set<HttpMethod> idempotentMethods() {
+        return idempotentMethods;
     }
 
     /**

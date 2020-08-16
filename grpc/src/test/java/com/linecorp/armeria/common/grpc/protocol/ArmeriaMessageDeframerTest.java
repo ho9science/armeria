@@ -22,14 +22,18 @@ import static org.mockito.Mockito.reset;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
-import static org.mockito.Mockito.verifyZeroInteractions;
 
 import java.io.InputStream;
+import java.lang.reflect.Method;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Base64;
+import java.util.Random;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestInfo;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 
@@ -38,11 +42,11 @@ import com.google.common.io.ByteStreams;
 import com.google.protobuf.ByteString;
 
 import com.linecorp.armeria.common.HttpData;
-import com.linecorp.armeria.common.grpc.protocol.ArmeriaMessageDeframer.ByteBufOrStream;
+import com.linecorp.armeria.common.grpc.protocol.ArmeriaMessageDeframer.DeframedMessage;
 import com.linecorp.armeria.grpc.testing.Messages.Payload;
 import com.linecorp.armeria.grpc.testing.Messages.SimpleRequest;
-import com.linecorp.armeria.internal.grpc.ForwardingDecompressor;
-import com.linecorp.armeria.internal.grpc.GrpcTestUtil;
+import com.linecorp.armeria.internal.common.grpc.ForwardingDecompressor;
+import com.linecorp.armeria.internal.common.grpc.GrpcTestUtil;
 
 import io.grpc.Codec.Gzip;
 import io.netty.buffer.Unpooled;
@@ -58,10 +62,12 @@ class ArmeriaMessageDeframerTest {
     private ArmeriaMessageDeframer deframer;
 
     @BeforeEach
-    void setUp() {
+    void setUp(TestInfo info) {
+        final Method method = info.getTestMethod().get();
+        final boolean decodeBase64 = method.getName().contains("Base64");
         deframer = new ArmeriaMessageDeframer(listener,
                                               MAX_MESSAGE_SIZE,
-                                              UnpooledByteBufAllocator.DEFAULT)
+                                              UnpooledByteBufAllocator.DEFAULT, decodeBase64)
                 .decompressor(ForwardingDecompressor.forGrpc(new Gzip()));
     }
 
@@ -87,10 +93,23 @@ class ArmeriaMessageDeframerTest {
     void deframe_noRequests() throws Exception {
         deframer.deframe(HttpData.wrap(GrpcTestUtil.uncompressedFrame(GrpcTestUtil.requestByteBuf())), false);
         assertThat(deframer.isStalled()).isFalse();
-        verifyZeroInteractions(listener);
+        verifyNoMoreInteractions(listener);
 
         deframer.request(1);
-        verifyAndReleaseMessage(new ByteBufOrStream(GrpcTestUtil.requestByteBuf()));
+        verifyAndReleaseMessage(new DeframedMessage(GrpcTestUtil.requestByteBuf(), 0));
+        assertThat(deframer.isStalled()).isTrue();
+        verifyNoMoreInteractions(listener);
+    }
+
+    @Test
+    void decodeBase64AndDeframe_noRequests() throws Exception {
+        final byte[] data = GrpcTestUtil.uncompressedFrame(GrpcTestUtil.requestByteBuf());
+        deframer.deframe(HttpData.wrap(Base64.getEncoder().encode(data)), false);
+        assertThat(deframer.isStalled()).isFalse();
+        verifyNoMoreInteractions(listener);
+
+        deframer.request(1);
+        verifyAndReleaseMessage(new DeframedMessage(GrpcTestUtil.requestByteBuf(), 0));
         assertThat(deframer.isStalled()).isTrue();
         verifyNoMoreInteractions(listener);
     }
@@ -99,7 +118,17 @@ class ArmeriaMessageDeframerTest {
     void deframe_hasRequests() throws Exception {
         deframer.request(1);
         deframer.deframe(HttpData.wrap(GrpcTestUtil.uncompressedFrame(GrpcTestUtil.requestByteBuf())), false);
-        verifyAndReleaseMessage(new ByteBufOrStream(GrpcTestUtil.requestByteBuf()));
+        verifyAndReleaseMessage(new DeframedMessage(GrpcTestUtil.requestByteBuf(), 0));
+        verifyNoMoreInteractions(listener);
+        assertThat(deframer.isStalled()).isTrue();
+    }
+
+    @Test
+    void decodeBase64AndDeframe_hasRequests() throws Exception {
+        deframer.request(1);
+        final byte[] data = GrpcTestUtil.uncompressedFrame(GrpcTestUtil.requestByteBuf());
+        deframer.deframe(HttpData.wrap(Base64.getEncoder().encode(data)), false);
+        verifyAndReleaseMessage(new DeframedMessage(GrpcTestUtil.requestByteBuf(), 0));
         verifyNoMoreInteractions(listener);
         assertThat(deframer.isStalled()).isTrue();
     }
@@ -112,12 +141,31 @@ class ArmeriaMessageDeframerTest {
         // Only the last fragment should notify the listener.
         for (int i = 0; i < frameBytes.length - 1; i++) {
             deframer.deframe(HttpData.wrap(new byte[] { frameBytes[i] }), false);
-            verifyZeroInteractions(listener);
+            verifyNoMoreInteractions(listener);
             assertThat(deframer.isStalled()).isTrue();
         }
 
         deframer.deframe(HttpData.wrap(new byte[] { frameBytes[frameBytes.length - 1] }), false);
-        verifyAndReleaseMessage(new ByteBufOrStream(GrpcTestUtil.requestByteBuf()));
+        verifyAndReleaseMessage(new DeframedMessage(GrpcTestUtil.requestByteBuf(), 0));
+        verifyNoMoreInteractions(listener);
+        assertThat(deframer.isStalled()).isTrue();
+    }
+
+    @Test
+    void decodeBase64AndDeframe_frameWithManyFragments() throws Exception {
+        deframer.request(1);
+        final byte[] frameBytes = GrpcTestUtil.uncompressedFrame(GrpcTestUtil.requestByteBuf());
+        final ArrayList<byte[]> fragments = base64EncodedFragments(frameBytes);
+
+        // Only the last fragment should notify the listener.
+        for (int i = 0; i < fragments.size() - 1; i++) {
+            deframer.deframe(HttpData.wrap(fragments.get(i)), false);
+            verifyNoMoreInteractions(listener);
+            assertThat(deframer.isStalled()).isTrue();
+        }
+
+        deframer.deframe(HttpData.wrap(fragments.get(fragments.size() - 1)), false);
+        verifyAndReleaseMessage(new DeframedMessage(GrpcTestUtil.requestByteBuf(), 0));
         verifyNoMoreInteractions(listener);
         assertThat(deframer.isStalled()).isTrue();
     }
@@ -129,10 +177,27 @@ class ArmeriaMessageDeframerTest {
 
         // Frame is split into two fragments - header and body.
         deframer.deframe(HttpData.wrap(Arrays.copyOfRange(frameBytes, 0, 5)), false);
-        verifyZeroInteractions(listener);
+        verifyNoMoreInteractions(listener);
         assertThat(deframer.isStalled()).isTrue();
         deframer.deframe(HttpData.wrap(Arrays.copyOfRange(frameBytes, 5, frameBytes.length)), false);
-        verifyAndReleaseMessage(new ByteBufOrStream(GrpcTestUtil.requestByteBuf()));
+        verifyAndReleaseMessage(new DeframedMessage(GrpcTestUtil.requestByteBuf(), 0));
+        verifyNoMoreInteractions(listener);
+        assertThat(deframer.isStalled()).isTrue();
+    }
+
+    @Test
+    void decodeBase64AndDeframe_frameWithHeaderAndBodyFragment() throws Exception {
+        final byte[] frameBytes = GrpcTestUtil.uncompressedFrame(GrpcTestUtil.requestByteBuf());
+        deframer.request(1);
+
+        // Frame is split into two fragments - header and body.
+        deframer.deframe(HttpData.wrap(Base64.getEncoder().encode(
+                Arrays.copyOfRange(frameBytes, 0, 5))), false);
+        verifyNoMoreInteractions(listener);
+        assertThat(deframer.isStalled()).isTrue();
+        deframer.deframe(HttpData.wrap(Base64.getEncoder().encode(
+                Arrays.copyOfRange(frameBytes, 5, frameBytes.length))), false);
+        verifyAndReleaseMessage(new DeframedMessage(GrpcTestUtil.requestByteBuf(), 0));
         verifyNoMoreInteractions(listener);
         assertThat(deframer.isStalled()).isTrue();
     }
@@ -143,12 +208,29 @@ class ArmeriaMessageDeframerTest {
         deframer.deframe(HttpData.wrap(GrpcTestUtil.uncompressedFrame(GrpcTestUtil.requestByteBuf())), false);
         deframer.request(1);
         assertThat(deframer.isStalled()).isFalse();
-        verifyAndReleaseMessage(new ByteBufOrStream(GrpcTestUtil.requestByteBuf()));
+        verifyAndReleaseMessage(new DeframedMessage(GrpcTestUtil.requestByteBuf(), 0));
         verifyNoMoreInteractions(listener);
         reset(listener);
         deframer.request(1);
         assertThat(deframer.isStalled()).isTrue();
-        verifyAndReleaseMessage(new ByteBufOrStream(GrpcTestUtil.requestByteBuf()));
+        verifyAndReleaseMessage(new DeframedMessage(GrpcTestUtil.requestByteBuf(), 0));
+        verifyNoMoreInteractions(listener);
+    }
+
+    @Test
+    void decodeBase64AndDeframe_multipleMessagesBeforeRequests() throws Exception {
+        deframer.deframe(HttpData.wrap(Base64.getEncoder().encode(
+                GrpcTestUtil.uncompressedFrame(GrpcTestUtil.requestByteBuf()))), false);
+        deframer.deframe(HttpData.wrap(Base64.getEncoder().encode(
+                GrpcTestUtil.uncompressedFrame(GrpcTestUtil.requestByteBuf()))), false);
+        deframer.request(1);
+        assertThat(deframer.isStalled()).isFalse();
+        verifyAndReleaseMessage(new DeframedMessage(GrpcTestUtil.requestByteBuf(), 0));
+        verifyNoMoreInteractions(listener);
+        reset(listener);
+        deframer.request(1);
+        assertThat(deframer.isStalled()).isTrue();
+        verifyAndReleaseMessage(new DeframedMessage(GrpcTestUtil.requestByteBuf(), 0));
         verifyNoMoreInteractions(listener);
     }
 
@@ -158,14 +240,14 @@ class ArmeriaMessageDeframerTest {
         deframer.deframe(HttpData.wrap(GrpcTestUtil.uncompressedFrame(GrpcTestUtil.requestByteBuf())), false);
         deframer.deframe(HttpData.wrap(GrpcTestUtil.uncompressedFrame(GrpcTestUtil.requestByteBuf())), false);
         assertThat(deframer.isStalled()).isTrue();
-        verifyAndReleaseMessage(new ByteBufOrStream(GrpcTestUtil.requestByteBuf()), 2);
+        verifyAndReleaseMessage(new DeframedMessage(GrpcTestUtil.requestByteBuf(), 0), 2);
         verifyNoMoreInteractions(listener);
     }
 
     @Test
     void deframe_endOfStream() throws Exception {
         deframer.request(1);
-        deframer.deframe(HttpData.EMPTY_DATA, true);
+        deframer.deframe(HttpData.empty(), true);
         deframer.closeWhenComplete();
         verify(listener).endOfStream();
         verifyNoMoreInteractions(listener);
@@ -175,10 +257,27 @@ class ArmeriaMessageDeframerTest {
     void deframe_compressed() throws Exception {
         deframer.request(1);
         deframer.deframe(HttpData.wrap(GrpcTestUtil.compressedFrame(GrpcTestUtil.requestByteBuf())), false);
-        final ArgumentCaptor<ByteBufOrStream> messageCaptor = ArgumentCaptor.forClass(ByteBufOrStream.class);
+        final ArgumentCaptor<DeframedMessage> messageCaptor = ArgumentCaptor.forClass(DeframedMessage.class);
         verify(listener).messageRead(messageCaptor.capture());
         verifyNoMoreInteractions(listener);
-        final ByteBufOrStream message = messageCaptor.getValue();
+        final DeframedMessage message = messageCaptor.getValue();
+        assertThat(message.stream()).isNotNull();
+        final byte[] messageBytes;
+        try (InputStream stream = message.stream()) {
+            messageBytes = ByteStreams.toByteArray(stream);
+        }
+        assertThat(messageBytes).isEqualTo(GrpcTestUtil.REQUEST_MESSAGE.toByteArray());
+    }
+
+    @Test
+    void decodeBase64AndDeframe_compressed() throws Exception {
+        deframer.request(1);
+        deframer.deframe(HttpData.wrap(Base64.getEncoder().encode(
+                GrpcTestUtil.compressedFrame(GrpcTestUtil.requestByteBuf()))), false);
+        final ArgumentCaptor<DeframedMessage> messageCaptor = ArgumentCaptor.forClass(DeframedMessage.class);
+        verify(listener).messageRead(messageCaptor.capture());
+        verifyNoMoreInteractions(listener);
+        final DeframedMessage message = messageCaptor.getValue();
         assertThat(message.stream()).isNotNull();
         final byte[] messageBytes;
         try (InputStream stream = message.stream()) {
@@ -214,7 +313,7 @@ class ArmeriaMessageDeframerTest {
         assertThat(frame.length).isLessThan(1024);
         deframer.request(1);
         deframer.deframe(HttpData.wrap(frame), false);
-        final ArgumentCaptor<ByteBufOrStream> messageCaptor = ArgumentCaptor.forClass(ByteBufOrStream.class);
+        final ArgumentCaptor<DeframedMessage> messageCaptor = ArgumentCaptor.forClass(DeframedMessage.class);
         verify(listener).messageRead(messageCaptor.capture());
         verifyNoMoreInteractions(listener);
         try (InputStream stream = messageCaptor.getValue().stream()) {
@@ -223,15 +322,15 @@ class ArmeriaMessageDeframerTest {
         }
     }
 
-    private void verifyAndReleaseMessage(ByteBufOrStream message) {
+    private void verifyAndReleaseMessage(DeframedMessage message) {
         verifyAndReleaseMessage(message, 1);
     }
 
-    private void verifyAndReleaseMessage(ByteBufOrStream message, int times) {
-        final ArgumentCaptor<ByteBufOrStream> read = ArgumentCaptor.forClass(ByteBufOrStream.class);
+    private void verifyAndReleaseMessage(DeframedMessage message, int times) {
+        final ArgumentCaptor<DeframedMessage> read = ArgumentCaptor.forClass(DeframedMessage.class);
         verify(listener, times(times)).messageRead(read.capture());
         for (int i = 0; i < times; i++) {
-            final ByteBufOrStream val = read.getAllValues().get(i);
+            final DeframedMessage val = read.getAllValues().get(i);
             assertThat(val).isEqualTo(message);
             if (val.buf() != null) {
                 val.buf().release();
@@ -240,5 +339,17 @@ class ArmeriaMessageDeframerTest {
         if (message.buf() != null) {
             message.buf().release();
         }
+    }
+
+    private static ArrayList<byte[]> base64EncodedFragments(byte[] frameBytes) {
+        final ArrayList<byte[]> fragments = new ArrayList<>();
+        for (int i = 0; i < frameBytes.length;) {
+            final int to = Math.min(frameBytes.length,
+                                    new Random().nextInt(5) + 1 + i); // One byte is selected at least.
+            final byte[] encoded = Base64.getEncoder().encode(Arrays.copyOfRange(frameBytes, i, to));
+            fragments.add(encoded);
+            i = to;
+        }
+        return fragments;
     }
 }

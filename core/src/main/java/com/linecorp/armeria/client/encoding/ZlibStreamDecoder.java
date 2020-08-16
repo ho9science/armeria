@@ -17,12 +17,9 @@
 package com.linecorp.armeria.client.encoding;
 
 import com.linecorp.armeria.common.HttpData;
-import com.linecorp.armeria.unsafe.ByteBufHttpData;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
-import io.netty.buffer.ByteBufHolder;
-import io.netty.buffer.Unpooled;
 import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.handler.codec.compression.ZlibCodecFactory;
 import io.netty.handler.codec.compression.ZlibWrapper;
@@ -31,7 +28,7 @@ import io.netty.handler.codec.compression.ZlibWrapper;
  * A {@link StreamDecoder} that user zlib ('gzip' or 'deflate'). Netty implementation used to allow
  * for incremental decoding using an {@link EmbeddedChannel}.
  */
-class ZlibStreamDecoder implements StreamDecoder {
+final class ZlibStreamDecoder implements StreamDecoder {
 
     private final EmbeddedChannel decoder;
 
@@ -42,12 +39,7 @@ class ZlibStreamDecoder implements StreamDecoder {
 
     @Override
     public HttpData decode(HttpData obj) {
-        if (obj instanceof ByteBufHolder) {
-            decoder.writeInbound(((ByteBufHolder) obj).content());
-        } else {
-            final ByteBuf compressed = Unpooled.wrappedBuffer(obj.array());
-            decoder.writeInbound(compressed);
-        }
+        decoder.writeInbound(obj.byteBuf());
         return fetchDecoderOutput();
     }
 
@@ -56,7 +48,7 @@ class ZlibStreamDecoder implements StreamDecoder {
         if (decoder.finish()) {
             return fetchDecoderOutput();
         } else {
-            return HttpData.EMPTY_DATA;
+            return HttpData.empty();
         }
     }
 
@@ -84,9 +76,9 @@ class ZlibStreamDecoder implements StreamDecoder {
         }
 
         if (decoded == null) {
-            return HttpData.EMPTY_DATA;
+            return HttpData.empty();
         }
 
-        return new ByteBufHttpData(decoded, false);
+        return HttpData.wrap(decoded);
     }
 }

@@ -16,7 +16,7 @@
 
 package com.linecorp.armeria.server;
 
-import static com.linecorp.armeria.internal.RouteUtil.REGEX;
+import static com.linecorp.armeria.internal.server.RouteUtil.REGEX;
 import static java.util.Objects.requireNonNull;
 
 import java.util.List;
@@ -35,15 +35,15 @@ final class RegexPathMapping extends AbstractPathMapping {
 
     private final Pattern regex;
     private final Set<String> paramNames;
-    private final String loggerName;
-    private final String meterTag;
+    private final String pathPattern;
+    private final String strVal;
     private final List<String> paths;
 
     RegexPathMapping(Pattern regex) {
         this.regex = requireNonNull(regex, "regex");
         paramNames = findParamNames(regex);
-        loggerName = toLoggerName(regex);
-        meterTag = REGEX + regex.pattern();
+        pathPattern = regex.pattern();
+        strVal = REGEX + pathPattern;
         paths = ImmutableList.of(regex.pattern());
     }
 
@@ -66,7 +66,7 @@ final class RegexPathMapping extends AbstractPathMapping {
             return null;
         }
 
-        final RoutingResultBuilder builder = RoutingResult.builder()
+        final RoutingResultBuilder builder = RoutingResult.builderWithExpectedNumParams(paramNames.size())
                                                           .path(routingCtx.path())
                                                           .query(routingCtx.query());
         for (String name : paramNames) {
@@ -86,29 +86,8 @@ final class RegexPathMapping extends AbstractPathMapping {
     }
 
     @Override
-    public String loggerName() {
-        return loggerName;
-    }
-
-    private static String toLoggerName(Pattern regex) {
-        final String regexStr = regex.pattern();
-        final String prefix = "regex.";
-        final StringBuilder buf = new StringBuilder(prefix.length() + regexStr.length());
-        buf.append(prefix);
-        for (int i = 0; i < regexStr.length(); i++) {
-            final char ch = regexStr.charAt(i);
-            if (Character.isJavaIdentifierPart(ch)) {
-                buf.append(ch);
-            } else {
-                buf.append('_');
-            }
-        }
-        return buf.toString();
-    }
-
-    @Override
-    public String meterTag() {
-        return meterTag;
+    public String patternString() {
+        return pathPattern;
     }
 
     @Override
@@ -123,17 +102,17 @@ final class RegexPathMapping extends AbstractPathMapping {
 
     @Override
     public int hashCode() {
-        return meterTag.hashCode();
+        return regex.pattern().hashCode();
     }
 
     @Override
-    public boolean equals(Object obj) {
+    public boolean equals(@Nullable Object obj) {
         return obj instanceof RegexPathMapping &&
                (this == obj || regex.pattern().equals(((RegexPathMapping) obj).regex.pattern()));
     }
 
     @Override
     public String toString() {
-        return meterTag;
+        return strVal;
     }
 }

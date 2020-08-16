@@ -18,41 +18,51 @@ import Button from '@material-ui/core/Button';
 import TextField from '@material-ui/core/TextField';
 import Typography from '@material-ui/core/Typography';
 import React, { ChangeEvent } from 'react';
+import Dropdown, { Option } from 'react-dropdown';
 
 const queryPlaceHolder = 'foo=bar&baz=qux';
 
 interface Props {
   additionalQueriesOpen: boolean;
+  exampleQueries: Option[];
   additionalQueries: string;
-  onEditHttpQueriesClick: () => void;
+  onSelectedQueriesChange: (selectedQueries: Option) => void;
+  onEditHttpQueriesClick: React.Dispatch<unknown>;
   onQueriesFormChange: (e: ChangeEvent<HTMLInputElement>) => void;
 }
 
-const HttpQueryString: React.SFC<Props> = (props) => {
-  return (
-    <>
-      <Typography variant="body2" paragraph />
-      <Button color="secondary" onClick={props.onEditHttpQueriesClick}>
-        HTTP query string
-      </Button>
-      <Typography variant="body2" paragraph />
-      {props.additionalQueriesOpen && (
-        <>
-          <TextField
-            multiline
-            fullWidth
-            rows={1}
-            value={props.additionalQueries}
-            placeholder={queryPlaceHolder}
-            onChange={props.onQueriesFormChange}
-            inputProps={{
-              className: 'code',
-            }}
-          />
-        </>
-      )}
-    </>
-  );
-};
+const HttpQueryString: React.FunctionComponent<Props> = (props) => (
+  <>
+    <Typography variant="body2" paragraph />
+    <Button color="secondary" onClick={props.onEditHttpQueriesClick}>
+      HTTP query string
+    </Button>
+    <Typography variant="body2" paragraph />
+    {props.additionalQueriesOpen && (
+      <>
+        {props.exampleQueries.length > 0 && (
+          <>
+            <Typography variant="body2" paragraph />
+            <Dropdown
+              placeholder="Select an example queries..."
+              options={props.exampleQueries}
+              onChange={props.onSelectedQueriesChange}
+            />
+          </>
+        )}
+        <Typography variant="body2" paragraph />
+        <TextField
+          fullWidth
+          value={props.additionalQueries}
+          placeholder={queryPlaceHolder}
+          onChange={props.onQueriesFormChange}
+          inputProps={{
+            className: 'code',
+          }}
+        />
+      </>
+    )}
+  </>
+);
 
-export default HttpQueryString;
+export default React.memo(HttpQueryString);

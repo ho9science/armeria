@@ -24,7 +24,7 @@ import javax.annotation.Nullable;
 /**
  * A builder which creates a {@link ServerSentEvent} instance.
  */
-public class ServerSentEventBuilder {
+public final class ServerSentEventBuilder {
 
     @Nullable
     private String id;
@@ -36,6 +36,8 @@ public class ServerSentEventBuilder {
     private String comment;
     @Nullable
     private String data;
+
+    ServerSentEventBuilder() {}
 
     /**
      * Sets the specified {@code id}.

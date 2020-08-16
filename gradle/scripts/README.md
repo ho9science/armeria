@@ -6,6 +6,7 @@ sensible defaults. By applying them, you can:
 - Manage dependencies using a simple YAML file.
 - Configure Checkstyle and JaCoCo code coverage.
 - Add [Javadoc offline links](https://docs.oracle.com/javase/9/javadoc/javadoc-command.htm#GUID-51213F2C-6E01-4A03-A82A-17428A258A0F) easily.
+- Add Google Analytics scripts into Javadoc if `googleAnalyticsId` property exists.
 - Generate Maven BOM (Bill of Materials).
 - Sign and deploy artifacts to a Maven repository.
 - Embedding version properties into a JAR.
@@ -83,7 +84,7 @@ sensible defaults. By applying them, you can:
        }
        dependencies {
            classpath 'com.google.gradle:osdetector-gradle-plugin:1.6.2'
-           classpath 'io.spring.gradle:dependency-management-plugin:1.0.7.RELEASE'
+           classpath 'io.spring.gradle:dependency-management-plugin:1.0.8.RELEASE'
        }
    }
 
@@ -115,6 +116,7 @@ sensible defaults. By applying them, you can:
    publishUrlForSnapshot=https://oss.sonatype.org/content/repositories/snapshots/
    publishUsernameProperty=ossrhUsername
    publishPasswordProperty=ossrhPassword
+   googleAnalyticsId=UA-XXXXXXXX
    javaSourceCompatibility=1.8
    javaTargetCompatibility=1.8
    ```
@@ -137,25 +139,25 @@ com.google.guava:
   guava:
     version: '23.6-jre'
     exclusions:
-    - com.google.code.findbugs:jsr305
-    - com.google.errorprone:error_prone_annotations
-    - com.google.j2objc:j2objc-annotations
-    - org.codehaus.mojo:animal-sniffer-annotations
+      - com.google.code.findbugs:jsr305
+      - com.google.errorprone:error_prone_annotations
+      - com.google.j2objc:j2objc-annotations
+      - org.codehaus.mojo:animal-sniffer-annotations
 
 # More than one artifact under the same group:
 com.fasterxml.jackson.core:
   jackson-annotations:
     version: &JACKSON_VERSION '2.9.2' # Using a YAML anchor
     javadocs:
-    - https://fasterxml.github.io/jackson-annotations/javadoc/2.9/
+      - https://fasterxml.github.io/jackson-annotations/javadoc/2.9/
   jackson-core:
     version: *JACKSON_VERSION
     javadocs:
-    - https://fasterxml.github.io/jackson-core/javadoc/2.9/
+      - https://fasterxml.github.io/jackson-core/javadoc/2.9/
   jackson-databind:
     version: *JACKSON_VERSION
     javadocs:
-    - https://fasterxml.github.io/jackson-databind/javadoc/2.9/
+      - https://fasterxml.github.io/jackson-databind/javadoc/2.9/
 ```
 
 `dependencies.yml` will be parsed at project evaluation time and be fed into
@@ -170,7 +172,7 @@ buildscript {
     }
     dependencies {
         classpath "com.google.gradle:osdetector-gradle-plugin:1.6.2"
-        classpath 'io.spring.gradle:dependency-management-plugin:1.0.7.RELEASE'
+        classpath 'io.spring.gradle:dependency-management-plugin:1.0.8.RELEASE'
     }
 }
 
@@ -211,7 +213,7 @@ boms:
 applied so you can conveniently check if your dependencies are out of date:
 
 ```
-$ ./gradlew dependencyUpdates -Drevision=release
+$ ./gradlew dependencyUpdates
 ...
 The following dependencies have later integration versions:
  - com.google.guava:guava [17.0 -> 24.0-jre]
@@ -247,7 +249,7 @@ All projects will get the following extension properties:
 - `executeGit(...args)` - executes a Git command with the specified arguments
 - `hasSourceDirectory(name)` - tells if the project has any source directory that matches `<projectDir>/src/*/<name>`, e.g.
 
-  ```java
+  ```groovy
   if (project.ext.hasSourceDirectory('thrift')) {
       println "${project} contains Thrift source files."
   }
@@ -309,6 +311,7 @@ automatically:
 - `publish` - Makes a project publish its artifact to a Maven repository
 - `bom` - Makes a project publish Maven BOM based on `dependencies.yml`
 - `shade`, `relocate` and `trim` - Makes a Java project produce an additional 'shaded' JAR
+- `reactor-grpc` or `rxgrpc` - Enables [`reactor-grpc`](https://github.com/salesforce/reactive-grpc/tree/master/reactor) or [`rxgrpc`](https://github.com/salesforce/reactive-grpc/tree/master/rx-java) support to the project
 
 We will learn what these flags exactly do in the following sections.
 
@@ -334,14 +337,17 @@ When a project has a `java` flag:
 - Checkstyle validation is enabled using `checkstyle` plugin if Checkstyle
   configuration file exists at `<project_root>/settings/checkstyle/checkstyle.xml`
 
+  - A new task called `lint` is added to all projects with Checkstyle enabled.
+    - Consider adding dependency tasks to the `lint` task to do other jobs
+      such as static analysis.
   - A special configuration property `checkstyleConfigDir` is set so you can
     access the external files such as `suppressions.xml` from `checkstyle.xml`.
   - You can choose Checkstyle version by specifying it in `dependencies.yml`:
-
     ```yaml
     com.puppycrawl.tools:
       checkstyle: { version: '8.5' }
     ```
+  - Checkstyle can be disabled completely by specifying `-PnoLint` option.
 
 - Test coverage report is enabled using `jacoco` plugin if `-Pcoverage` option
   is specified.
@@ -353,8 +359,8 @@ When a project has a `java` flag:
     rootProject {
         ext {
             jacocoExclusions = [
-                '/com/example/generated/sources/**',
-                '/com/example/third/party/**'
+                    '/com/example/generated/sources/**',
+                    '/com/example/third/party/**'
             ]
         }
     }
@@ -378,8 +384,8 @@ When a project has a `java` flag:
     grpc-core:
       version: &GRPC_VERSION '1.8.0'
       javadocs:
-      - https://grpc.io/grpc-java/javadoc/
-      - https://developers.google.com/protocol-buffers/docs/reference/java/
+        - https://grpc.io/grpc-java/javadoc/
+        - https://developers.google.com/protocol-buffers/docs/reference/java/
   ```
 
   If you are in an environment with restricted network access, you can specify
@@ -388,6 +394,10 @@ When a project has a `java` flag:
 - The `.proto` files under `src/*/proto` will be compiled into Java code with
   [protobuf-gradle-plugin](https://github.com/google/protobuf-gradle-plugin).
 
+  - A new task called `generateSources` is added to all projects with `.proto`
+    files.
+    - Consider adding dependency tasks to the `generateSources` task to do
+      other source generation jobs.
   - You need to add `com.google.protobuf:protobuf-gradle-plugin` to
     `dependencies.yml` to get this to work.
   - Add `com.google.protobuf:protoc` to `dependencies.yml` to specify the
@@ -396,6 +406,10 @@ When a project has a `java` flag:
 
 - The `.thrift` files under `src/*/thrift` will be compiled into Java code.
 
+  - A new task called `generateSources` is added to all projects with `.thrift`
+    files.
+    - Consider adding dependency tasks to the `generateSources` task to do
+      other source generation jobs.
   - Thrift compiler 0.12 will be used by default. Override `thriftVersion`
     property if you prefer 0.9:
 
@@ -534,7 +548,7 @@ for more information.
 
    ```groovy
    // settings.gradle
-   //...
+   // ...
    includeWithFlags ':common', 'java', 'trim'
    includeWithFlags ':client', 'java', 'relocate'
    includeWithFlags ':server', 'java', 'relocate'
@@ -547,7 +561,10 @@ for more information.
    // ...
    configure(projectsWithFlags('java')) {
        dependencies {
-           compile 'com.google.guava'
+           // Except ':common' itself.
+           if (project != project(':common')) {
+               compile project(':common')
+           }
        }
    }
    ```

@@ -18,27 +18,25 @@ package com.linecorp.armeria.server;
 
 import static java.util.Objects.requireNonNull;
 
-import java.nio.charset.Charset;
 import java.time.Duration;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.Predicate;
 
 import com.linecorp.armeria.common.HttpMethod;
-import com.linecorp.armeria.common.HttpRequest;
-import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.MediaType;
-import com.linecorp.armeria.common.logging.ContentPreviewerFactory;
 import com.linecorp.armeria.server.logging.AccessLogWriter;
 
 /**
- * A builder class for binding a {@link Service} fluently. This class can be instantiated through
- * {@link VirtualHostBuilder#route()}. You can also configure a {@link Service} using
+ * A builder class for binding an {@link HttpService} fluently. This class can be instantiated through
+ * {@link VirtualHostBuilder#route()}. You can also configure an {@link HttpService} using
  * {@link VirtualHostBuilder#withRoute(Consumer)}.
  *
- * <p>Call {@link #build(Service)} to build the {@link Service} and return to the {@link VirtualHostBuilder}.
+ * <p>Call {@link #build(HttpService)} to build the {@link HttpService} and return to the
+ * {@link VirtualHostBuilder}.
  *
  * <pre>{@code
- * ServerBuilder sb = new ServerBuilder();
+ * ServerBuilder sb = Server.builder();
  * sb.virtualHost("example.com")
  *   .route()                                      // Configure the first service in "example.com".
  *   .post("/foo/bar")
@@ -47,7 +45,6 @@ import com.linecorp.armeria.server.logging.AccessLogWriter;
  *   .requestTimeoutMillis(5000)
  *   .maxRequestLength(8192)
  *   .verboseResponses(true)
- *   .contentPreview(500)
  *   .build((ctx, req) -> HttpResponse.of(OK));    // Return to the VirtualHostBuilder.
  *
  * sb.virtualHost("example2.com")                  // Configure the second service "example2.com".
@@ -72,8 +69,8 @@ public final class VirtualHostServiceBindingBuilder extends AbstractServiceBindi
     }
 
     @Override
-    public VirtualHostServiceBindingBuilder pathUnder(String prefix) {
-        return (VirtualHostServiceBindingBuilder) super.pathUnder(prefix);
+    public VirtualHostServiceBindingBuilder pathPrefix(String prefix) {
+        return (VirtualHostServiceBindingBuilder) super.pathPrefix(prefix);
     }
 
     @Override
@@ -152,6 +149,53 @@ public final class VirtualHostServiceBindingBuilder extends AbstractServiceBindi
     }
 
     @Override
+    public VirtualHostServiceBindingBuilder matchesParams(String... paramPredicates) {
+        return (VirtualHostServiceBindingBuilder) super.matchesParams(paramPredicates);
+    }
+
+    @Override
+    public VirtualHostServiceBindingBuilder matchesParams(Iterable<String> paramPredicates) {
+        return (VirtualHostServiceBindingBuilder) super.matchesParams(paramPredicates);
+    }
+
+    @Override
+    public VirtualHostServiceBindingBuilder matchesParams(String paramName,
+                                                          Predicate<? super String> valuePredicate) {
+        return (VirtualHostServiceBindingBuilder) super.matchesParams(paramName, valuePredicate);
+    }
+
+    @Override
+    public VirtualHostServiceBindingBuilder matchesHeaders(String... headerPredicates) {
+        return (VirtualHostServiceBindingBuilder) super.matchesHeaders(headerPredicates);
+    }
+
+    @Override
+    public VirtualHostServiceBindingBuilder matchesHeaders(Iterable<String> headerPredicates) {
+        return (VirtualHostServiceBindingBuilder) super.matchesHeaders(headerPredicates);
+    }
+
+    @Override
+    public VirtualHostServiceBindingBuilder matchesHeaders(CharSequence headerName,
+                                                           Predicate<? super String> valuePredicate) {
+        return (VirtualHostServiceBindingBuilder) super.matchesHeaders(headerName, valuePredicate);
+    }
+
+    @Override
+    public VirtualHostServiceBindingBuilder addRoute(Route route) {
+        return (VirtualHostServiceBindingBuilder) super.addRoute(route);
+    }
+
+    @Override
+    public VirtualHostServiceBindingBuilder defaultServiceName(String defaultServiceName) {
+        return (VirtualHostServiceBindingBuilder) super.defaultServiceName(defaultServiceName);
+    }
+
+    @Override
+    public VirtualHostServiceBindingBuilder defaultLogName(String defaultLogName) {
+        return (VirtualHostServiceBindingBuilder) super.defaultLogName(defaultLogName);
+    }
+
+    @Override
     public VirtualHostServiceBindingBuilder requestTimeout(Duration requestTimeout) {
         return (VirtualHostServiceBindingBuilder) super.requestTimeout(requestTimeout);
     }
@@ -172,28 +216,8 @@ public final class VirtualHostServiceBindingBuilder extends AbstractServiceBindi
     }
 
     @Override
-    public VirtualHostServiceBindingBuilder requestContentPreviewerFactory(ContentPreviewerFactory factory) {
-        return (VirtualHostServiceBindingBuilder) super.requestContentPreviewerFactory(factory);
-    }
-
-    @Override
-    public VirtualHostServiceBindingBuilder responseContentPreviewerFactory(ContentPreviewerFactory factory) {
-        return (VirtualHostServiceBindingBuilder) super.responseContentPreviewerFactory(factory);
-    }
-
-    @Override
-    public VirtualHostServiceBindingBuilder contentPreview(int length) {
-        return (VirtualHostServiceBindingBuilder) super.contentPreview(length);
-    }
-
-    @Override
-    public VirtualHostServiceBindingBuilder contentPreview(int length, Charset defaultCharset) {
-        return (VirtualHostServiceBindingBuilder) super.contentPreview(length, defaultCharset);
-    }
-
-    @Override
-    public VirtualHostServiceBindingBuilder contentPreviewerFactory(ContentPreviewerFactory factory) {
-        return (VirtualHostServiceBindingBuilder) super.contentPreviewerFactory(factory);
+    public VirtualHostServiceBindingBuilder accessLogFormat(String accessLogFormat) {
+        return (VirtualHostServiceBindingBuilder) super.accessLogFormat(accessLogFormat);
     }
 
     @Override
@@ -203,24 +227,37 @@ public final class VirtualHostServiceBindingBuilder extends AbstractServiceBindi
     }
 
     @Override
-    public <T extends Service<HttpRequest, HttpResponse>, R extends Service<HttpRequest, HttpResponse>>
-    VirtualHostServiceBindingBuilder decorator(Function<T, R> decorator) {
+    public VirtualHostServiceBindingBuilder decorator(
+            Function<? super HttpService, ? extends HttpService> decorator) {
         return (VirtualHostServiceBindingBuilder) super.decorator(decorator);
     }
 
+    @Override
+    @SafeVarargs
+    public final VirtualHostServiceBindingBuilder decorators(
+            Function<? super HttpService, ? extends HttpService>... decorators) {
+        return (VirtualHostServiceBindingBuilder) super.decorators(decorators);
+    }
+
+    @Override
+    public VirtualHostServiceBindingBuilder decorators(
+            Iterable<? extends Function<? super HttpService, ? extends HttpService>> decorators) {
+        return (VirtualHostServiceBindingBuilder) super.decorators(decorators);
+    }
+
     /**
-     * Sets the {@link Service} and returns the {@link VirtualHostBuilder} that this
+     * Sets the {@link HttpService} and returns the {@link VirtualHostBuilder} that this
      * {@link VirtualHostServiceBindingBuilder} was created from.
      *
-     * @throws IllegalStateException if the path that the {@link Service} will be bound to is not specified
+     * @throws IllegalStateException if the path that the {@link HttpService} will be bound to is not specified
      */
-    public VirtualHostBuilder build(Service<HttpRequest, HttpResponse> service) {
+    public VirtualHostBuilder build(HttpService service) {
         build0(service);
         return virtualHostBuilder;
     }
 
     @Override
     void serviceConfigBuilder(ServiceConfigBuilder serviceConfigBuilder) {
-        virtualHostBuilder.serviceConfigBuilder(serviceConfigBuilder);
+        virtualHostBuilder.addServiceConfigSetters(serviceConfigBuilder);
     }
 }

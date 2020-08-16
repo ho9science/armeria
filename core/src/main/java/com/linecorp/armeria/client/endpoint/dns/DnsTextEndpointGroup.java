@@ -25,8 +25,10 @@ import com.google.common.collect.ImmutableSortedSet;
 
 import com.linecorp.armeria.client.Endpoint;
 import com.linecorp.armeria.client.endpoint.DynamicEndpointGroup;
+import com.linecorp.armeria.client.endpoint.EndpointSelectionStrategy;
 import com.linecorp.armeria.client.retry.Backoff;
 import com.linecorp.armeria.common.CommonPools;
+import com.linecorp.armeria.internal.client.DnsQuestionWithoutTrailingDot;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufHolder;
@@ -52,16 +54,30 @@ public final class DnsTextEndpointGroup extends DnsEndpointGroup {
      *                if the record contains unsupported content.
      */
     public static DnsTextEndpointGroup of(String hostname, Function<byte[], Endpoint> mapping) {
-        return new DnsTextEndpointGroupBuilder(hostname, mapping).build();
+        return builder(hostname, mapping).build();
+    }
+
+    /**
+     * Returns a new {@link DnsTextEndpointGroupBuilder} with
+     * the specified hostname and {@link Function} mapping.
+     *
+     * @param hostname the hostname to query DNS queries for
+     * @param mapping the {@link Function} that maps the content of a {@code TXT} record into
+     *                an {@link Endpoint}. The {@link Function} is expected to return {@code null}
+     *                if the record contains unsupported content.
+     */
+    public static DnsTextEndpointGroupBuilder builder(String hostname, Function<byte[], Endpoint> mapping) {
+        return new DnsTextEndpointGroupBuilder(hostname, mapping);
     }
 
     private final Function<byte[], Endpoint> mapping;
 
-    DnsTextEndpointGroup(EventLoop eventLoop, int minTtl, int maxTtl,
+    DnsTextEndpointGroup(EndpointSelectionStrategy selectionStrategy, EventLoop eventLoop,
+                         int minTtl, int maxTtl, long queryTimeoutMillis,
                          DnsServerAddressStreamProvider serverAddressStreamProvider,
                          Backoff backoff, String hostname, Function<byte[], Endpoint> mapping) {
-        super(eventLoop, minTtl, maxTtl, serverAddressStreamProvider, backoff,
-              ImmutableList.of(new DnsQuestionWithoutTrailingDot(hostname, DnsRecordType.TXT)),
+        super(selectionStrategy, eventLoop, minTtl, maxTtl, queryTimeoutMillis, serverAddressStreamProvider,
+              backoff, ImmutableList.of(DnsQuestionWithoutTrailingDot.of(hostname, DnsRecordType.TXT)),
               unused -> {});
         this.mapping = mapping;
         start();
@@ -106,11 +122,7 @@ public final class DnsTextEndpointGroup extends DnsEndpointGroup {
             }
 
             if (endpoint != null) {
-                if (endpoint.isGroup()) {
-                    logger().warn("{} Ignoring group endpoint: {}", logPrefix(), endpoint);
-                } else {
-                    builder.add(endpoint);
-                }
+                builder.add(endpoint);
             }
         }
 

@@ -16,30 +16,37 @@
 
 package com.linecorp.armeria.server.annotation;
 
+import java.lang.reflect.ParameterizedType;
 import java.nio.charset.Charset;
+
+import javax.annotation.Nullable;
 
 import com.linecorp.armeria.common.AggregatedHttpRequest;
 import com.linecorp.armeria.common.MediaType;
-import com.linecorp.armeria.internal.ArmeriaHttpUtil;
+import com.linecorp.armeria.internal.common.ArmeriaHttpUtil;
 import com.linecorp.armeria.server.ServiceRequestContext;
 
 /**
- * A default implementation of a {@link RequestConverterFunction} which converts a text body of
- * the {@link AggregatedHttpRequest} to a {@link String}.
+ * A {@link RequestConverterFunction} which converts a text body of the
+ * {@link AggregatedHttpRequest} to a {@link String}.
+ * Note that this {@link RequestConverterFunction} is applied to the annotated service by default,
+ * so you don't have to set explicitly.
  */
-public class StringRequestConverterFunction implements RequestConverterFunction {
+public final class StringRequestConverterFunction implements RequestConverterFunction {
     /**
      * Converts the specified {@link AggregatedHttpRequest} to a {@link String}.
      */
     @Override
-    public Object convertRequest(ServiceRequestContext ctx, AggregatedHttpRequest request,
-                                 Class<?> expectedResultType) throws Exception {
+    public Object convertRequest(
+            ServiceRequestContext ctx, AggregatedHttpRequest request, Class<?> expectedResultType,
+            @Nullable ParameterizedType expectedParameterizedResultType) throws Exception {
+
         if (expectedResultType == String.class ||
             expectedResultType == CharSequence.class) {
             final Charset charset;
             final MediaType contentType = request.contentType();
             if (contentType != null) {
-                charset = contentType.charset().orElse(ArmeriaHttpUtil.HTTP_DEFAULT_CONTENT_CHARSET);
+                charset = contentType.charset(ArmeriaHttpUtil.HTTP_DEFAULT_CONTENT_CHARSET);
             } else {
                 charset = ArmeriaHttpUtil.HTTP_DEFAULT_CONTENT_CHARSET;
             }

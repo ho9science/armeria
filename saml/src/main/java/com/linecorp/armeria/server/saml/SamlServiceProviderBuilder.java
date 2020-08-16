@@ -145,6 +145,8 @@ public final class SamlServiceProviderBuilder {
         }
     };
 
+    SamlServiceProviderBuilder() {}
+
     /**
      * Set an {@link Authorizer} which is used for this service provider's authentication.
      */
@@ -413,8 +415,7 @@ public final class SamlServiceProviderBuilder {
         // entityID would be used as a secret by default.
         try {
             requestIdManager = firstNonNull(requestIdManager,
-                                            SamlRequestIdManager.ofJwt(entityId, entityId,
-                                                                       60, 5));
+                                            SamlRequestIdManager.ofJwt(entityId, entityId, 60, 5));
         } catch (UnsupportedEncodingException e) {
             throw new IllegalStateException("cannot create a " + SamlRequestIdManager.class.getSimpleName(),
                                             e);

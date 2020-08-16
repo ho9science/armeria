@@ -19,25 +19,27 @@ package com.linecorp.armeria.common.stream;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
+import static org.junit.jupiter.api.Assertions.fail;
 
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedTransferQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
 
-import com.linecorp.armeria.testing.junit.common.EventLoopExtension;
-import com.linecorp.armeria.unsafe.ByteBufHttpData;
+import com.linecorp.armeria.common.HttpData;
+import com.linecorp.armeria.testing.junit5.common.EventLoopExtension;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.channel.EventLoop;
-import io.netty.util.AbstractReferenceCounted;
-import io.netty.util.ReferenceCounted;
 import io.netty.util.concurrent.EventExecutor;
+import io.netty.util.concurrent.ImmediateEventExecutor;
 
 class DefaultStreamMessageTest {
 
@@ -86,71 +88,120 @@ class DefaultStreamMessageTest {
     }
 
     @Test
-    void rejectReferenceCounted() {
-        final AbstractReferenceCounted item = new AbstractReferenceCounted() {
-            @Override
-            protected void deallocate() {}
-
-            @Override
-            public ReferenceCounted touch(Object hint) {
-                return this;
-            }
-        };
-        final StreamMessageAndWriter<Object> stream = new DefaultStreamMessage<>();
-        assertThatThrownBy(() -> stream.write(item)).isInstanceOf(IllegalArgumentException.class);
-    }
-
-    @Test
-    void releaseWhenWritingToClosedStream_ByteBuf() {
-        final StreamMessageAndWriter<Object> stream = new DefaultStreamMessage<>();
-        final ByteBuf buf = PooledByteBufAllocator.DEFAULT.buffer().retain();
-        stream.close();
-
-        await().untilAsserted(() -> assertThat(stream.isOpen()).isFalse());
-        assertThat(stream.tryWrite(buf)).isFalse();
-        assertThat(buf.refCnt()).isOne();
-        assertThatThrownBy(() -> stream.write(buf)).isInstanceOf(ClosedPublisherException.class);
-        assertThat(buf.refCnt()).isZero();
-    }
-
-    @Test
-    void releaseWhenWritingToClosedStream_ByteBuf_Supplier() {
-        final StreamMessageAndWriter<Object> stream = new DefaultStreamMessage<>();
-        final ByteBuf buf = PooledByteBufAllocator.DEFAULT.buffer().retain();
-        stream.close();
-
-        await().untilAsserted(() -> assertThat(stream.isOpen()).isFalse());
-        assertThat(stream.tryWrite(() -> buf)).isFalse();
-        assertThat(buf.refCnt()).isOne();
-        assertThatThrownBy(() -> stream.write(() -> buf)).isInstanceOf(ClosedPublisherException.class);
-        assertThat(buf.refCnt()).isZero();
-    }
-
-    @Test
     void releaseWhenWritingToClosedStream_HttpData() {
-        final StreamMessageAndWriter<Object> stream = new DefaultStreamMessage<>();
-        final ByteBufHttpData data = new ByteBufHttpData(
-                PooledByteBufAllocator.DEFAULT.buffer().writeByte(0), true).retain();
+        final StreamMessageAndWriter<HttpData> stream = new DefaultStreamMessage<>();
+        final ByteBuf buf = PooledByteBufAllocator.DEFAULT.buffer().writeByte(0).retain();
         stream.close();
 
         await().untilAsserted(() -> assertThat(stream.isOpen()).isFalse());
-        assertThat(stream.tryWrite(data)).isFalse();
-        assertThat(data.refCnt()).isOne();
-        assertThatThrownBy(() -> stream.write(data)).isInstanceOf(ClosedPublisherException.class);
-        assertThat(data.refCnt()).isZero();
+        assertThat(stream.tryWrite(HttpData.wrap(buf))).isFalse();
+        assertThat(buf.refCnt()).isOne();
+        assertThatThrownBy(() -> stream.write(HttpData.wrap(buf))).isInstanceOf(ClosedStreamException.class);
+        assertThat(buf.refCnt()).isZero();
     }
 
     @Test
     void releaseWhenWritingToClosedStream_HttpData_Supplier() {
-        final StreamMessageAndWriter<Object> stream = new DefaultStreamMessage<>();
-        final ByteBufHttpData data = new ByteBufHttpData(
-                PooledByteBufAllocator.DEFAULT.buffer().writeByte(0), true).retain();
+        final StreamMessageAndWriter<HttpData> stream = new DefaultStreamMessage<>();
+        final ByteBuf buf = PooledByteBufAllocator.DEFAULT.buffer().writeByte(0).retain();
         stream.close();
 
         await().untilAsserted(() -> assertThat(stream.isOpen()).isFalse());
-        assertThat(stream.tryWrite(() -> data)).isFalse();
-        assertThat(data.refCnt()).isOne();
-        assertThatThrownBy(() -> stream.write(() -> data)).isInstanceOf(ClosedPublisherException.class);
-        assertThat(data.refCnt()).isZero();
+        assertThat(stream.tryWrite(() -> HttpData.wrap(buf))).isFalse();
+        assertThat(buf.refCnt()).isOne();
+        assertThatThrownBy(() -> stream.write(() -> HttpData.wrap(buf)))
+                .isInstanceOf(ClosedStreamException.class);
+        assertThat(buf.refCnt()).isZero();
+    }
+
+    @Test
+    void abortedStreamCallOnCompleteIfNoData() throws InterruptedException {
+        final StreamMessageAndWriter<Object> stream = new DefaultStreamMessage<>();
+        stream.close();
+
+        final AtomicBoolean onCompleteCalled = new AtomicBoolean();
+        stream.subscribe(new Subscriber<Object>() {
+            @Override
+            public void onSubscribe(Subscription s) {}
+
+            @Override
+            public void onNext(Object o) {}
+
+            @Override
+            public void onError(Throwable t) {
+                fail();
+            }
+
+            @Override
+            public void onComplete() {
+                onCompleteCalled.set(true);
+            }
+        }, ImmediateEventExecutor.INSTANCE);
+
+        stream.abort();
+        assertThat(onCompleteCalled.get()).isTrue();
+    }
+
+    @Test
+    void abortedStreamCallOnErrorAfterCloseIsCalled() throws InterruptedException {
+        final StreamMessageAndWriter<HttpData> stream = new DefaultStreamMessage<>();
+        final ByteBuf buf = PooledByteBufAllocator.DEFAULT.buffer().writeByte(0);
+        stream.write(HttpData.wrap(buf).withEndOfStream());
+        stream.close();
+
+        final AtomicReference<Throwable> throwableCaptor = new AtomicReference<>();
+        stream.subscribe(new Subscriber<HttpData>() {
+            @Override
+            public void onSubscribe(Subscription s) {}
+
+            @Override
+            public void onNext(HttpData o) {}
+
+            @Override
+            public void onError(Throwable t) {
+                throwableCaptor.set(t);
+            }
+
+            @Override
+            public void onComplete() {
+                fail();
+            }
+        }, ImmediateEventExecutor.INSTANCE);
+
+        stream.abort();
+        assertThat(throwableCaptor.get()).isInstanceOf(AbortedStreamException.class);
+        assertThat(buf.refCnt()).isZero();
+    }
+
+    @Test
+    void requestWithNegativeValue() {
+        final StreamMessageAndWriter<HttpData> stream = new DefaultStreamMessage<>();
+        final ByteBuf buf = PooledByteBufAllocator.DEFAULT.buffer().writeByte(0);
+        stream.write(HttpData.wrap(buf).withEndOfStream());
+
+        final AtomicBoolean onErrorCalled = new AtomicBoolean();
+        stream.subscribe(new Subscriber<HttpData>() {
+            @Override
+            public void onSubscribe(Subscription s) {
+                s.request(-1);
+            }
+
+            @Override
+            public void onNext(HttpData o) {}
+
+            @Override
+            public void onError(Throwable t) {
+                onErrorCalled.set(true);
+            }
+
+            @Override
+            public void onComplete() {}
+        }, ImmediateEventExecutor.INSTANCE);
+
+        assertThat(onErrorCalled.get()).isTrue();
+        assertThat(buf.refCnt()).isZero();
+        assertThatThrownBy(() -> stream.whenComplete().get())
+                .hasCauseInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("expected: > 0");
     }
 }

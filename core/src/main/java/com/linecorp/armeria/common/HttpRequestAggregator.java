@@ -1,5 +1,5 @@
 /*
- * Copyright 2016 LINE Corporation
+ * Copyright 2020 LINE Corporation
  *
  * LINE Corporation licenses this file to you under the Apache License,
  * version 2.0 (the "License"); you may not use this file except in compliance
@@ -21,7 +21,6 @@ import java.util.concurrent.CompletableFuture;
 import javax.annotation.Nullable;
 
 import io.netty.buffer.ByteBufAllocator;
-import io.netty.util.ReferenceCountUtil;
 
 final class HttpRequestAggregator extends HttpMessageAggregator<AggregatedHttpRequest> {
 
@@ -52,7 +51,7 @@ final class HttpRequestAggregator extends HttpMessageAggregator<AggregatedHttpRe
     @Override
     protected void onData(HttpData data) {
         if (!trailers.isEmpty()) {
-            ReferenceCountUtil.safeRelease(data);
+            data.close();
             // Data can't come after trailers.
             // See https://tools.ietf.org/html/rfc7540#section-8.1
             return;

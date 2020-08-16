@@ -18,24 +18,32 @@ package com.linecorp.armeria.server;
 import static java.util.Objects.requireNonNull;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.junit.Assert.fail;
-import static org.junit.Assume.assumeTrue;
+import static org.assertj.core.api.Assumptions.assumeThat;
+import static org.awaitility.Awaitility.await;
 
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.PrintWriter;
+import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadInfo;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Queue;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedTransferQueue;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
+import java.util.function.Predicate;
 
 import org.apache.http.client.methods.CloseableHttpResponse;
 import org.apache.http.client.methods.HttpPost;
@@ -43,37 +51,45 @@ import org.apache.http.entity.StringEntity;
 import org.apache.http.impl.client.CloseableHttpClient;
 import org.apache.http.impl.client.HttpClients;
 import org.apache.http.util.EntityUtils;
-import org.junit.AfterClass;
-import org.junit.Before;
-import org.junit.ClassRule;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
 import com.google.common.util.concurrent.MoreExecutors;
 
 import com.linecorp.armeria.common.AggregatedHttpRequest;
+import com.linecorp.armeria.common.CommonPools;
 import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.Request;
 import com.linecorp.armeria.common.ResponseHeaders;
+import com.linecorp.armeria.common.SessionProtocol;
 import com.linecorp.armeria.common.metric.MeterIdPrefix;
 import com.linecorp.armeria.common.metric.PrometheusMeterRegistries;
 import com.linecorp.armeria.common.util.CompletionActions;
-import com.linecorp.armeria.common.util.EventLoopThreadFactory;
 import com.linecorp.armeria.common.util.Exceptions;
-import com.linecorp.armeria.internal.metric.MicrometerUtil;
+import com.linecorp.armeria.common.util.ThreadFactories;
+import com.linecorp.armeria.common.util.TimeoutMode;
+import com.linecorp.armeria.internal.common.metric.MicrometerUtil;
+import com.linecorp.armeria.internal.testing.AnticipatedException;
+import com.linecorp.armeria.server.logging.AccessLogWriter;
 import com.linecorp.armeria.server.logging.LoggingService;
-import com.linecorp.armeria.testing.internal.AnticipatedException;
 import com.linecorp.armeria.testing.junit4.server.ServerRule;
+import com.linecorp.armeria.testing.junit5.server.ServerExtension;
 
+import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
+import io.netty.bootstrap.ServerBootstrap;
 import io.netty.channel.ChannelOption;
 import io.netty.handler.codec.http.HttpStatusClass;
 import io.netty.util.concurrent.DefaultEventExecutorGroup;
 import io.netty.util.concurrent.EventExecutorGroup;
 import io.netty.util.concurrent.Future;
 
-public class ServerTest {
+class ServerTest {
 
     private static final long processDelayMillis = 1000;
     private static final long requestTimeoutMillis = 500;
@@ -81,18 +97,18 @@ public class ServerTest {
 
     private static final EventExecutorGroup asyncExecutorGroup = new DefaultEventExecutorGroup(1);
 
-    @ClassRule
-    public static final ServerRule server = new ServerRule() {
+    @RegisterExtension
+    static final ServerExtension server = new ServerExtension() {
         @Override
         protected void configure(ServerBuilder sb) throws Exception {
 
             sb.channelOption(ChannelOption.SO_BACKLOG, 1024);
             sb.meterRegistry(PrometheusMeterRegistries.newRegistry());
 
-            final Service<HttpRequest, HttpResponse> immediateResponseOnIoThread =
+            final HttpService immediateResponseOnIoThread =
                     new EchoService().decorate(LoggingService.newDecorator());
 
-            final Service<HttpRequest, HttpResponse> delayedResponseOnIoThread = new EchoService() {
+            final HttpService delayedResponseOnIoThread = new EchoService() {
                 @Override
                 protected HttpResponse echo(AggregatedHttpRequest aReq) {
                     try {
@@ -104,7 +120,7 @@ public class ServerTest {
                 }
             }.decorate(LoggingService.newDecorator());
 
-            final Service<HttpRequest, HttpResponse> lazyResponseNotOnIoThread = new EchoService() {
+            final HttpService lazyResponseNotOnIoThread = new EchoService() {
                 @Override
                 protected HttpResponse echo(AggregatedHttpRequest aReq) {
                     final CompletableFuture<HttpResponse> responseFuture = new CompletableFuture<>();
@@ -117,7 +133,7 @@ public class ServerTest {
                 }
             }.decorate(LoggingService.newDecorator());
 
-            final Service<HttpRequest, HttpResponse> buggy = new AbstractHttpService() {
+            final HttpService buggy = new AbstractHttpService() {
                 @Override
                 protected HttpResponse doPost(ServiceRequestContext ctx, HttpRequest req) {
                     throw Exceptions.clearTrace(new AnticipatedException("bug!"));
@@ -131,28 +147,33 @@ public class ServerTest {
               .service("/buggy", buggy);
 
             // Disable request timeout for '/timeout-not' only.
-            final Function<Service<HttpRequest, HttpResponse>, Service<HttpRequest, HttpResponse>> decorator =
+            final Function<HttpService, HttpService> decorator =
                     s -> new SimpleDecoratingHttpService(s) {
                         @Override
                         public HttpResponse serve(ServiceRequestContext ctx, HttpRequest req) throws Exception {
-                            ctx.setRequestTimeoutMillis(
-                                    "/timeout-not".equals(ctx.path()) ? 0 : requestTimeoutMillis);
-                            return delegate().serve(ctx, req);
+                            if ("/timeout-not".equals(ctx.path())) {
+                                ctx.clearRequestTimeout();
+                            } else {
+                                ctx.setRequestTimeoutMillis(TimeoutMode.SET_FROM_NOW, requestTimeoutMillis);
+                            }
+                            return unwrap().serve(ctx, req);
                         }
                     };
 
             sb.decorator(decorator);
 
             sb.idleTimeoutMillis(idleTimeoutMillis);
+            // Enable access logs to make sure AccessLogWriter does not fail on an invalid path.
+            sb.accessLogWriter(AccessLogWriter.common(), false);
         }
     };
 
-    @AfterClass
-    public static void checkMetrics() {
+    @AfterAll
+    static void checkMetrics() {
         final MeterRegistry registry = server.server().meterRegistry();
         assertThat(MicrometerUtil.register(registry,
-                                           new MeterIdPrefix("armeria.server.router.virtualHostCache",
-                                                             "hostnamePattern", "*"),
+                                           new MeterIdPrefix("armeria.server.router.virtual.host.cache",
+                                                             "hostname.pattern", "*"),
                                            Object.class, (r, i) -> null)).isNotNull();
     }
 
@@ -160,13 +181,13 @@ public class ServerTest {
      * Ensures that the {@link Server} is always started when a test begins. This is necessary even if we
      * enabled auto-start for {@link ServerRule} because we stop it in {@link #testStartStop()}.
      */
-    @Before
-    public void startServer() {
+    @BeforeEach
+    void startServer() {
         server.start();
     }
 
     @Test
-    public void testStartStop() throws Exception {
+    void testStartStop() throws Exception {
         final Server server = ServerTest.server.server();
         assertThat(server.activePorts()).hasSize(1);
         server.stop().get();
@@ -174,24 +195,59 @@ public class ServerTest {
     }
 
     @Test
-    public void testInvocation() throws Exception {
+    void testInvocation() throws Exception {
         testInvocation0("/");
     }
 
     @Test
-    public void testDelayedResponseApiInvocationExpectedTimeout() throws Exception {
+    void testDelayedResponseApiInvocationExpectedTimeout() throws Exception {
         testInvocation0("/delayed");
     }
 
     @Test
-    public void testChannelOptions() throws Exception {
-        assertThat(server.server().serverBootstrap().config()
-                         .options().get(ChannelOption.SO_BACKLOG)).isEqualTo(1024);
+    void testChannelOptions() throws Exception {
+        final ServerBootstrap bootstrap = server.server().serverBootstrap;
+        assertThat(bootstrap).isNotNull();
+        assertThat(bootstrap.config().options().get(ChannelOption.SO_BACKLOG)).isEqualTo(1024);
+    }
+
+    @Test
+    void unsuccessfulStartupTerminatesBossGroup() {
+        final Predicate<ThreadInfo> predicate = info -> {
+            final String name = info.getThreadName();
+            return name.startsWith("armeria-boss-") && name.endsWith(":" + server.httpPort());
+        };
+
+        // When one port is open, there should be only one boss group thread.
+        final long oldNumBossThreads =
+                Arrays.stream(ManagementFactory.getThreadMXBean().dumpAllThreads(false, false))
+                      .filter(predicate)
+                      .count();
+        assertThat(oldNumBossThreads).isOne();
+
+        // Attempt to start another server at the same port.
+        final Server serverAtSamePort =
+                Server.builder()
+                      .http(server.httpPort())
+                      .service("/", (ctx, req) -> HttpResponse.of(200))
+                      .build();
+
+        // .. which will fail with an IOException.
+        assertThatThrownBy(() -> serverAtSamePort.start().join())
+                .isInstanceOf(CompletionException.class)
+                .hasCauseInstanceOf(IOException.class);
+
+        // A failed bind attempt must not leave a dangling boss group thread.
+        final long numBossThreads =
+                Arrays.stream(ManagementFactory.getThreadMXBean().dumpAllThreads(false, false))
+                      .filter(predicate)
+                      .count();
+        assertThat(numBossThreads).isEqualTo(oldNumBossThreads);
     }
 
     private static void testInvocation0(String path) throws IOException {
         try (CloseableHttpClient hc = HttpClients.createMinimal()) {
-            final HttpPost req = new HttpPost(server.uri(path));
+            final HttpPost req = new HttpPost(server.httpUri().resolve(path));
             req.setEntity(new StringEntity("Hello, world!", StandardCharsets.UTF_8));
 
             try (CloseableHttpResponse res = hc.execute(req)) {
@@ -202,9 +258,9 @@ public class ServerTest {
     }
 
     @Test
-    public void testRequestTimeoutInvocation() throws Exception {
+    void testRequestTimeoutInvocation() throws Exception {
         try (CloseableHttpClient hc = HttpClients.createMinimal()) {
-            final HttpPost req = new HttpPost(server.uri("/timeout"));
+            final HttpPost req = new HttpPost(server.httpUri() + "/timeout");
             req.setEntity(new StringEntity("Hello, world!", StandardCharsets.UTF_8));
 
             try (CloseableHttpResponse res = hc.execute(req)) {
@@ -215,9 +271,9 @@ public class ServerTest {
     }
 
     @Test
-    public void testDynamicRequestTimeoutInvocation() throws Exception {
+    void testDynamicRequestTimeoutInvocation() throws Exception {
         try (CloseableHttpClient hc = HttpClients.createMinimal()) {
-            final HttpPost req = new HttpPost(server.uri("/timeout-not"));
+            final HttpPost req = new HttpPost(server.httpUri() + "/timeout-not");
             req.setEntity(new StringEntity("Hello, world!", StandardCharsets.UTF_8));
 
             try (CloseableHttpResponse res = hc.execute(req)) {
@@ -227,10 +283,9 @@ public class ServerTest {
         }
     }
 
-    @Test(timeout = idleTimeoutMillis * 5)
-    public void testIdleTimeoutByNoContentSent() throws Exception {
+    @Test
+    void testIdleTimeoutByNoContentSent() throws Exception {
         try (Socket socket = new Socket()) {
-            socket.setSoTimeout((int) (idleTimeoutMillis * 4));
             socket.connect(server.httpSocketAddress());
             final long connectedNanos = System.nanoTime();
             //read until EOF
@@ -243,10 +298,9 @@ public class ServerTest {
         }
     }
 
-    @Test(timeout = idleTimeoutMillis * 5)
-    public void testIdleTimeoutByContentSent() throws Exception {
+    @Test
+    void testIdleTimeoutByContentSent() throws Exception {
         try (Socket socket = new Socket()) {
-            socket.setSoTimeout((int) (idleTimeoutMillis * 4));
             socket.connect(server.httpSocketAddress());
             final PrintWriter outWriter = new PrintWriter(socket.getOutputStream(), false);
             outWriter.print("POST / HTTP/1.1\r\n");
@@ -270,10 +324,9 @@ public class ServerTest {
      * Ensure that the connection is not broken even if {@link Service#serve(ServiceRequestContext, Request)}
      * raises an exception.
      */
-    @Test(timeout = idleTimeoutMillis * 5)
-    public void testBuggyService() throws Exception {
+    @Test
+    void testBuggyService() throws Exception {
         try (Socket socket = new Socket()) {
-            socket.setSoTimeout((int) (idleTimeoutMillis * 4));
             socket.connect(server.httpSocketAddress());
             final PrintWriter outWriter = new PrintWriter(socket.getOutputStream(), false);
 
@@ -303,36 +356,60 @@ public class ServerTest {
     }
 
     @Test
-    public void testOptions() throws Exception {
+    void testOptions() throws Exception {
         testSimple("OPTIONS * HTTP/1.1", "HTTP/1.1 200 OK",
                    "allow: OPTIONS,GET,HEAD,POST,PUT,PATCH,DELETE,TRACE,CONNECT");
     }
 
     @Test
-    public void testInvalidPath() throws Exception {
+    void testInvalidPath() throws Exception {
         testSimple("GET * HTTP/1.1", "HTTP/1.1 400 Bad Request");
     }
 
     @Test
-    public void testUnsupportedMethod() throws Exception {
+    void testUnsupportedMethod() throws Exception {
         testSimple("WHOA / HTTP/1.1", "HTTP/1.1 405 Method Not Allowed");
     }
 
     @Test
-    public void duplicatedPort() {
+    void duplicatedPort() {
         // Known to fail on WSL (Windows Subsystem for Linux)
-        assumeTrue(System.getenv("WSLENV") == null);
+        assumeThat(System.getenv("WSLENV")).isNull();
 
-        final Server duplicatedPortServer = new ServerBuilder()
-                .http(server.httpPort())
-                .service("/", (ctx, res) -> HttpResponse.of(""))
-                .build();
+        final Server duplicatedPortServer = Server.builder()
+                                                  .http(server.httpPort())
+                                                  .service("/", (ctx, res) -> HttpResponse.of(""))
+                                                  .build();
         assertThatThrownBy(() -> duplicatedPortServer.start().join())
                 .hasCauseInstanceOf(IOException.class);
     }
 
     @Test
-    public void defaultStartStopExecutor() {
+    void testActiveLocalPort() throws Exception {
+        final Server server = Server.builder()
+                                    .http(0)
+                                    .https(0)
+                                    .tlsSelfSigned()
+                                    .service("/", (ctx, res) -> HttpResponse.of(""))
+                                    .build();
+
+        // not started yet
+        assertThatThrownBy(server::activeLocalPort)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("no active local ports");
+
+        server.start().get();
+
+        assertThat(server.activeLocalPort()).isPositive();
+        assertThat(server.activeLocalPort(SessionProtocol.HTTP)).isPositive();
+        assertThat(server.activeLocalPort(SessionProtocol.HTTPS)).isPositive();
+        assertThatThrownBy(() -> server.activeLocalPort(SessionProtocol.PROXY))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("no active local ports for " + SessionProtocol.PROXY);
+    }
+
+    @Test
+    void defaultStartStopExecutor() {
         final Server server = ServerTest.server.server();
         final Queue<Thread> threads = new LinkedTransferQueue<>();
         server.addListener(new ThreadRecordingServerListener(threads));
@@ -344,30 +421,42 @@ public class ServerTest {
     }
 
     @Test
-    public void customStartStopExecutor() {
+    void customStartStopExecutor() {
         final Queue<Thread> threads = new LinkedTransferQueue<>();
         final String prefix = getClass().getName() + "#customStartStopExecutor";
-        final ExecutorService executor = Executors.newSingleThreadExecutor(new EventLoopThreadFactory(prefix));
-        final Server server = new ServerBuilder()
-                .startStopExecutor(executor)
-                .service("/", (ctx, req) -> HttpResponse.of(200))
-                .serverListener(new ThreadRecordingServerListener(threads))
-                .build();
+
+        final AtomicBoolean serverStarted = new AtomicBoolean();
+        final ThreadFactory factory = ThreadFactories.builder(prefix).taskFunction(task -> () -> {
+            await().untilFalse(serverStarted);
+            task.run();
+        }).build();
+
+        final ExecutorService executor = Executors.newSingleThreadExecutor(factory);
+        final Server server = Server.builder()
+                                    .startStopExecutor(executor)
+                                    .service("/", (ctx, req) -> HttpResponse.of(200))
+                                    .serverListener(new ThreadRecordingServerListener(threads))
+                                    .build();
 
         threads.add(server.start().thenApply(unused -> Thread.currentThread()).join());
-        threads.add(server.stop().thenApply(unused -> Thread.currentThread()).join());
+        serverStarted.set(true);
+
+        final CompletableFuture<Thread> stopFuture = server.stop().thenApply(
+                unused -> Thread.currentThread());
+        serverStarted.set(false);
+        threads.add(stopFuture.join());
 
         threads.forEach(t -> assertThat(t.getName()).startsWith(prefix));
     }
 
     @Test
-    public void gracefulShutdownBlockingTaskExecutor() {
-        final ExecutorService executor = Executors.newSingleThreadExecutor();
+    void gracefulShutdownBlockingTaskExecutor() {
+        final ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
 
-        final Server server = new ServerBuilder()
-                .blockingTaskExecutor(executor, true)
-                .service("/", (ctx, req) -> HttpResponse.of(200))
-                .build();
+        final Server server = Server.builder()
+                                    .blockingTaskExecutor(executor, true)
+                                    .service("/", (ctx, req) -> HttpResponse.of(200))
+                                    .build();
 
         server.start().join();
 
@@ -386,13 +475,13 @@ public class ServerTest {
     }
 
     @Test
-    public void notGracefulShutdownBlockingTaskExecutor() {
-        final ExecutorService executor = Executors.newSingleThreadExecutor();
+    void notGracefulShutdownBlockingTaskExecutor() {
+        final ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
 
-        final Server server = new ServerBuilder()
-                .blockingTaskExecutor(executor, false)
-                .service("/", (ctx, req) -> HttpResponse.of(200))
-                .build();
+        final Server server = Server.builder()
+                                    .blockingTaskExecutor(executor, false)
+                                    .service("/", (ctx, req) -> HttpResponse.of(200))
+                                    .build();
 
         server.start().join();
 
@@ -409,6 +498,37 @@ public class ServerTest {
         assertThat(server.config().blockingTaskExecutor().isShutdown()).isFalse();
         assertThat(server.config().blockingTaskExecutor().isTerminated()).isFalse();
         assertThat(MoreExecutors.shutdownAndAwaitTermination(executor, 10, TimeUnit.SECONDS)).isTrue();
+    }
+
+    @Test
+    void versionMetrics() {
+        final Server server = ServerTest.server.server();
+        server.setupVersionMetrics();
+
+        final MeterRegistry meterRegistry = server.config().meterRegistry();
+        final Gauge gauge = meterRegistry.find("armeria.build.info")
+                                         .tagKeys("version", "commit", "repo.status")
+                                         .gauge();
+        assertThat(gauge).isNotNull();
+        assertThat(gauge.value()).isOne();
+    }
+
+    @Test
+    void blockUntilShutdown() throws Exception {
+        final AtomicBoolean stopped = new AtomicBoolean();
+        final Server server = Server.builder()
+                                    .service("/", (ctx, req) -> HttpResponse.of(HttpStatus.OK))
+                                    .serverListener(new ServerListenerAdapter() {
+                                        @Override
+                                        public void serverStopping(Server server) throws Exception {
+                                            stopped.set(true);
+                                        }
+                                    })
+                                    .build();
+        server.start().join();
+        CommonPools.blockingTaskExecutor().schedule(server::close, 1, TimeUnit.SECONDS);
+        server.blockUntilShutdown();
+        assertThat(stopped).isTrue();
     }
 
     private static void testSimple(
@@ -444,7 +564,7 @@ public class ServerTest {
 
             for (String expectedHeader : expectedHeaders) {
                 if (!headers.contains(expectedHeader)) {
-                    fail("does not contain '" + expectedHeader + "': " + headers);
+                    Assertions.fail("does not contain '" + expectedHeader + "': " + headers);
                 }
             }
         }

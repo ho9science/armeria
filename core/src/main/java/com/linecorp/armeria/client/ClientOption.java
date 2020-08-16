@@ -15,108 +15,76 @@
  */
 package com.linecorp.armeria.client;
 
-import static java.util.Objects.requireNonNull;
-
+import java.util.NoSuchElementException;
+import java.util.Set;
+import java.util.function.BiFunction;
 import java.util.function.Function;
 
-import com.linecorp.armeria.common.HttpHeaders;
-import com.linecorp.armeria.common.SessionProtocol;
-import com.linecorp.armeria.common.logging.ContentPreviewerFactory;
 import com.linecorp.armeria.common.util.AbstractOption;
-
-import io.netty.util.ConstantPool;
 
 /**
  * A client option.
  *
  * @param <T> the type of the option value
  */
-public final class ClientOption<T> extends AbstractOption<T> {
-
-    @SuppressWarnings("rawtypes")
-    private static final ConstantPool pool = new ConstantPool() {
-        @Override
-        protected ClientOption<Object> newConstant(int id, String name) {
-            return new ClientOption<>(id, name);
-        }
-    };
+public final class ClientOption<T> extends AbstractOption<ClientOption<T>, ClientOptionValue<T>, T> {
 
     /**
-     * The timeout of a socket write.
+     * Returns the all available {@link ClientOption}s.
      */
-    public static final ClientOption<Long> WRITE_TIMEOUT_MILLIS = valueOf("WRITE_TIMEOUT_MILLIS");
-
-    /**
-     * The timeout of a socket write.
-     *
-     * @deprecated Use {@link #WRITE_TIMEOUT_MILLIS}.
-     */
-    @Deprecated
-    public static final ClientOption<Long> DEFAULT_WRITE_TIMEOUT_MILLIS = WRITE_TIMEOUT_MILLIS;
-
-    /**
-     * The timeout of a server reply to a client call.
-     */
-    public static final ClientOption<Long> RESPONSE_TIMEOUT_MILLIS = valueOf("RESPONSE_TIMEOUT_MILLIS");
-
-    /**
-     * The timeout of a server reply to a client call.
-     *
-     * @deprecated Use {@link #RESPONSE_TIMEOUT_MILLIS}.
-     */
-    @Deprecated
-    public static final ClientOption<Long> DEFAULT_RESPONSE_TIMEOUT_MILLIS = RESPONSE_TIMEOUT_MILLIS;
-
-    /**
-     * The maximum allowed length of a server response.
-     */
-    public static final ClientOption<Long> MAX_RESPONSE_LENGTH = valueOf("DEFAULT_MAX_RESPONSE_LENGTH");
-
-    /**
-     * The maximum allowed length of a server response.
-     *
-     * @deprecated Use {@link #MAX_RESPONSE_LENGTH};
-     */
-    @Deprecated
-    public static final ClientOption<Long> DEFAULT_MAX_RESPONSE_LENGTH = MAX_RESPONSE_LENGTH;
-
-    /**
-     * The additional HTTP headers to send with requests. Used only when the underlying
-     * {@link SessionProtocol} is HTTP.
-     */
-    public static final ClientOption<HttpHeaders> HTTP_HEADERS = valueOf("HTTP_HEADERS");
-
-    /**
-     * The {@link Function} that decorates the client components.
-     */
-    public static final ClientOption<ClientDecoration> DECORATION = valueOf("DECORATION");
-
-    public static final ClientOption<ContentPreviewerFactory> REQ_CONTENT_PREVIEWER_FACTORY = valueOf(
-            "REQ_CONTENT_PREVIEWER_FACTORY");
-
-    public static final ClientOption<ContentPreviewerFactory> RES_CONTENT_PREVIEWER_FACTORY = valueOf(
-            "RES_CONTENT_PREVIEWER_FACTORY");
-
-    /**
-     * Returns the {@link ClientOption} of the specified name.
-     */
-    @SuppressWarnings("unchecked")
-    public static <T> ClientOption<T> valueOf(String name) {
-        return (ClientOption<T>) pool.valueOf(name);
+    public static Set<ClientOption<?>> allOptions() {
+        return allOptions(ClientOption.class);
     }
 
     /**
-     * Creates a new {@link ClientOption} of the specified unique {@code name}.
+     * Returns the {@link ClientOption} with the specified {@code name}.
+     *
+     * @throws NoSuchElementException if there's no such option defined.
      */
-    private ClientOption(int id, String name) {
-        super(id, name);
+    public static ClientOption<?> of(String name) {
+        return of(ClientOption.class, name);
     }
 
     /**
-     * Creates a new value of this option.
+     * Defines a new {@link ClientOption} of the specified name and default value.
+     *
+     * @param name the name of the option.
+     * @param defaultValue the default value of the option, which will be used when unspecified.
+     *
+     * @throws IllegalStateException if an option with the specified name exists already.
      */
-    public ClientOptionValue<T> newValue(T value) {
-        requireNonNull(value, "value");
+    public static <T> ClientOption<T> define(String name, T defaultValue) {
+        return define(name, defaultValue, Function.identity(), (oldValue, newValue) -> newValue);
+    }
+
+    /**
+     * Defines a new {@link ClientOption} of the specified name, default value and merge function.
+     *
+     * @param name the name of the option.
+     * @param defaultValue the default value of the option, which will be used when unspecified.
+     * @param validator the {@link Function} which is used for validating and normalizing an option value.
+     * @param mergeFunction the {@link BiFunction} which is used for merging old and new option values.
+     *
+     * @throws IllegalStateException if an option with the specified name exists already.
+     */
+    public static <T> ClientOption<T> define(
+            String name,
+            T defaultValue,
+            Function<T, T> validator,
+            BiFunction<ClientOptionValue<T>, ClientOptionValue<T>, ClientOptionValue<T>> mergeFunction) {
+        return define(ClientOption.class, name, defaultValue, ClientOption::new, validator, mergeFunction);
+    }
+
+    private ClientOption(
+            String name,
+            T defaultValue,
+            Function<T, T> validator,
+            BiFunction<ClientOptionValue<T>, ClientOptionValue<T>, ClientOptionValue<T>> mergeFunction) {
+        super(name, defaultValue, validator, mergeFunction);
+    }
+
+    @Override
+    protected ClientOptionValue<T> doNewValue(T value) {
         return new ClientOptionValue<>(this, value);
     }
 }

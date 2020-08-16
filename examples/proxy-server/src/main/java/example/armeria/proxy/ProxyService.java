@@ -2,14 +2,12 @@ package example.armeria.proxy;
 
 import java.net.InetSocketAddress;
 import java.time.Duration;
+import java.util.concurrent.ExecutionException;
 
 import com.linecorp.armeria.client.Endpoint;
-import com.linecorp.armeria.client.HttpClient;
-import com.linecorp.armeria.client.HttpClientBuilder;
+import com.linecorp.armeria.client.WebClient;
 import com.linecorp.armeria.client.endpoint.EndpointGroup;
-import com.linecorp.armeria.client.endpoint.EndpointGroupRegistry;
 import com.linecorp.armeria.client.endpoint.EndpointSelectionStrategy;
-import com.linecorp.armeria.client.endpoint.StaticEndpointGroup;
 import com.linecorp.armeria.client.endpoint.dns.DnsServiceEndpointGroup;
 import com.linecorp.armeria.client.endpoint.healthcheck.HealthCheckedEndpointGroup;
 import com.linecorp.armeria.client.logging.LoggingClient;
@@ -18,7 +16,6 @@ import com.linecorp.armeria.common.HttpHeaderNames;
 import com.linecorp.armeria.common.HttpObject;
 import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.HttpResponse;
-import com.linecorp.armeria.common.RequestHeaders;
 import com.linecorp.armeria.common.ResponseHeaders;
 import com.linecorp.armeria.common.SessionProtocol;
 import com.linecorp.armeria.server.AbstractHttpService;
@@ -33,27 +30,30 @@ public final class ProxyService extends AbstractHttpService {
     /**
      * We used hardcoded backend addresses. But you can use other service discovery mechanisms to configure
      * backends dynamically using {@link DnsServiceEndpointGroup}, ZooKeeper or Central Dogma.
-     * See <a href="https://line.github.io/armeria/client-service-discovery.html">service discovery</a>,
-     * <a href="https://line.github.io/armeria/advanced-zookeeper.html#advanced-zookeeper">Service discovery
+     * See <a href="https://armeria.dev/docs/client-service-discovery">service discovery</a>,
+     * <a href="https://armeria.dev/docs/advanced-zookeeper">Service discovery
      * with ZooKeeper</a> and <a href="https://line.github.io/centraldogma/">centraldogma</a>.
      */
-    private static final EndpointGroup animationGroup = new StaticEndpointGroup(
+    private static final EndpointGroup animationGroup = EndpointGroup.of(
+            // You can use EndpointSelectionStrategy.weightedRoundRobin() or even
+            // implement your own strategy to balance requests.
+            EndpointSelectionStrategy.roundRobin(),
             Endpoint.of("127.0.0.1", 8081),
             Endpoint.of("127.0.0.1", 8082),
             Endpoint.of("127.0.0.1", 8083));
 
-    private final HttpClient loadBalancingClient;
+    private final WebClient loadBalancingClient;
 
     private final boolean addForwardedToRequestHeaders;
     private final boolean addViaToResponseHeaders;
 
-    public ProxyService() throws InterruptedException {
+    public ProxyService() throws ExecutionException, InterruptedException {
         loadBalancingClient = newLoadBalancingClient();
         addForwardedToRequestHeaders = true;
         addViaToResponseHeaders = true;
     }
 
-    private static HttpClient newLoadBalancingClient() throws InterruptedException {
+    private static WebClient newLoadBalancingClient() throws ExecutionException, InterruptedException {
         // Send HTTP health check requests to '/internal/l7check' every 10 seconds.
         final HealthCheckedEndpointGroup healthCheckedGroup =
                 HealthCheckedEndpointGroup.builder(animationGroup, "/internal/l7check")
@@ -62,18 +62,13 @@ public final class ProxyService extends AbstractHttpService {
                                           .build();
 
         // Wait until the initial health check is finished.
-        healthCheckedGroup.awaitInitialEndpoints();
+        healthCheckedGroup.whenReady().get();
 
-        EndpointGroupRegistry.register("animation_apis", healthCheckedGroup,
-                                       // You can use EndpointSelectionStrategy.WEIGHTED_ROUND_ROBIN or even
-                                       // implement your own strategy to balance requests.
-                                       EndpointSelectionStrategy.ROUND_ROBIN);
-
-        return new HttpClientBuilder("http://group:animation_apis")
-                // Disable timeout to serve infinite streaming response.
-                .responseTimeoutMillis(0)
-                .decorator(LoggingClient.newDecorator())
-                .build();
+        return WebClient.builder(SessionProtocol.HTTP, healthCheckedGroup)
+                        // Disable timeout to serve infinite streaming response.
+                        .responseTimeoutMillis(0)
+                        .decorator(LoggingClient.newDecorator())
+                        .build();
     }
 
     @Override
@@ -126,10 +121,8 @@ public final class ProxyService extends AbstractHttpService {
         sb.append(", host: ").append(req.authority());
         sb.append(", proto: ").append(ctx.sessionProtocol());
 
-        final RequestHeaders newHeaders = req.headers().toBuilder()
-                                             .add(HttpHeaderNames.FORWARDED, sb.toString())
-                                             .build();
-        return HttpRequest.of(req, newHeaders);
+        return req.withHeaders(req.headers().toBuilder()
+                                  .add(HttpHeaderNames.FORWARDED, sb.toString()));
     }
 
     private static HttpResponse addViaHeader(HttpResponse res) {

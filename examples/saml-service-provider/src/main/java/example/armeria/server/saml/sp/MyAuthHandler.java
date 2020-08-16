@@ -8,7 +8,7 @@ import java.util.concurrent.CompletionStage;
 import javax.annotation.Nullable;
 
 import org.opensaml.messaging.context.MessageContext;
-import org.opensaml.saml.saml2.core.NameIDType;
+import org.opensaml.saml.saml2.core.NameID;
 import org.opensaml.saml.saml2.core.Response;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -16,6 +16,7 @@ import org.slf4j.LoggerFactory;
 import com.google.common.base.Strings;
 
 import com.linecorp.armeria.common.AggregatedHttpRequest;
+import com.linecorp.armeria.common.Cookie;
 import com.linecorp.armeria.common.HttpData;
 import com.linecorp.armeria.common.HttpHeaderNames;
 import com.linecorp.armeria.common.HttpRequest;
@@ -27,11 +28,6 @@ import com.linecorp.armeria.server.ServiceRequestContext;
 import com.linecorp.armeria.server.auth.Authorizer;
 import com.linecorp.armeria.server.saml.SamlNameIdFormat;
 import com.linecorp.armeria.server.saml.SamlSingleSignOnHandler;
-
-import io.netty.handler.codec.http.cookie.Cookie;
-import io.netty.handler.codec.http.cookie.DefaultCookie;
-import io.netty.handler.codec.http.cookie.ServerCookieDecoder;
-import io.netty.handler.codec.http.cookie.ServerCookieEncoder;
 
 /**
  * An example of an {@link Authorizer} and a {@link SamlSingleSignOnHandler}.
@@ -54,7 +50,7 @@ final class MyAuthHandler implements Authorizer<HttpRequest>, SamlSingleSignOnHa
             return CompletableFuture.completedFuture(false);
         }
 
-        final boolean authenticated = ServerCookieDecoder.LAX.decode(cookie).stream().anyMatch(
+        final boolean authenticated = Cookie.fromCookieHeader(cookie).stream().anyMatch(
                 c -> "username".equals(c.name()) && !Strings.isNullOrEmpty(c.value()));
         return CompletableFuture.completedFuture(authenticated);
     }
@@ -69,9 +65,8 @@ final class MyAuthHandler implements Authorizer<HttpRequest>, SamlSingleSignOnHa
     public HttpResponse loginSucceeded(ServiceRequestContext ctx, AggregatedHttpRequest req,
                                        MessageContext<Response> message, @Nullable String sessionIndex,
                                        @Nullable String relayState) {
-        final String username =
-                getNameId(message.getMessage(), SamlNameIdFormat.EMAIL).map(NameIDType::getValue)
-                                                                       .orElse(null);
+        final NameID nameId = getNameId(message.getMessage(), SamlNameIdFormat.EMAIL);
+        final String username = nameId != null ? nameId.getValue() : null;
         if (username == null) {
             return HttpResponse.of(HttpStatus.UNAUTHORIZED, MediaType.HTML_UTF_8,
                                    "<html><body>Username is not found.</body></html>");
@@ -79,15 +74,16 @@ final class MyAuthHandler implements Authorizer<HttpRequest>, SamlSingleSignOnHa
 
         logger.info("{} user '{}' has been logged in.", ctx, username);
 
-        final Cookie cookie = new DefaultCookie("username", username);
-        cookie.setHttpOnly(true);
-        cookie.setDomain("localhost");
-        cookie.setMaxAge(60);
-        cookie.setPath("/");
+        final Cookie cookie = Cookie.builder("username", username)
+                                    .httpOnly(true)
+                                    .domain("localhost")
+                                    .maxAge(60)
+                                    .path("/")
+                                    .build();
         return HttpResponse.of(
                 ResponseHeaders.of(HttpStatus.OK,
                                    HttpHeaderNames.CONTENT_TYPE, MediaType.HTML_UTF_8,
-                                   HttpHeaderNames.SET_COOKIE, ServerCookieEncoder.LAX.encode(cookie)),
+                                   HttpHeaderNames.SET_COOKIE, cookie.toSetCookieHeader(false)),
                 HttpData.ofUtf8("<html><body onLoad=\"window.location.href='/welcome'\"></body></html>"));
     }
 

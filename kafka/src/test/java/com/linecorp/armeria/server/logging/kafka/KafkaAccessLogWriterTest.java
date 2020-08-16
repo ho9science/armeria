@@ -17,29 +17,40 @@ package com.linecorp.armeria.server.logging.kafka;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.when;
 import static org.mockito.internal.verification.VerificationModeFactory.times;
 
 import org.apache.kafka.clients.producer.Callback;
 import org.apache.kafka.clients.producer.Producer;
 import org.apache.kafka.clients.producer.ProducerRecord;
-import org.junit.Rule;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Captor;
 import org.mockito.Mock;
-import org.mockito.junit.MockitoJUnit;
-import org.mockito.junit.MockitoRule;
 
+import com.linecorp.armeria.common.HttpHeaderNames;
+import com.linecorp.armeria.common.HttpMethod;
+import com.linecorp.armeria.common.HttpRequest;
+import com.linecorp.armeria.common.RequestHeaders;
 import com.linecorp.armeria.common.logging.RequestLog;
+import com.linecorp.armeria.server.ServiceRequestContext;
 
-public class KafkaAccessLogWriterTest {
-    @Rule
-    public final MockitoRule mockitoRule = MockitoJUnit.rule();
+class KafkaAccessLogWriterTest {
 
     private static final String TOPIC_NAME = "topic-test";
+
+    private static final RequestLog log;
+
+    static {
+        final ServiceRequestContext ctx =
+                ServiceRequestContext.of(HttpRequest.of(
+                        RequestHeaders.of(HttpMethod.GET, "/kyuto",
+                                          HttpHeaderNames.AUTHORITY, "kawamuray")));
+        ctx.logBuilder().endRequest();
+        ctx.logBuilder().endResponse();
+
+        log = ctx.log().ensureComplete();
+    }
 
     @Mock
     private Producer<String, String> producer;
@@ -48,12 +59,9 @@ public class KafkaAccessLogWriterTest {
     private ArgumentCaptor<ProducerRecord<String, String>> captor;
 
     @Test
-    public void withoutKeyExtractor() {
-        final RequestLog log = mock(RequestLog.class);
-        when(log.authority()).thenReturn("kawamuray");
-
+    void withoutKeyExtractor() {
         final KafkaAccessLogWriter<String, String> service =
-                new KafkaAccessLogWriter<>(producer, TOPIC_NAME, RequestLog::authority);
+                new KafkaAccessLogWriter<>(producer, TOPIC_NAME, log -> log.requestHeaders().authority());
 
         service.log(log);
 
@@ -65,26 +73,23 @@ public class KafkaAccessLogWriterTest {
     }
 
     @Test
-    public void withKeyExtractor() {
-        final RequestLog log = mock(RequestLog.class);
-        when(log.authority()).thenReturn("kawamuray");
-        when(log.decodedPath()).thenReturn("kyuto");
-
+    void withKeyExtractor() {
         final KafkaAccessLogWriter<String, String> service =
                 new KafkaAccessLogWriter<>(producer, TOPIC_NAME,
-                                           RequestLog::decodedPath, RequestLog::authority);
+                                           log -> log.context().decodedPath(),
+                                           log -> log.requestHeaders().authority());
 
         service.log(log);
 
         verify(producer, times(1)).send(captor.capture(), any(Callback.class));
 
         final ProducerRecord<String, String> record = captor.getValue();
-        assertThat(record.key()).isEqualTo("kyuto");
+        assertThat(record.key()).isEqualTo("/kyuto");
         assertThat(record.value()).isEqualTo("kawamuray");
     }
 
     @Test
-    public void closeProducerWhenRequested() {
+    void closeProducerWhenRequested() {
         final KafkaAccessLogWriter<String, String> service =
                 new KafkaAccessLogWriter<>(producer, TOPIC_NAME, log -> "");
 

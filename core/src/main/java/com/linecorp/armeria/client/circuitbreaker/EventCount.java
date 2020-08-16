@@ -16,6 +16,10 @@
 
 package com.linecorp.armeria.client.circuitbreaker;
 
+import static com.google.common.base.Preconditions.checkArgument;
+
+import javax.annotation.Nullable;
+
 /**
  * An immutable object that stores the count of events.
  */
@@ -26,18 +30,26 @@ public final class EventCount {
      */
     public static final EventCount ZERO = new EventCount(0, 0);
 
+    /**
+     * Returns a new {@link EventCount} with the specified number of successes and failures.
+     */
+    public static EventCount of(long success, long failure) {
+        if (success == 0 && failure == 0) {
+            return ZERO;
+        }
+
+        return new EventCount(success, failure);
+    }
+
     private final long success;
 
     private final long failure;
 
-    /**
-     * Creates a new instance with the specified number of successes and failures.
-     */
-    public EventCount(long success, long failure) {
+    private EventCount(long success, long failure) {
+        checkArgument(success >= 0, "success: %s (expected: >= 0)", success);
+        checkArgument(failure >= 0, "failure: %s (expected: >= 0)", failure);
         this.success = success;
         this.failure = failure;
-        assert 0 <= success;
-        assert 0 <= failure;
     }
 
     /**
@@ -84,22 +96,12 @@ public final class EventCount {
     }
 
     @Override
-    public String toString() {
-        final long total = total();
-        if (total == 0) {
-            return "success% = NaN (0/0)";
-        }
-        final double percentageOfSuccess = 100 * successRate();
-        return String.format("success%% = %.2f%% (%d/%d)", percentageOfSuccess, success(), total);
-    }
-
-    @Override
     public int hashCode() {
         return (int) (31 * success + failure);
     }
 
     @Override
-    public boolean equals(Object o) {
+    public boolean equals(@Nullable Object o) {
         if (this == o) {
             return true;
         }
@@ -108,5 +110,15 @@ public final class EventCount {
         }
         final EventCount that = (EventCount) o;
         return success == that.success && failure == that.failure;
+    }
+
+    @Override
+    public String toString() {
+        final long total = total();
+        if (total == 0) {
+            return "success% = NaN (0/0)";
+        }
+        final double percentageOfSuccess = 100 * successRate();
+        return String.format("success%% = %.2f%% (%d/%d)", percentageOfSuccess, success(), total);
     }
 }

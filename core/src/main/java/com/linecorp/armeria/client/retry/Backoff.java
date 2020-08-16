@@ -18,18 +18,18 @@ package com.linecorp.armeria.client.retry;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.linecorp.armeria.client.retry.DefaultBackoffHolder.defaultBackoff;
 import static com.linecorp.armeria.client.retry.FixedBackoff.NO_DELAY;
-import static java.util.Objects.requireNonNull;
 
-import java.util.Optional;
 import java.util.Random;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Supplier;
+
+import com.linecorp.armeria.common.util.Unwrappable;
 
 /**
  * Controls back off between attempts in a single retry operation.
  */
 @FunctionalInterface
-public interface Backoff {
+public interface Backoff extends Unwrappable {
 
     /**
      * Returns the default {@link Backoff}.
@@ -69,6 +69,14 @@ public interface Backoff {
     }
 
     /**
+     * Returns a {@link Backoff} for which the backoff delay increases in line with the Fibonacci sequence
+     * f(n) = f(n-1) + f(n-2) where f(0) = f(1) = {@code initialDelayMillis}.
+     */
+    static Backoff fibonacci(long initialDelayMillis, long maxDelayMillis) {
+        return new FibonacciBackoff(initialDelayMillis, maxDelayMillis);
+    }
+
+    /**
      * Returns a {@link Backoff} that computes backoff delay which is a random value between
      * {@code minDelayMillis} and {@code maxDelayMillis} chosen by {@link ThreadLocalRandom}.
      */
@@ -86,12 +94,15 @@ public interface Backoff {
 
     /**
      * Creates a new {@link Backoff} that computes backoff delay using one of
-     * {@link #exponential(long, long, double)}, {@link #fixed(long)} and {@link #random(long, long)} chaining
-     * with {@link #withJitter(double, double)} and {@link #withMaxAttempts(int)} from the
-     * {@code specification}. This is the format for the {@code specification}:
+     * {@link #exponential(long, long, double)}, {@link #fibonacci(long, long)}, {@link #fixed(long)}
+     * and {@link #random(long, long)} chaining with {@link #withJitter(double, double)} and
+     * {@link #withMaxAttempts(int)} from the {@code specification} string that conforms to
+     * the following format:
      * <ul>
      *   <li>{@code exponential=[initialDelayMillis:maxDelayMillis:multiplier]} is for
      *       {@link Backoff#exponential(long, long, double)} (multiplier will be 2.0 if it's omitted)</li>
+     *   <li>{@code fibonacci=[initialDelayMillis:maxDelayMillis]} is for
+     *       {@link Backoff#fibonacci(long, long)}</li>
      *   <li>{@code fixed=[delayMillis]} is for {@link Backoff#fixed(long)}</li>
      *   <li>{@code random=[minDelayMillis:maxDelayMillis]} is for {@link Backoff#random(long, long)}</li>
      *   <li>{@code jitter=[minJitterRate:maxJitterRate]} is for {@link Backoff#withJitter(double, double)}
@@ -100,16 +111,16 @@ public interface Backoff {
      * </ul>
      * The order of options does not matter, and the {@code specification} needs at least one option.
      * If you don't specify the base option exponential backoff will be used. If you only specify
-     * a base option, jitter and maxAttempts will be set by default values.
-     * These are a few examples:
+     * a base option, jitter and maxAttempts will be set by default values. For example:
      * <ul>
      *   <li>{@code exponential=200:10000:2.0,jitter=0.2} (default)</li>
      *   <li>{@code exponential=200:10000,jitter=0.2,maxAttempts=50} (multiplier omitted)</li>
+     *   <li>{@code fibonacci=200:10000,jitter=0.2,maxAttempts=50}</li>
      *   <li>{@code fixed=100,jitter=-0.5:0.2,maxAttempts=10} (fixed backoff with jitter variation)</li>
      *   <li>{@code random=200:1000} (jitter and maxAttempts will be set by default values)</li>
      * </ul>
      *
-     * @param specification the specification used to create the {@link Backoff}
+     * @param specification the specification used to create a {@link Backoff}
      */
     static Backoff of(String specification) {
         return BackoffSpec.parse(specification).build();
@@ -130,16 +141,28 @@ public interface Backoff {
 
     /**
      * Undecorates this {@link Backoff} to find the {@link Backoff} which is an instance of the specified
-     * {@code backoffType}.
+     * {@code type}.
      *
-     * @param backoffType the type of the desired {@link Backoff}
-     * @return the {@link Backoff} which is an instance of {@code backoffType} if this {@link Backoff}
-     *         decorated such a {@link Backoff}. {@link Optional#empty()} otherwise.
+     * @param type the type of the desired {@link Backoff}
+     * @return the {@link Backoff} which is an instance of {@code type} if this {@link Backoff}
+     *         decorated such a {@link Backoff}, or {@code null} otherwise.
+     *
+     * @see Unwrappable
      */
-    default <T> Optional<T> as(Class<T> backoffType) {
-        requireNonNull(backoffType, "backoffType");
-        return backoffType.isInstance(this) ? Optional.of(backoffType.cast(this))
-                                            : Optional.empty();
+    @Override
+    default <T> T as(Class<T> type) {
+        return Unwrappable.super.as(type);
+    }
+
+    /**
+     * Undecorates this {@link Backoff} and returns the object being decorated.
+     * If this {@link Backoff} is the innermost object, this method returns itself.
+     *
+     * @see Unwrappable
+     */
+    @Override
+    default Backoff unwrap() {
+        return (Backoff) Unwrappable.super.unwrap();
     }
 
     /**

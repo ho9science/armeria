@@ -22,7 +22,6 @@ import static com.linecorp.armeria.common.MediaType.create;
 import static java.util.Objects.requireNonNull;
 
 import java.util.Arrays;
-import java.util.Optional;
 import java.util.ServiceLoader;
 import java.util.Set;
 
@@ -33,7 +32,6 @@ import com.google.common.collect.BiMap;
 import com.google.common.collect.HashBiMap;
 import com.google.common.collect.HashMultimap;
 import com.google.common.collect.ImmutableBiMap;
-import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Multimap;
 
@@ -56,49 +54,6 @@ public final class SerializationFormat implements Comparable<SerializationFormat
      */
     public static final SerializationFormat UNKNOWN;
 
-    /**
-     * Thrift TBinary serialization format.
-     *
-     * @deprecated Use {@code ThriftSerializationFormats.BINARY}. Note that the value of this field will be
-     *             {@code null} if {@code armeria-thrift} module is not loaded.
-     */
-    @Nullable
-    @Deprecated
-    public static final SerializationFormat THRIFT_BINARY;
-
-    /**
-     * Thrift TCompact serialization format.
-     *
-     * @deprecated Use {@code ThriftSerializationFormats.COMPACT}. Note that the value of this field will be
-     *             {@code null} if {@code armeria-thrift} module is not loaded.
-     */
-    @Nullable
-    @Deprecated
-    public static final SerializationFormat THRIFT_COMPACT;
-
-    /**
-     * Thrift TJSON serialization format.
-     *
-     * @deprecated Use {@code ThriftSerializationFormats.JSON}. Note that the value of this field will be
-     *             {@code null} if {@code armeria-thrift} module is not loaded.
-     */
-    @Nullable
-    @Deprecated
-    public static final SerializationFormat THRIFT_JSON;
-
-    /**
-     * Thrift TText serialization format.
-     *
-     * @deprecated Use {@code ThriftSerializationFormats.TEXT}. Note that the value of this field will be
-     *             {@code null} if {@code armeria-thrift} module is not loaded.
-     */
-    @Nullable
-    @Deprecated
-    public static final SerializationFormat THRIFT_TEXT;
-
-    @Nullable
-    private static final Set<SerializationFormat> THRIFT_FORMATS;
-
     static {
         final BiMap<String, SerializationFormat> mutableUriTextToFormats = HashBiMap.create();
         final Multimap<MediaType, SerializationFormat> mutableSimplifiedMediaTypeToFormats =
@@ -119,28 +74,6 @@ public final class SerializationFormat implements Comparable<SerializationFormat
 
         uriTextToFormats = ImmutableBiMap.copyOf(mutableUriTextToFormats);
         values = uriTextToFormats.values();
-
-        // Backward compatibility stuff
-        SerializationFormat tbinary = null;
-        SerializationFormat tcompact = null;
-        SerializationFormat tjson = null;
-        SerializationFormat ttext = null;
-        Set<SerializationFormat> thriftFormats = null;
-        try {
-            tbinary = of("tbinary");
-            tcompact = of("tcompact");
-            tjson = of("tjson");
-            ttext = of("ttext");
-            thriftFormats = ImmutableSet.of(tbinary, tcompact, tjson, ttext);
-        } catch (IllegalArgumentException e) {
-            // ThriftSerializationFormatProvider is not loaded.
-        }
-
-        THRIFT_BINARY = tbinary;
-        THRIFT_COMPACT = tcompact;
-        THRIFT_JSON = tjson;
-        THRIFT_TEXT = ttext;
-        THRIFT_FORMATS = thriftFormats;
     }
 
     private static SerializationFormat register(
@@ -163,22 +96,6 @@ public final class SerializationFormat implements Comparable<SerializationFormat
         }
 
         return value;
-    }
-
-    /**
-     * Returns the set of all known Thrift serialization formats.
-     *
-     * @deprecated Use {@code ThriftSerializationFormats.values()}.
-     *
-     * @throws IllegalStateException if {@code armeria-thrift} module is not loaded
-     */
-    @Deprecated
-    public static Set<SerializationFormat> ofThrift() {
-        if (THRIFT_FORMATS == null) {
-            throw new IllegalStateException("Thrift support not available");
-        }
-
-        return THRIFT_FORMATS;
     }
 
     /**
@@ -217,46 +134,29 @@ public final class SerializationFormat implements Comparable<SerializationFormat
     /**
      * Finds the {@link SerializationFormat} with the specified {@link #uriText()}.
      */
-    public static Optional<SerializationFormat> find(String uriText) {
+    @Nullable
+    public static SerializationFormat find(String uriText) {
         uriText = Ascii.toLowerCase(requireNonNull(uriText, "uriText"));
-        return Optional.ofNullable(uriTextToFormats.get(uriText));
+        return uriTextToFormats.get(uriText);
     }
 
     /**
      * Finds the {@link SerializationFormat} which is accepted by any of the specified media ranges.
      */
-    public static Optional<SerializationFormat> find(MediaType... ranges) {
+    @Nullable
+    public static SerializationFormat find(MediaType... ranges) {
         requireNonNull(ranges, "ranges");
         if (ranges.length == 0) {
-            return Optional.empty();
+            return null;
         }
 
         for (SerializationFormat f : values()) {
             if (f.isAccepted(Arrays.asList(ranges))) {
-                return Optional.of(f);
+                return f;
             }
         }
 
-        return Optional.empty();
-    }
-
-    /**
-     * Finds the {@link SerializationFormat} which is accepted by the specified media range.
-     *
-     * @deprecated Use {@link #find(MediaType...)}.
-     */
-    @Deprecated
-    public static Optional<SerializationFormat> fromMediaType(@Nullable String mediaType) {
-        if (mediaType == null) {
-            return Optional.empty();
-        }
-
-        try {
-            return find(MediaType.parse(mediaType));
-        } catch (IllegalArgumentException e) {
-            // Malformed media type
-            return Optional.empty();
-        }
+        return null;
     }
 
     private final String uriText;
@@ -296,7 +196,7 @@ public final class SerializationFormat implements Comparable<SerializationFormat
      */
     public boolean isAccepted(MediaType range) {
         requireNonNull(range, "range");
-        return mediaTypes.match(range).isPresent();
+        return mediaTypes.match(range) != null;
     }
 
     /**
@@ -315,7 +215,7 @@ public final class SerializationFormat implements Comparable<SerializationFormat
      */
     public boolean isAccepted(Iterable<MediaType> ranges) {
         requireNonNull(ranges, "ranges");
-        return mediaTypes.match(ranges).isPresent();
+        return mediaTypes.match(ranges) != null;
     }
 
     @Override
@@ -324,7 +224,7 @@ public final class SerializationFormat implements Comparable<SerializationFormat
     }
 
     @Override
-    public boolean equals(Object obj) {
+    public boolean equals(@Nullable Object obj) {
         return this == obj;
     }
 

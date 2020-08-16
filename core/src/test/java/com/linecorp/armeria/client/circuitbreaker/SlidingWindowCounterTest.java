@@ -27,66 +27,65 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
-import com.google.common.base.Ticker;
-import com.google.common.testing.FakeTicker;
+import com.linecorp.armeria.common.util.Ticker;
 
-public class SlidingWindowCounterTest {
+class SlidingWindowCounterTest {
 
-    private static final FakeTicker ticker = new FakeTicker();
+    private static final AtomicLong ticker = new AtomicLong();
 
     @Test
-    public void testInitialState() {
-        final SlidingWindowCounter counter = new SlidingWindowCounter(ticker, Duration.ofSeconds(10),
+    void testInitialState() {
+        final SlidingWindowCounter counter = new SlidingWindowCounter(ticker::get, Duration.ofSeconds(10),
                                                                       Duration.ofSeconds(1));
 
-        assertThat(counter.count()).isEqualTo(new EventCount(0, 0));
+        assertThat(counter.count()).isEqualTo(EventCount.of(0, 0));
     }
 
     @Test
-    public void testOnSuccess() {
-        final SlidingWindowCounter counter = new SlidingWindowCounter(ticker, Duration.ofSeconds(10),
+    void testOnSuccess() {
+        final SlidingWindowCounter counter = new SlidingWindowCounter(ticker::get, Duration.ofSeconds(10),
                                                                       Duration.ofSeconds(1));
 
-        assertThat(counter.onSuccess()).isEmpty();
+        assertThat(counter.onSuccess()).isNull();
 
-        ticker.advance(1, TimeUnit.SECONDS);
-        assertThat(counter.onFailure()).contains(new EventCount(1, 0));
-        assertThat(counter.count()).isEqualTo(new EventCount(1, 0));
+        ticker.addAndGet(TimeUnit.SECONDS.toNanos(1));
+        assertThat(counter.onFailure()).isEqualTo(EventCount.of(1, 0));
+        assertThat(counter.count()).isEqualTo(EventCount.of(1, 0));
     }
 
     @Test
-    public void testOnFailure() {
-        final SlidingWindowCounter counter = new SlidingWindowCounter(ticker, Duration.ofSeconds(10),
+    void testOnFailure() {
+        final SlidingWindowCounter counter = new SlidingWindowCounter(ticker::get, Duration.ofSeconds(10),
                                                                       Duration.ofSeconds(1));
 
-        assertThat(counter.onFailure()).isEmpty();
+        assertThat(counter.onFailure()).isNull();
 
-        ticker.advance(1, TimeUnit.SECONDS);
-        assertThat(counter.onFailure()).contains(new EventCount(0, 1));
-        assertThat(counter.count()).isEqualTo(new EventCount(0, 1));
+        ticker.addAndGet(TimeUnit.SECONDS.toNanos(1));
+        assertThat(counter.onFailure()).isEqualTo(EventCount.of(0, 1));
+        assertThat(counter.count()).isEqualTo(EventCount.of(0, 1));
     }
 
     @Test
-    public void testTrim() {
-        final SlidingWindowCounter counter = new SlidingWindowCounter(ticker, Duration.ofSeconds(10),
+    void testTrim() {
+        final SlidingWindowCounter counter = new SlidingWindowCounter(ticker::get, Duration.ofSeconds(10),
                                                                       Duration.ofSeconds(1));
 
-        assertThat(counter.onSuccess()).isEmpty();
-        assertThat(counter.onFailure()).isEmpty();
+        assertThat(counter.onSuccess()).isNull();
+        assertThat(counter.onFailure()).isNull();
 
-        ticker.advance(1, TimeUnit.SECONDS);
-        assertThat(counter.onFailure()).contains(new EventCount(1, 1));
-        assertThat(counter.count()).isEqualTo(new EventCount(1, 1));
+        ticker.addAndGet(TimeUnit.SECONDS.toNanos(1));
+        assertThat(counter.onFailure()).isEqualTo(EventCount.of(1, 1));
+        assertThat(counter.count()).isEqualTo(EventCount.of(1, 1));
 
-        ticker.advance(11, TimeUnit.SECONDS);
-        assertThat(counter.onFailure()).contains(new EventCount(0, 0));
-        assertThat(counter.count()).isEqualTo(new EventCount(0, 0));
+        ticker.addAndGet(TimeUnit.SECONDS.toNanos(11));
+        assertThat(counter.onFailure()).isEqualTo(EventCount.of(0, 0));
+        assertThat(counter.count()).isEqualTo(EventCount.of(0, 0));
     }
 
     @Test
-    public void testConcurrentAccess() throws InterruptedException {
+    void testConcurrentAccess() throws InterruptedException {
         final SlidingWindowCounter counter = new SlidingWindowCounter(
                 Ticker.systemTicker(), Duration.ofMinutes(5), Duration.ofMillis(1));
 
@@ -132,17 +131,17 @@ public class SlidingWindowCounterTest {
             thread.join();
         }
 
-        await().untilAsserted(() -> assertThat(counter.onFailure()).isPresent());
-        assertThat(counter.count()).isEqualTo(new EventCount(success.get(), failure.get()));
+        await().untilAsserted(() -> assertThat(counter.onFailure()).isNotNull());
+        assertThat(counter.count()).isEqualTo(EventCount.of(success.get(), failure.get()));
     }
 
     @Test
-    public void testLateBucket() {
-        final SlidingWindowCounter counter = new SlidingWindowCounter(ticker, Duration.ofSeconds(10),
+    void testLateBucket() {
+        final SlidingWindowCounter counter = new SlidingWindowCounter(ticker::get, Duration.ofSeconds(10),
                                                                       Duration.ofSeconds(1));
 
-        ticker.advance(-1, TimeUnit.SECONDS);
-        assertThat(counter.onSuccess()).isEmpty();
-        assertThat(counter.count()).isEqualTo(new EventCount(0, 0));
+        ticker.addAndGet(TimeUnit.SECONDS.toNanos(-1));
+        assertThat(counter.onSuccess()).isNull();
+        assertThat(counter.count()).isEqualTo(EventCount.of(0, 0));
     }
 }

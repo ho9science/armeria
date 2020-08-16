@@ -32,9 +32,8 @@ import com.linecorp.armeria.common.HttpHeaderNames;
 import com.linecorp.armeria.common.HttpHeaders;
 import com.linecorp.armeria.common.HttpObject;
 import com.linecorp.armeria.common.HttpStatus;
-import com.linecorp.armeria.common.HttpStatusClass;
+import com.linecorp.armeria.unsafe.PooledObjects;
 
-import io.netty.util.ReferenceCountUtil;
 import okhttp3.Callback;
 import okhttp3.MediaType;
 import okhttp3.Protocol;
@@ -105,7 +104,7 @@ abstract class AbstractSubscriber implements Subscriber<HttpObject> {
                 }
 
                 final HttpStatus status = HttpStatus.valueOf(statusText);
-                if (status.codeClass() != HttpStatusClass.INFORMATIONAL) {
+                if (!status.isInformational()) {
                     state = State.WAIT_DATA_OR_TRAILERS;
                     responseBuilder.code(status.code());
                     responseBuilder.message(status.reasonPhrase());
@@ -129,7 +128,7 @@ abstract class AbstractSubscriber implements Subscriber<HttpObject> {
                 // Cancel the subscription if any message comes here after the state has been changed to DONE.
                 assert subscription != null;
                 subscription.cancel();
-                ReferenceCountUtil.safeRelease(httpObject);
+                PooledObjects.close(httpObject);
                 break;
         }
     }
@@ -137,7 +136,7 @@ abstract class AbstractSubscriber implements Subscriber<HttpObject> {
     @Override
     public final void onError(Throwable throwable) {
         if (armeriaCall.tryFinish()) {
-            onError0(new IOException(throwable.getMessage(), throwable));
+            onError0(new IOException(throwable.toString(), throwable));
         } else {
             onError0(newCancelledException());
         }
@@ -152,12 +151,12 @@ abstract class AbstractSubscriber implements Subscriber<HttpObject> {
         }
     }
 
-    void request(long n) {
+    final void request(long n) {
         assert subscription != null;
         subscription.request(n);
     }
 
-    void safeOnFailure(IOException e) {
+    final void safeOnFailure(IOException e) {
         if (callbackCalled) {
             return;
         }
@@ -165,7 +164,7 @@ abstract class AbstractSubscriber implements Subscriber<HttpObject> {
         callbackExecutor.execute(() -> callback.onFailure(armeriaCall, e));
     }
 
-    void safeOnResponse(BufferedSource content) {
+    final void safeOnResponse(BufferedSource content) {
         if (callbackCalled) {
             return;
         }

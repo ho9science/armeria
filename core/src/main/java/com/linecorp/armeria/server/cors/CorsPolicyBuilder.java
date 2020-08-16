@@ -15,11 +15,17 @@
  */
 package com.linecorp.armeria.server.cors;
 
+import java.util.function.Supplier;
+
+import com.google.common.collect.ImmutableList;
+
+import com.linecorp.armeria.common.HttpMethod;
+
 /**
  * Builds a new {@link CorsPolicy}.
  * <h2>Example</h2>
  * <pre>{@code
- * CorsPolicyBuilder cb = new CorsPolicyBuilder("http://example.com");
+ * CorsPolicyBuilder cb = CorsPolicy.builder("http://example.com");
  * cb.allowRequestMethods(HttpMethod.POST, HttpMethod.GET)
  *   .allowRequestHeaders("allow_request_header")
  *   .exposeHeaders("expose_header_1", "expose_header_2")
@@ -28,12 +34,16 @@ package com.linecorp.armeria.server.cors;
  * }</pre>
  *
  */
-public final class CorsPolicyBuilder extends AbstractCorsPolicyBuilder<CorsPolicyBuilder> {
-    /**
-     * Creates a new instance with the specified {@code origins}.
-     */
-    public CorsPolicyBuilder(String... origins) {
-        super(origins);
+public final class CorsPolicyBuilder extends AbstractCorsPolicyBuilder {
+
+    CorsPolicyBuilder() {}
+
+    CorsPolicyBuilder(String... origins) {
+        super(ImmutableList.copyOf(origins));
+    }
+
+    CorsPolicyBuilder(Iterable<String> origins) {
+        super(ImmutableList.copyOf(origins));
     }
 
     /**
@@ -42,5 +52,77 @@ public final class CorsPolicyBuilder extends AbstractCorsPolicyBuilder<CorsPolic
     @Override
     public CorsPolicy build() {
         return super.build();
+    }
+
+    // Override the return type of the chaining methods in the superclass.
+
+    @Override
+    public CorsPolicyBuilder route(String pathPattern) {
+        return (CorsPolicyBuilder) super.route(pathPattern);
+    }
+
+    @Override
+    public CorsPolicyBuilder allowNullOrigin() {
+        return (CorsPolicyBuilder) super.allowNullOrigin();
+    }
+
+    @Override
+    public CorsPolicyBuilder allowCredentials() {
+        return (CorsPolicyBuilder) super.allowCredentials();
+    }
+
+    @Override
+    public CorsPolicyBuilder maxAge(long maxAge) {
+        return (CorsPolicyBuilder) super.maxAge(maxAge);
+    }
+
+    @Override
+    public CorsPolicyBuilder exposeHeaders(CharSequence... headers) {
+        return (CorsPolicyBuilder) super.exposeHeaders(headers);
+    }
+
+    @Override
+    public CorsPolicyBuilder exposeHeaders(Iterable<? extends CharSequence> headers) {
+        return (CorsPolicyBuilder) super.exposeHeaders(headers);
+    }
+
+    @Override
+    public CorsPolicyBuilder allowRequestMethods(HttpMethod... methods) {
+        return (CorsPolicyBuilder) super.allowRequestMethods(methods);
+    }
+
+    @Override
+    public CorsPolicyBuilder allowRequestMethods(Iterable<HttpMethod> methods) {
+        return (CorsPolicyBuilder) super.allowRequestMethods(methods);
+    }
+
+    @Override
+    public CorsPolicyBuilder allowRequestHeaders(CharSequence... headers) {
+        return (CorsPolicyBuilder) super.allowRequestHeaders(headers);
+    }
+
+    @Override
+    public CorsPolicyBuilder allowRequestHeaders(Iterable<? extends CharSequence> headers) {
+        return (CorsPolicyBuilder) super.allowRequestHeaders(headers);
+    }
+
+    @Override
+    public CorsPolicyBuilder preflightResponseHeader(CharSequence name, Object... values) {
+        return (CorsPolicyBuilder) super.preflightResponseHeader(name, values);
+    }
+
+    @Override
+    public CorsPolicyBuilder preflightResponseHeader(CharSequence name, Iterable<?> values) {
+        return (CorsPolicyBuilder) super.preflightResponseHeader(name, values);
+    }
+
+    @Override
+    public CorsPolicyBuilder preflightResponseHeader(CharSequence name, Supplier<?> valueSupplier) {
+        return (CorsPolicyBuilder) super.preflightResponseHeader(name, valueSupplier);
+    }
+
+    @Override
+    public CorsPolicyBuilder disablePreflightResponseHeaders() {
+        return (CorsPolicyBuilder) super.disablePreflightResponseHeaders();
     }
 }

@@ -16,77 +16,147 @@
 package com.linecorp.armeria.client.retrofit2;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.catchThrowable;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-import org.junit.Test;
+import java.io.IOException;
+import java.time.Duration;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import com.linecorp.armeria.client.ClientOptions;
+import com.linecorp.armeria.client.Endpoint;
+import com.linecorp.armeria.client.WebClient;
+import com.linecorp.armeria.client.endpoint.EndpointGroup;
+import com.linecorp.armeria.common.HttpHeaderNames;
+import com.linecorp.armeria.common.HttpResponse;
+import com.linecorp.armeria.common.HttpStatus;
+import com.linecorp.armeria.common.SessionProtocol;
+import com.linecorp.armeria.server.ServerBuilder;
+import com.linecorp.armeria.testing.junit5.server.ServerExtension;
+
+import retrofit2.Converter;
 import retrofit2.Retrofit;
+import retrofit2.converter.jackson.JacksonConverterFactory;
+import retrofit2.http.GET;
 
-public class ArmeriaRetrofitBuilderTest {
+class ArmeriaRetrofitBuilderTest {
+
+    private static final Converter.Factory converterFactory =
+            JacksonConverterFactory.create(new ObjectMapper());
+
+    @RegisterExtension
+    static ServerExtension server = new ServerExtension() {
+        @Override
+        protected void configure(ServerBuilder sb) throws Exception {
+            sb.service("/secret", (ctx, req) -> {
+                return HttpResponse.from(req.aggregate().thenApply(aggReq -> {
+                    if ("Bearer: access-token".equals(aggReq.headers().get(HttpHeaderNames.AUTHORIZATION))) {
+                        return HttpResponse.of("\"OK\"");
+                    } else {
+                        return HttpResponse.of(HttpStatus.FORBIDDEN);
+                    }
+                }));
+            });
+            sb.service("/slow", (ctx, req) ->
+                    HttpResponse.delayed(HttpResponse.of("\"OK\""), Duration.ofSeconds(2)));
+        }
+    };
 
     @Test
-    public void build() throws Exception {
-        final Retrofit retrofit = new ArmeriaRetrofitBuilder().baseUrl("http://example.com:8080/").build();
+    void build() {
+        final Retrofit retrofit = ArmeriaRetrofit.of("http://example.com:8080/");
         assertThat(retrofit.baseUrl().toString()).isEqualTo("http://example.com:8080/");
     }
 
     @Test
-    public void build_wrongScheme() throws Exception {
-        final Throwable thrown = catchThrowable(
-                () -> new ArmeriaRetrofitBuilder().baseUrl("foo://example.com:8080").build());
-        assertThat(thrown).isInstanceOf(IllegalArgumentException.class)
-                          .hasMessage("baseUrl must have an HTTP scheme: foo://example.com:8080");
-    }
-
-    @Test
-    public void build_withoutSlashAtEnd() throws Exception {
-        final Retrofit retrofit = new ArmeriaRetrofitBuilder().baseUrl("http://example.com:8080").build();
+    void build_withoutSlashAtEnd() {
+        final Retrofit retrofit = ArmeriaRetrofit.of("http://example.com:8080");
         assertThat(retrofit.baseUrl().toString()).isEqualTo("http://example.com:8080/");
     }
 
     @Test
-    public void build_withNonRootPath() throws Exception {
-        assertThat(new ArmeriaRetrofitBuilder().baseUrl("http://example.com:8080/a/b/c/")
-                                               .build().baseUrl().toString())
+    void build_withNonRootPath() {
+        assertThat(ArmeriaRetrofit.of("http://example.com:8080/a/b/c/").baseUrl().toString())
                 .isEqualTo("http://example.com:8080/a/b/c/");
     }
 
     @Test
-    public void build_withNonRootPathNonSlashEnd() throws Exception {
-        final Throwable thrown = catchThrowable(
-                () -> new ArmeriaRetrofitBuilder().baseUrl("http://example.com:8080/a/b/c").build());
-        assertThat(thrown).isInstanceOf(IllegalArgumentException.class)
-                          .hasMessage("baseUrl must end with /: http://example.com:8080/a/b/c");
+    void build_withNonRootPathNonSlashEnd() {
+        assertThatThrownBy(() -> ArmeriaRetrofit.of("http://example.com:8080/a/b/c"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("baseUrl must end in /: http://example.com:8080/a/b/c");
     }
 
     @Test
-    public void build_moreSessionProtocol() throws Exception {
-        assertThat(new ArmeriaRetrofitBuilder().baseUrl("h1c://example.com:8080/").build().baseUrl()
-                                               .toString())
+    void build_moreSessionProtocol() {
+        assertThat(ArmeriaRetrofit.of("h1c://example.com:8080/").baseUrl().toString())
                 .isEqualTo("http://example.com:8080/");
-        assertThat(new ArmeriaRetrofitBuilder().baseUrl("h2c://example.com:8080/").build().baseUrl()
-                                               .toString())
+        assertThat(ArmeriaRetrofit.of("h2c://example.com:8080/").baseUrl().toString())
                 .isEqualTo("http://example.com:8080/");
-        assertThat(new ArmeriaRetrofitBuilder().baseUrl("h1://example.com:8080/").build().baseUrl()
-                                               .toString())
+        assertThat(ArmeriaRetrofit.of("h1://example.com:8080/").baseUrl().toString())
                 .isEqualTo("https://example.com:8080/");
-        assertThat(new ArmeriaRetrofitBuilder().baseUrl("h2://example.com:8080/").build().baseUrl()
-                                               .toString())
+        assertThat(ArmeriaRetrofit.of("h2://example.com:8080/").baseUrl().toString())
                 .isEqualTo("https://example.com:8080/");
-        assertThat(new ArmeriaRetrofitBuilder().baseUrl("https://example.com:8080/").build().baseUrl()
-                                               .toString())
+        assertThat(ArmeriaRetrofit.of("https://example.com:8080/").baseUrl().toString())
                 .isEqualTo("https://example.com:8080/");
     }
 
     @Test
-    public void build_armeriaGroupAuthority() throws Exception {
-        assertThat(new ArmeriaRetrofitBuilder().baseUrl("http://group:myGroup/").build().baseUrl()
-                                               .toString())
-                // NB: lower-cased by OkHttp
-                .isEqualTo("http://group_mygroup/");
+    void build_armeriaGroupAuthority() {
+        final Endpoint endpoint = Endpoint.of("127.0.0.1", 8080);
+        final EndpointGroup group = EndpointGroup.of(endpoint, endpoint);
 
-        assertThat(new ArmeriaRetrofitBuilder().baseUrl("http://group:myGroup").build().baseUrl()
-                                               .toString())
-                .isEqualTo("http://group_mygroup/");
+        assertThat(ArmeriaRetrofit.of(SessionProtocol.H2C, endpoint).baseUrl().toString())
+                .isEqualTo("http://127.0.0.1:8080/");
+
+        assertThat(ArmeriaRetrofit.of(SessionProtocol.H2, group).baseUrl().toString())
+                .startsWith("https://armeria-group-");
+    }
+
+    @Test
+    void build_clientOptions() {
+        final Service secretService = ArmeriaRetrofit
+                .builder(server.httpUri())
+                .addHeader(HttpHeaderNames.AUTHORIZATION, "Bearer: access-token")
+                .addConverterFactory(converterFactory)
+                .build()
+                .create(Service.class);
+        assertThat(secretService.secret().join()).isEqualTo("OK");
+    }
+
+    @Test
+    void build_overrideOption() {
+        final WebClient client = WebClient.builder(server.httpUri())
+                                          .responseTimeoutMillis(500L).build();
+        assertThat(client.options().get(ClientOptions.RESPONSE_TIMEOUT_MILLIS).longValue()).isEqualTo(500);
+
+        final Service serviceWithDefaultOptions = ArmeriaRetrofit.builder(client)
+                                                                 .addConverterFactory(converterFactory)
+                                                                 .build()
+                                                                 .create(Service.class);
+        assertThatThrownBy(() -> serviceWithDefaultOptions.slow().join())
+                .isInstanceOf(CompletionException.class)
+                .hasCauseInstanceOf(IOException.class);
+
+        final Service serviceWithCustomOptions =
+                ArmeriaRetrofit.builder(client)
+                               .option(ClientOptions.RESPONSE_TIMEOUT_MILLIS, 4000L)
+                               .addConverterFactory(converterFactory)
+                               .build()
+                               .create(Service.class);
+        assertThat(serviceWithCustomOptions.slow().join()).isEqualTo("OK");
+    }
+
+    interface Service {
+        @GET("/secret")
+        CompletableFuture<String> secret();
+
+        @GET("/slow")
+        CompletableFuture<String> slow();
     }
 }

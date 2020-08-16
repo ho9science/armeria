@@ -26,11 +26,12 @@ import org.openjdk.jmh.annotations.TearDown;
 import com.linecorp.armeria.client.endpoint.dns.DnsAddressEndpointGroup;
 import com.linecorp.armeria.client.endpoint.healthcheck.HealthCheckedEndpointGroup;
 import com.linecorp.armeria.common.AggregatedHttpResponse;
-import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.server.Server;
-import com.linecorp.armeria.server.ServerBuilder;
 
+/**
+ * Microbenchmarks of a {@link com.linecorp.armeria.client.endpoint.dns.DnsAddressEndpointGroup}.
+ */
 @State(Scope.Thread)
 public class DnsEndpointGroupBenchmark {
 
@@ -41,9 +42,9 @@ public class DnsEndpointGroupBenchmark {
 
     @Setup(Level.Trial)
     public void startServer() {
-        server = new ServerBuilder()
-                .service("/health", (ctx, req) -> HttpResponse.of(OK))
-                .build();
+        server = Server.builder()
+                       .service("/health", (ctx, req) -> OK.toHttpResponse())
+                       .build();
         server.start().join();
     }
 
@@ -56,7 +57,7 @@ public class DnsEndpointGroupBenchmark {
     public void setUp() {
         endpointGroup = HealthCheckedEndpointGroup.of(
                 DnsAddressEndpointGroup.of("localhost",
-                                           server.activePort().get().localAddress().getPort()), "/health");
+                                           server.activeLocalPort()), "/health");
     }
 
     @TearDown(Level.Invocation)
@@ -66,6 +67,6 @@ public class DnsEndpointGroupBenchmark {
 
     @Benchmark
     public Object resolveLocalhost() throws Exception {
-        return endpointGroup.awaitInitialEndpoints();
+        return endpointGroup.whenReady().get();
     }
 }

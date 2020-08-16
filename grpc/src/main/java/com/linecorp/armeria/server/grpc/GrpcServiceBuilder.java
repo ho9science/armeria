@@ -21,6 +21,7 @@ import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkState;
 import static java.util.Objects.requireNonNull;
 
+import java.time.Duration;
 import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.function.Consumer;
@@ -29,29 +30,33 @@ import java.util.function.Function;
 import javax.annotation.Nullable;
 
 import org.curioswitch.common.protobuf.json.MessageMarshaller;
-import org.curioswitch.common.protobuf.json.MessageMarshaller.Builder;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.protobuf.ByteString;
+import com.google.protobuf.Message;
 
-import com.linecorp.armeria.common.HttpRequest;
-import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.RequestContext;
 import com.linecorp.armeria.common.SerializationFormat;
+import com.linecorp.armeria.common.grpc.GrpcJsonMarshaller;
+import com.linecorp.armeria.common.grpc.GrpcJsonMarshallerBuilder;
 import com.linecorp.armeria.common.grpc.GrpcSerializationFormats;
+import com.linecorp.armeria.common.grpc.protocol.ArmeriaMessageDeframer;
 import com.linecorp.armeria.common.grpc.protocol.ArmeriaMessageFramer;
+import com.linecorp.armeria.server.HttpServiceWithRoutes;
 import com.linecorp.armeria.server.Route;
 import com.linecorp.armeria.server.ServerBuilder;
-import com.linecorp.armeria.server.ServerConfig;
-import com.linecorp.armeria.server.ServiceWithRoutes;
-import com.linecorp.armeria.server.encoding.HttpEncodingService;
+import com.linecorp.armeria.server.VirtualHost;
+import com.linecorp.armeria.server.VirtualHostBuilder;
+import com.linecorp.armeria.server.encoding.EncodingService;
 import com.linecorp.armeria.unsafe.grpc.GrpcUnsafeBufferUtil;
 
 import io.grpc.BindableService;
 import io.grpc.CompressorRegistry;
 import io.grpc.DecompressorRegistry;
+import io.grpc.ServerInterceptors;
 import io.grpc.ServerServiceDefinition;
+import io.grpc.ServiceDescriptor;
 import io.grpc.protobuf.services.ProtoReflectionService;
 
 /**
@@ -60,7 +65,7 @@ import io.grpc.protobuf.services.ProtoReflectionService;
 public final class GrpcServiceBuilder {
 
     private static final Set<SerializationFormat> DEFAULT_SUPPORTED_SERIALIZATION_FORMATS =
-            ImmutableSet.of(GrpcSerializationFormats.PROTO, GrpcSerializationFormats.PROTO_WEB);
+            GrpcSerializationFormats.values();
 
     private final HandlerRegistry.Builder registryBuilder = new HandlerRegistry.Builder();
 
@@ -70,13 +75,17 @@ public final class GrpcServiceBuilder {
     @Nullable
     private CompressorRegistry compressorRegistry;
 
+    @Nullable
+    private ProtoReflectionServiceInterceptor protoReflectionServiceInterceptor;
+
     private Set<SerializationFormat> supportedSerializationFormats = DEFAULT_SUPPORTED_SERIALIZATION_FORMATS;
 
-    private int maxInboundMessageSizeBytes = GrpcService.NO_MAX_INBOUND_MESSAGE_SIZE;
+    private int maxInboundMessageSizeBytes = ArmeriaMessageDeframer.NO_MAX_INBOUND_MESSAGE_SIZE;
 
     private int maxOutboundMessageSizeBytes = ArmeriaMessageFramer.NO_MAX_OUTBOUND_MESSAGE_SIZE;
 
-    private Consumer<Builder> jsonMarshallerCustomizer = (unused) -> {};
+    private Function<? super ServiceDescriptor, ? extends GrpcJsonMarshaller> jsonMarshallerFactory =
+            GrpcJsonMarshaller::of;
 
     private boolean enableUnframedRequests;
 
@@ -84,8 +93,9 @@ public final class GrpcServiceBuilder {
 
     private boolean unsafeWrapRequestBuffers;
 
-    @Nullable
-    private ProtoReflectionService protoReflectionService;
+    private boolean useClientTimeoutHeader = true;
+
+    GrpcServiceBuilder() {}
 
     /**
      * Adds a gRPC {@link ServerServiceDefinition} to this {@link GrpcServiceBuilder}, such as
@@ -102,10 +112,11 @@ public final class GrpcServiceBuilder {
      */
     public GrpcServiceBuilder addService(BindableService bindableService) {
         if (bindableService instanceof ProtoReflectionService) {
-            checkState(protoReflectionService == null,
+            checkState(protoReflectionServiceInterceptor == null,
                        "Attempting to add a ProtoReflectionService but one is already present. " +
                        "ProtoReflectionService must only be added once.");
-            protoReflectionService = (ProtoReflectionService) bindableService;
+            protoReflectionServiceInterceptor = new ProtoReflectionServiceInterceptor();
+            return addService(ServerInterceptors.intercept(bindableService, protoReflectionServiceInterceptor));
         }
 
         return addService(bindableService.bindService());
@@ -149,18 +160,16 @@ public final class GrpcServiceBuilder {
     }
 
     /**
-     * Sets the {@link SerializationFormat}s supported by this server. If not set, defaults to supporting binary
-     * protobuf formats. Enabling JSON can be useful, e.g., when migrating existing JSON services to gRPC.
+     * Sets the {@link SerializationFormat}s supported by this server. If not set, defaults to support
+     * all {@link GrpcSerializationFormats#values()}.
      */
     public GrpcServiceBuilder supportedSerializationFormats(SerializationFormat... formats) {
         return supportedSerializationFormats(ImmutableSet.copyOf(requireNonNull(formats, "formats")));
     }
 
     /**
-     * Sets the {@link SerializationFormat}s supported by this server. If not set, defaults to supporting binary
-     * protobuf formats. JSON formats are currently very inefficient and not recommended for use in production.
-     *
-     * <p>TODO(anuraaga): Use faster JSON marshalling.
+     * Sets the {@link SerializationFormat}s supported by this server. If not set, defaults to support
+     * all {@link GrpcSerializationFormats#values()}.
      */
     public GrpcServiceBuilder supportedSerializationFormats(Iterable<SerializationFormat> formats) {
         requireNonNull(formats, "formats");
@@ -175,10 +184,12 @@ public final class GrpcServiceBuilder {
 
     /**
      * Sets the maximum size in bytes of an individual incoming message. If not set, will use
-     * {@link ServerConfig#maxRequestLength()}. To support long-running RPC streams, it is recommended to
-     * set {@link ServerBuilder#maxRequestLength(long)} and
-     * {@link ServerBuilder#requestTimeoutMillis(long)} to very high values and set this to the expected
-     * limit of individual messages in the stream.
+     * {@link VirtualHost#maxRequestLength()}. To support long-running RPC streams, it is recommended to
+     * set {@link ServerBuilder#maxRequestLength(long)}
+     * (or {@link VirtualHostBuilder#maxRequestLength(long)})
+     * and {@link ServerBuilder#requestTimeoutMillis(long)}
+     * (or {@link VirtualHostBuilder#requestTimeoutMillis(long)})
+     * to very high values and set this to the expected limit of individual messages in the stream.
      */
     public GrpcServiceBuilder setMaxInboundMessageSizeBytes(int maxInboundMessageSizeBytes) {
         checkArgument(maxInboundMessageSizeBytes > 0,
@@ -210,7 +221,7 @@ public final class GrpcServiceBuilder {
      *     <li>Only unary methods (single request, single response) are supported.</li>
      *     <li>
      *         Message compression is not supported.
-     *         {@link HttpEncodingService} should be used instead for
+     *         {@link EncodingService} should be used instead for
      *         transport level encoding.
      *     </li>
      * </ul>
@@ -248,6 +259,9 @@ public final class GrpcServiceBuilder {
      * reference as what was passed to the service stub - a message with the same contents will not
      * work. If {@link GrpcUnsafeBufferUtil#releaseBuffer(Object, RequestContext)} is not called, the memory
      * will be leaked.
+     *
+     * <p>Note that this isn't working if the payloads are compressed or the {@link SerializationFormat} is
+     * {@link GrpcSerializationFormats#PROTO_WEB_TEXT}.
      */
     public GrpcServiceBuilder unsafeWrapRequestBuffers(boolean unsafeWrapRequestBuffers) {
         this.unsafeWrapRequestBuffers = unsafeWrapRequestBuffers;
@@ -255,28 +269,61 @@ public final class GrpcServiceBuilder {
     }
 
     /**
-     * Sets a {@link Consumer} that can customize the JSON marshaller used when handling JSON payloads in the
-     * service. This is commonly used to switch from the default of using lowerCamelCase for field names to
-     * using the field name from the proto definition, by setting
-     * {@link MessageMarshaller.Builder#preservingProtoFieldNames(boolean)}.
+     * Sets the factory that creates a {@link GrpcJsonMarshaller} that serializes and deserializes request or
+     * response messages to and from JSON depending on the {@link SerializationFormat}. The returned
+     * {@link GrpcJsonMarshaller} from the factory replaces the built-in {@link GrpcJsonMarshaller}.
+     *
+     * <p>This is commonly used to:
+     * <ul>
+     *   <li>Switch from the default of using lowerCamelCase for field names to using the field name from
+     *       the proto definition, by setting
+     *       {@link MessageMarshaller.Builder#preservingProtoFieldNames(boolean)} via
+     *       {@link GrpcJsonMarshallerBuilder#jsonMarshallerCustomizer(Consumer)}.
+     *       <pre>{@code
+     *       GrpcService.builder()
+     *                  .jsonMarshallerFactory(serviceDescriptor -> {
+     *                      return GrpcJsonMarshaller.builder()
+     *                                               .jsonMarshallerCustomizer(builder -> {
+     *                                                    builder.preservingProtoFieldNames(true);
+     *                                               })
+     *                                               .build(serviceDescriptor);
+     *                  })
+     *                  .build();
+     *       }</pre></li>
+     *   <li>Set a customer marshaller for non-{@link Message} types such as {@code scalapb.GeneratedMessage}
+     *       for Scala and {@code pbandk.Message} for Kotlin.</li>
+     * </ul>
      */
-    public GrpcServiceBuilder jsonMarshallerCustomizer(
-            Consumer<MessageMarshaller.Builder> jsonMarshallerCustomizer) {
-        this.jsonMarshallerCustomizer = requireNonNull(jsonMarshallerCustomizer, "jsonMarshallerCustomizer");
+    public GrpcServiceBuilder jsonMarshallerFactory(
+            Function<? super ServiceDescriptor, ? extends GrpcJsonMarshaller> jsonMarshallerFactory) {
+        this.jsonMarshallerFactory = requireNonNull(jsonMarshallerFactory, "jsonMarshallerFactory");
+        return this;
+    }
+
+    /**
+     * Sets whether to use a {@code grpc-timeout} header sent by the client to control the timeout for request
+     * processing. If disabled, the request timeout will be the one configured for the Armeria server, e.g.,
+     * using {@link ServerBuilder#requestTimeout(Duration)}.
+     *
+     * <p>It is recommended to disable this when clients are not trusted code, e.g., for gRPC-Web clients that
+     * can come from arbitrary browsers.
+     */
+    public GrpcServiceBuilder useClientTimeoutHeader(boolean useClientTimeoutHeader) {
+        this.useClientTimeoutHeader = useClientTimeoutHeader;
         return this;
     }
 
     /**
      * Constructs a new {@link GrpcService} that can be bound to
      * {@link ServerBuilder}. It is recommended to bind the service to a server using
-     * {@linkplain ServerBuilder#service(ServiceWithRoutes, Function[])
-     * ServerBuilder.service(ServiceWithRoutes)} to mount all service paths
+     * {@linkplain ServerBuilder#service(HttpServiceWithRoutes, Function[])
+     * ServerBuilder.service(HttpServiceWithRoutes)} to mount all service paths
      * without interfering with other services.
      */
-    public ServiceWithRoutes<HttpRequest, HttpResponse> build() {
+    public GrpcService build() {
         final HandlerRegistry handlerRegistry = registryBuilder.build();
 
-        final GrpcService grpcService = new GrpcService(
+        final GrpcService grpcService = new FramedGrpcService(
                 handlerRegistry,
                 handlerRegistry
                         .methods()
@@ -287,12 +334,13 @@ public final class GrpcServiceBuilder {
                 firstNonNull(decompressorRegistry, DecompressorRegistry.getDefaultInstance()),
                 firstNonNull(compressorRegistry, CompressorRegistry.getDefaultInstance()),
                 supportedSerializationFormats,
-                jsonMarshallerCustomizer,
+                jsonMarshallerFactory,
+                protoReflectionServiceInterceptor,
                 maxOutboundMessageSizeBytes,
                 useBlockingTaskExecutor,
                 unsafeWrapRequestBuffers,
-                protoReflectionService,
+                useClientTimeoutHeader,
                 maxInboundMessageSizeBytes);
-        return enableUnframedRequests ? grpcService.decorate(UnframedGrpcService::new) : grpcService;
+        return enableUnframedRequests ? new UnframedGrpcService(grpcService) : grpcService;
     }
 }

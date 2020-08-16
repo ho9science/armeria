@@ -17,8 +17,8 @@ package com.linecorp.armeria.client.endpoint.dns;
 
 import static com.google.common.base.Preconditions.checkState;
 
-import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
@@ -34,23 +34,21 @@ import com.google.common.collect.ImmutableSortedSet;
 
 import com.linecorp.armeria.client.Endpoint;
 import com.linecorp.armeria.client.endpoint.DynamicEndpointGroup;
-import com.linecorp.armeria.client.endpoint.EndpointGroupException;
+import com.linecorp.armeria.client.endpoint.EndpointSelectionStrategy;
 import com.linecorp.armeria.client.retry.Backoff;
-import com.linecorp.armeria.internal.TransportType;
+import com.linecorp.armeria.internal.client.DefaultDnsNameResolver;
+import com.linecorp.armeria.internal.client.DnsUtil;
+import com.linecorp.armeria.internal.common.util.TransportType;
 
 import io.netty.buffer.ByteBuf;
-import io.netty.buffer.ByteBufUtil;
 import io.netty.channel.EventLoop;
 import io.netty.handler.codec.dns.DnsQuestion;
 import io.netty.handler.codec.dns.DnsRecord;
 import io.netty.handler.codec.dns.DnsRecordType;
-import io.netty.resolver.dns.DnsNameResolver;
 import io.netty.resolver.dns.DnsNameResolverBuilder;
 import io.netty.resolver.dns.DnsServerAddressStreamProvider;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.concurrent.Future;
-import io.netty.util.concurrent.FutureListener;
-import io.netty.util.concurrent.Promise;
 import io.netty.util.concurrent.ScheduledFuture;
 
 /**
@@ -64,21 +62,23 @@ abstract class DnsEndpointGroup extends DynamicEndpointGroup {
     private final int maxTtl;
     private final Backoff backoff;
     private final List<DnsQuestion> questions;
-    private final DnsNameResolver resolver;
+    private final DefaultDnsNameResolver resolver;
     private final Logger logger;
     private final String logPrefix;
 
     private boolean started;
-    private volatile boolean stopped;
     @Nullable
     private volatile ScheduledFuture<?> scheduledFuture;
     @VisibleForTesting
     int attemptsSoFar;
 
-    DnsEndpointGroup(EventLoop eventLoop, int minTtl, int maxTtl,
+    DnsEndpointGroup(EndpointSelectionStrategy selectionStrategy,
+                     EventLoop eventLoop, int minTtl, int maxTtl, long queryTimeoutMillis,
                      DnsServerAddressStreamProvider serverAddressStreamProvider,
                      Backoff backoff, Iterable<DnsQuestion> questions,
                      Consumer<DnsNameResolverBuilder> resolverConfigurator) {
+
+        super(selectionStrategy);
 
         this.eventLoop = eventLoop;
         this.minTtl = minTtl;
@@ -90,16 +90,21 @@ abstract class DnsEndpointGroup extends DynamicEndpointGroup {
         logPrefix = this.questions.stream()
                                   .map(DnsQuestion::name)
                                   .distinct()
-                                  .collect(Collectors.joining(", ", "[", "]"));
+                                  .collect(Collectors.joining(", "));
 
         final DnsNameResolverBuilder resolverBuilder = new DnsNameResolverBuilder(eventLoop)
                 .channelType(TransportType.datagramChannelType(eventLoop.parent()))
                 .ttl(minTtl, maxTtl)
                 .traceEnabled(true)
                 .nameServerProvider(serverAddressStreamProvider);
+        if (queryTimeoutMillis == 0) {
+            resolverBuilder.queryTimeoutMillis(Long.MAX_VALUE);
+        } else {
+            resolverBuilder.queryTimeoutMillis(queryTimeoutMillis);
+        }
 
         resolverConfigurator.accept(resolverBuilder);
-        resolver = resolverBuilder.build();
+        resolver = new DefaultDnsNameResolver(resolverBuilder.build(), eventLoop, queryTimeoutMillis);
     }
 
     final Logger logger() {
@@ -116,73 +121,21 @@ abstract class DnsEndpointGroup extends DynamicEndpointGroup {
     final void start() {
         checkState(!started);
         started = true;
-        eventLoop.execute(this::sendQueries);
+        eventLoop.execute(() -> sendQueries(questions));
     }
 
-    private void sendQueries() {
-        if (stopped) {
+    private void sendQueries(List<DnsQuestion> questions) {
+        if (isClosing()) {
             return;
         }
 
-        final Future<List<DnsRecord>> future;
-        final int numQuestions = questions.size();
-        if (numQuestions == 1) {
-            // Simple case of single query
-            final DnsQuestion question = questions.get(0);
-            logger.debug("{} Sending a DNS query", logPrefix);
-            future = resolver.resolveAll(question);
-        } else {
-            // Multiple queries
-            logger.debug("{} Sending DNS queries", logPrefix);
-            final Promise<List<DnsRecord>> aggregatedPromise = eventLoop.newPromise();
-            final FutureListener<List<DnsRecord>> listener = new FutureListener<List<DnsRecord>>() {
-                private final List<DnsRecord> records = new ArrayList<>();
-                private int remaining = numQuestions;
-                @Nullable
-                private List<Throwable> causes;
-
-                @Override
-                public void operationComplete(Future<List<DnsRecord>> future) throws Exception {
-                    if (future.isSuccess()) {
-                        final List<DnsRecord> records = future.getNow();
-                        this.records.addAll(records);
-                    } else {
-                        if (causes == null) {
-                            causes = new ArrayList<>(numQuestions);
-                        }
-                        causes.add(future.cause());
-                    }
-
-                    if (--remaining == 0) {
-                        if (!records.isEmpty()) {
-                            aggregatedPromise.setSuccess(records);
-                        } else {
-                            final Throwable aggregatedCause;
-                            if (causes == null) {
-                                aggregatedCause =
-                                        new EndpointGroupException("empty result returned by DNS server");
-                            } else {
-                                aggregatedCause = new EndpointGroupException("failed to receive DNS records");
-                                for (Throwable c : causes) {
-                                    aggregatedCause.addSuppressed(c);
-                                }
-                            }
-                            aggregatedPromise.setFailure(aggregatedCause);
-                        }
-                    }
-                }
-            };
-
-            questions.forEach(q -> resolver.resolveAll(q).addListener(listener));
-            future = aggregatedPromise;
-        }
-
+        final Future<List<DnsRecord>> future = resolver.sendQueries(questions, logPrefix);
         attemptsSoFar++;
         future.addListener(this::onDnsRecords);
     }
 
     private void onDnsRecords(Future<? super List<DnsRecord>> future) {
-        if (stopped) {
+        if (isClosing()) {
             if (future.isSuccess()) {
                 @SuppressWarnings("unchecked")
                 final List<DnsRecord> result = (List<DnsRecord>) future.getNow();
@@ -196,7 +149,8 @@ abstract class DnsEndpointGroup extends DynamicEndpointGroup {
             final long delayMillis = backoff.nextDelayMillis(attemptsSoFar);
             logger.warn("{} DNS query failed; retrying in {} ms (attempts so far: {}):",
                         logPrefix, delayMillis, attemptsSoFar, future.cause());
-            scheduledFuture = eventLoop.schedule(this::sendQueries, delayMillis, TimeUnit.MILLISECONDS);
+            scheduledFuture = eventLoop.schedule(() -> sendQueries(questions),
+                                                 delayMillis, TimeUnit.MILLISECONDS);
             return;
         }
 
@@ -214,7 +168,7 @@ abstract class DnsEndpointGroup extends DynamicEndpointGroup {
             logger.warn("{} Failed to process the DNS query result: {}", logPrefix, records, t);
         } finally {
             records.forEach(ReferenceCountUtil::safeRelease);
-            scheduledFuture = eventLoop.schedule(this::sendQueries, effectiveTtl, TimeUnit.SECONDS);
+            scheduledFuture = eventLoop.schedule(() -> sendQueries(questions), effectiveTtl, TimeUnit.SECONDS);
         }
     }
 
@@ -228,23 +182,18 @@ abstract class DnsEndpointGroup extends DynamicEndpointGroup {
      * Stops polling DNS servers for service updates.
      */
     @Override
-    public final void close() {
-        stopped = true;
-        super.close();
+    protected final void doCloseAsync(CompletableFuture<?> future) {
         final ScheduledFuture<?> scheduledFuture = this.scheduledFuture;
         if (scheduledFuture != null) {
             scheduledFuture.cancel(true);
         }
+        future.complete(null);
     }
 
     /**
      * Logs a warning message about an invalid record.
      */
     final void warnInvalidRecord(DnsRecordType type, ByteBuf content) {
-        if (logger().isWarnEnabled()) {
-            final String dump = ByteBufUtil.hexDump(content);
-            logger().warn("{} Skipping invalid {} record: {}",
-                          logPrefix(), type.name(), dump.isEmpty() ? "<empty>" : dump);
-        }
+        DnsUtil.warnInvalidRecord(logger(), logPrefix(), type, content);
     }
 }

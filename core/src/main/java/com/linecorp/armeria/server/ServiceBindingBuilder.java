@@ -18,27 +18,24 @@ package com.linecorp.armeria.server;
 
 import static java.util.Objects.requireNonNull;
 
-import java.nio.charset.Charset;
 import java.time.Duration;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.Predicate;
 
 import com.linecorp.armeria.common.HttpMethod;
-import com.linecorp.armeria.common.HttpRequest;
-import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.MediaType;
-import com.linecorp.armeria.common.logging.ContentPreviewerFactory;
 import com.linecorp.armeria.server.logging.AccessLogWriter;
 
 /**
- * A builder class for binding a {@link Service} fluently. This class can be instantiated through
- * {@link ServerBuilder#route()}. You can also configure a {@link Service} using
+ * A builder class for binding an {@link HttpService} fluently. This class can be instantiated through
+ * {@link ServerBuilder#route()}. You can also configure an {@link HttpService} using
  * {@link ServerBuilder#withRoute(Consumer)}.
  *
- * <p>Call {@link #build(Service)} to build the {@link Service} and return to the {@link ServerBuilder}.
+ * <p>Call {@link #build(HttpService)} to build the {@link HttpService} and return to the {@link ServerBuilder}.
  *
  * <pre>{@code
- * ServerBuilder sb = new ServerBuilder();
+ * ServerBuilder sb = Server.builder();
  *
  * sb.route()                                      // Configure the first service.
  *   .post("/foo/bar")
@@ -47,7 +44,6 @@ import com.linecorp.armeria.server.logging.AccessLogWriter;
  *   .requestTimeoutMillis(5000)
  *   .maxRequestLength(8192)
  *   .verboseResponses(true)
- *   .contentPreview(500)
  *   .build((ctx, req) -> HttpResponse.of(OK));    // Return to the ServerBuilder.
  *
  * // Configure the second service with Consumer.
@@ -72,8 +68,8 @@ public final class ServiceBindingBuilder extends AbstractServiceBindingBuilder {
     }
 
     @Override
-    public ServiceBindingBuilder pathUnder(String prefix) {
-        return (ServiceBindingBuilder) super.pathUnder(prefix);
+    public ServiceBindingBuilder pathPrefix(String prefix) {
+        return (ServiceBindingBuilder) super.pathPrefix(prefix);
     }
 
     @Override
@@ -152,6 +148,52 @@ public final class ServiceBindingBuilder extends AbstractServiceBindingBuilder {
     }
 
     @Override
+    public ServiceBindingBuilder matchesParams(String... paramPredicates) {
+        return (ServiceBindingBuilder) super.matchesParams(paramPredicates);
+    }
+
+    @Override
+    public ServiceBindingBuilder matchesParams(Iterable<String> paramPredicates) {
+        return (ServiceBindingBuilder) super.matchesParams(paramPredicates);
+    }
+
+    @Override
+    public ServiceBindingBuilder matchesParams(String paramName, Predicate<? super String> valuePredicate) {
+        return (ServiceBindingBuilder) super.matchesParams(paramName, valuePredicate);
+    }
+
+    @Override
+    public ServiceBindingBuilder matchesHeaders(String... headerPredicates) {
+        return (ServiceBindingBuilder) super.matchesHeaders(headerPredicates);
+    }
+
+    @Override
+    public ServiceBindingBuilder matchesHeaders(Iterable<String> headerPredicates) {
+        return (ServiceBindingBuilder) super.matchesHeaders(headerPredicates);
+    }
+
+    @Override
+    public ServiceBindingBuilder matchesHeaders(CharSequence headerName,
+                                                Predicate<? super String> valuePredicate) {
+        return (ServiceBindingBuilder) super.matchesHeaders(headerName, valuePredicate);
+    }
+
+    @Override
+    public ServiceBindingBuilder addRoute(Route route) {
+        return (ServiceBindingBuilder) super.addRoute(route);
+    }
+
+    @Override
+    public ServiceBindingBuilder defaultServiceName(String defaultServiceName) {
+        return (ServiceBindingBuilder) super.defaultServiceName(defaultServiceName);
+    }
+
+    @Override
+    public ServiceBindingBuilder defaultLogName(String defaultLogName) {
+        return (ServiceBindingBuilder) super.defaultLogName(defaultLogName);
+    }
+
+    @Override
     public ServiceBindingBuilder requestTimeout(Duration requestTimeout) {
         return (ServiceBindingBuilder) super.requestTimeout(requestTimeout);
     }
@@ -172,28 +214,8 @@ public final class ServiceBindingBuilder extends AbstractServiceBindingBuilder {
     }
 
     @Override
-    public ServiceBindingBuilder requestContentPreviewerFactory(ContentPreviewerFactory factory) {
-        return (ServiceBindingBuilder) super.requestContentPreviewerFactory(factory);
-    }
-
-    @Override
-    public ServiceBindingBuilder responseContentPreviewerFactory(ContentPreviewerFactory factory) {
-        return (ServiceBindingBuilder) super.responseContentPreviewerFactory(factory);
-    }
-
-    @Override
-    public ServiceBindingBuilder contentPreview(int length) {
-        return (ServiceBindingBuilder) super.contentPreview(length);
-    }
-
-    @Override
-    public ServiceBindingBuilder contentPreview(int length, Charset defaultCharset) {
-        return (ServiceBindingBuilder) super.contentPreview(length, defaultCharset);
-    }
-
-    @Override
-    public ServiceBindingBuilder contentPreviewerFactory(ContentPreviewerFactory factory) {
-        return (ServiceBindingBuilder) super.contentPreviewerFactory(factory);
+    public ServiceBindingBuilder accessLogFormat(String accessLogFormat) {
+        return (ServiceBindingBuilder) super.accessLogFormat(accessLogFormat);
     }
 
     @Override
@@ -202,18 +224,30 @@ public final class ServiceBindingBuilder extends AbstractServiceBindingBuilder {
     }
 
     @Override
-    public <T extends Service<HttpRequest, HttpResponse>, R extends Service<HttpRequest, HttpResponse>>
-    ServiceBindingBuilder decorator(Function<T, R> decorator) {
+    public ServiceBindingBuilder decorator(Function<? super HttpService, ? extends HttpService> decorator) {
         return (ServiceBindingBuilder) super.decorator(decorator);
     }
 
+    @Override
+    @SafeVarargs
+    public final ServiceBindingBuilder decorators(
+            Function<? super HttpService, ? extends HttpService>... decorators) {
+        return (ServiceBindingBuilder) super.decorators(decorators);
+    }
+
+    @Override
+    public ServiceBindingBuilder decorators(
+            Iterable<? extends Function<? super HttpService, ? extends HttpService>> decorators) {
+        return (ServiceBindingBuilder) super.decorators(decorators);
+    }
+
     /**
-     * Sets the {@link Service} and returns the {@link ServerBuilder} that this
+     * Sets the {@link HttpService} and returns the {@link ServerBuilder} that this
      * {@link ServiceBindingBuilder} was created from.
      *
-     * @throws IllegalStateException if the path that the {@link Service} will be bound to is not specified
+     * @throws IllegalStateException if the path that the {@link HttpService} will be bound to is not specified
      */
-    public ServerBuilder build(Service<HttpRequest, HttpResponse> service) {
+    public ServerBuilder build(HttpService service) {
         build0(service);
         return serverBuilder;
     }

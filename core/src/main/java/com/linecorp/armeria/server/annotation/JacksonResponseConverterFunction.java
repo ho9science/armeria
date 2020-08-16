@@ -15,7 +15,7 @@
  */
 package com.linecorp.armeria.server.annotation;
 
-import static com.linecorp.armeria.internal.ResponseConversionUtil.aggregateFrom;
+import static com.linecorp.armeria.internal.server.ResponseConversionUtil.aggregateFrom;
 import static java.util.Objects.requireNonNull;
 
 import java.nio.charset.Charset;
@@ -43,10 +43,12 @@ import com.linecorp.armeria.server.streaming.JsonTextSequences;
  * {@code content-type: application/json; charset=utf-8} or {@code content-type: application/json-seq}.
  * The objects published from a {@link Publisher} or {@link Stream} would be converted into JSON Text Sequences
  * if a {@link ProducesJsonSequences} annotation is specified on an annotated service method.
+ * Note that this {@link ResponseConverterFunction} is applied to the annotated service by default,
+ * so you don't have to set explicitly unless you want to use your own {@link ObjectMapper}.
  *
  * @see <a href="https://tools.ietf.org/html/rfc7464">JavaScript Object Notation (JSON) Text Sequences</a>
  */
-public class JacksonResponseConverterFunction implements ResponseConverterFunction {
+public final class JacksonResponseConverterFunction implements ResponseConverterFunction {
 
     private static final ObjectMapper defaultObjectMapper = new ObjectMapper();
 
@@ -76,7 +78,7 @@ public class JacksonResponseConverterFunction implements ResponseConverterFuncti
             // @Produces("application/json") or @ProducesJson is specified.
             // Any MIME type which ends with '+json' such as 'application/json-patch+json' can be also accepted.
             if (mediaType.is(MediaType.JSON) || mediaType.subtype().endsWith("+json")) {
-                final Charset charset = mediaType.charset().orElse(StandardCharsets.UTF_8);
+                final Charset charset = mediaType.charset(StandardCharsets.UTF_8);
                 // Convert the object only if the charset supports UTF-8,
                 // because ObjectMapper always writes JSON document as UTF-8.
                 if (charset.contains(StandardCharsets.UTF_8)) {

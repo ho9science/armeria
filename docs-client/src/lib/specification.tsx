@@ -47,8 +47,10 @@ export interface Method {
   parameters: Parameter[];
   exceptionTypeSignatures: string[];
   endpoints: Endpoint[];
-  exampleHttpHeaders: { [name: string]: string }[];
+  exampleHeaders: { [name: string]: string }[];
   exampleRequests: string[];
+  examplePaths: string[];
+  exampleQueries: string[];
   httpMethod: string;
   docString?: DocString;
 }
@@ -56,12 +58,13 @@ export interface Method {
 export interface Service {
   name: string;
   methods: Method[];
-  exampleHttpHeaders: { [name: string]: string }[];
+  exampleHeaders: { [name: string]: string }[];
   docString?: DocString;
 }
 
 export interface Value {
   name: string;
+  intValue?: number;
   docString?: DocString;
 }
 
@@ -89,7 +92,7 @@ export interface SpecificationData {
   enums: Enum[];
   structs: Struct[];
   exceptions: Struct[];
-  exampleHttpHeaders: { [name: string]: string }[];
+  exampleHeaders: { [name: string]: string }[];
 }
 
 export function simpleName(fullName: string): string {
@@ -114,7 +117,9 @@ export class Specification {
   private data: SpecificationData;
 
   private enumsByName: Map<string, Enum>;
+
   private servicesByName: Map<string, Service>;
+
   private structsByName: Map<string, Struct>;
 
   constructor(data: SpecificationData) {
@@ -146,8 +151,8 @@ export class Specification {
     return this.data.structs;
   }
 
-  public getExampleHttpHeaders(): { [name: string]: string }[] {
-    return this.data.exampleHttpHeaders;
+  public getExampleHeaders(): { [name: string]: string }[] {
+    return this.data.exampleHeaders;
   }
 
   public getEnumByName(name: string): Enum | undefined {
@@ -247,7 +252,7 @@ export class Specification {
     if (!docString) {
       return parameters;
     }
-    const pattern = /@param\s+(\w+)[\s\.]+(({@|[^@])*)(?=(@[\w]+|$|\s))/gm;
+    const pattern = /@param\s+(\w+)[\s.]+(({@|[^@])*)(?=(@[\w]+|$|\s))/gm;
     let match = pattern.exec(docString);
     while (match != null) {
       parameters.set(match[1], match[2]);
@@ -269,9 +274,11 @@ export class Specification {
     }
     const docString = item.docString as string;
     const lines = docString.split(/(?:\r\n|\n|\r)/gim);
+    // eslint-disable-next-line no-param-reassign
     item.docString = (
       <>
         {lines.map((line, i) => (
+          // eslint-disable-next-line react/no-array-index-key
           <React.Fragment key={`${line}-${i}`}>
             {line}
             {i < lines.length - 1 ? <br /> : null}

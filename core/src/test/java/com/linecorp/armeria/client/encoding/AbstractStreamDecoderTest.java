@@ -25,18 +25,16 @@ import java.util.zip.DeflaterOutputStream;
 import org.junit.Test;
 
 import com.linecorp.armeria.common.HttpData;
-import com.linecorp.armeria.unsafe.ByteBufHttpData;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
-import io.netty.buffer.ByteBufHolder;
 
 abstract class AbstractStreamDecoderTest {
 
     private static final byte[] PAYLOAD;
 
     static {
-        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        final ByteArrayOutputStream bos = new ByteArrayOutputStream();
         try (DeflaterOutputStream zip = new DeflaterOutputStream(bos, new Deflater(-1, true))) {
             zip.write(new byte[] { 1, 2, 3, 4, 5 });
         } catch (IOException e) {
@@ -52,28 +50,28 @@ abstract class AbstractStreamDecoderTest {
         final StreamDecoder decoder = newDecoder();
         final ByteBuf buf = ByteBufAllocator.DEFAULT.buffer();
         buf.writeBytes(PAYLOAD);
-        HttpData data = decoder.decode(new ByteBufHttpData(buf, false));
+        final HttpData data = decoder.decode(HttpData.wrap(buf));
         assertThat(buf.refCnt()).isZero();
-        assertThat(data).isInstanceOfSatisfying(ByteBufHolder.class, d -> assertThat(d.refCnt()).isEqualTo(1));
-        ((ByteBufHolder) data).release();
+        assertThat(data.byteBuf().refCnt()).isOne();
+        data.close();
     }
 
     @Test
     public void empty_unpooled() {
         final StreamDecoder decoder = newDecoder();
-        HttpData data = decoder.decode(HttpData.EMPTY_DATA);
-        assertThat(data).isNotInstanceOf(ByteBufHolder.class);
+        final HttpData data = decoder.decode(HttpData.empty());
+        assertThat(data.isPooled()).isFalse();
     }
 
     @Test
     public void empty_pooled() {
         final StreamDecoder decoder = newDecoder();
         final ByteBuf buf = ByteBufAllocator.DEFAULT.buffer();
-        HttpData data = decoder.decode(new ByteBufHttpData(buf, false));
+        final HttpData data = decoder.decode(HttpData.wrap(buf));
         assertThat(buf.refCnt()).isZero();
 
         // Even for a pooled empty input, the result is unpooled since there's no point in pooling empty
         // buffers.
-        assertThat(data).isNotInstanceOf(ByteBufHolder.class);
+        assertThat(data.isPooled()).isFalse();
     }
 }

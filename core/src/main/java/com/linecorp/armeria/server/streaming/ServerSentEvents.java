@@ -15,7 +15,7 @@
  */
 package com.linecorp.armeria.server.streaming;
 
-import static com.linecorp.armeria.internal.ResponseConversionUtil.streamingFrom;
+import static com.linecorp.armeria.internal.server.ResponseConversionUtil.streamingFrom;
 import static java.util.Objects.requireNonNull;
 
 import java.time.Duration;
@@ -42,17 +42,18 @@ import com.linecorp.armeria.common.sse.ServerSentEvent;
  *
  * <p>A user simply creates a streaming {@link HttpResponse} which emits Server-Sent Events, e.g.
  * <pre>{@code
- * Server server = new ServerBuilder()
- *         // Emit Server-Sent Events with the SeverSentEvent instances published by a publisher.
- *         .service("/sse1",
- *                  (ctx, req) -> ServerSentEvents.fromPublisher(
- *                          Flux.just(ServerSentEvent.ofData("foo"), ServerSentEvent.ofData("bar"))))
- *         // Emit Server-Sent Events with converting instances published by a publisher into
- *         // ServerSentEvent instances.
- *         .service("/sse2",
- *                  (ctx, req) -> ServerSentEvents.fromPublisher(
- *                          Flux.just("foo", "bar"), ServerSentEvent::ofData))
- *         .build();
+ * Server server =
+ *     Server.builder()
+ *           // Emit Server-Sent Events with the SeverSentEvent instances published by a publisher.
+ *           .service("/sse1",
+ *                    (ctx, req) -> ServerSentEvents.fromPublisher(
+ *                            Flux.just(ServerSentEvent.ofData("foo"), ServerSentEvent.ofData("bar"))))
+ *           // Emit Server-Sent Events with converting instances published by a publisher into
+ *           // ServerSentEvent instances.
+ *           .service("/sse2",
+ *                    (ctx, req) -> ServerSentEvents.fromPublisher(
+ *                            Flux.just("foo", "bar"), ServerSentEvent::ofData))
+ *           .build();
  * }</pre>
  */
 public final class ServerSentEvents {
@@ -367,14 +368,14 @@ public final class ServerSentEvents {
             sb.append("retry:").append(retry.toMillis()).append(LINE_FEED);
         }
 
-        return sb.length() == 0 ? HttpData.EMPTY_DATA
+        return sb.length() == 0 ? HttpData.empty()
                                 : HttpData.ofUtf8(sb.append(LINE_FEED).toString());
     }
 
     private static <T> HttpData toHttpData(
             Function<? super T, ? extends ServerSentEvent> converter, T content) {
         final ServerSentEvent sse = converter.apply(content);
-        return sse == null ? HttpData.EMPTY_DATA : toHttpData(sse);
+        return sse == null ? HttpData.empty() : toHttpData(sse);
     }
 
     private static void appendField(StringBuilder sb, String name, String value,

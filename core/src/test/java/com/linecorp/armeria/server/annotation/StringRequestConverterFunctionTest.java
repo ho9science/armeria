@@ -24,7 +24,7 @@ import org.junit.jupiter.api.Test;
 
 import com.linecorp.armeria.common.AggregatedHttpRequest;
 import com.linecorp.armeria.common.MediaType;
-import com.linecorp.armeria.internal.ArmeriaHttpUtil;
+import com.linecorp.armeria.internal.common.ArmeriaHttpUtil;
 import com.linecorp.armeria.server.ServiceRequestContext;
 
 class StringRequestConverterFunctionTest {
@@ -40,7 +40,7 @@ class StringRequestConverterFunctionTest {
         when(req.contentType()).thenReturn(MediaType.JSON);
         when(req.content(ArmeriaHttpUtil.HTTP_DEFAULT_CONTENT_CHARSET)).thenReturn(JSON_TEXT);
 
-        final Object result = function.convertRequest(ctx, req, String.class);
+        final Object result = function.convertRequest(ctx, req, String.class, null);
         assertThat(result).isInstanceOf(String.class);
     }
 
@@ -49,7 +49,7 @@ class StringRequestConverterFunctionTest {
         when(req.contentType()).thenReturn(MediaType.JSON);
         when(req.content(ArmeriaHttpUtil.HTTP_DEFAULT_CONTENT_CHARSET)).thenReturn(JSON_TEXT);
 
-        final Object result = function.convertRequest(ctx, req, CharSequence.class);
+        final Object result = function.convertRequest(ctx, req, CharSequence.class, null);
         assertThat(result).isInstanceOf(CharSequence.class);
     }
 }

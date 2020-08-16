@@ -16,12 +16,15 @@
 
 package com.linecorp.armeria.client;
 
+import static java.util.Objects.requireNonNull;
+
 import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.Request;
 import com.linecorp.armeria.common.Response;
 import com.linecorp.armeria.common.RpcRequest;
 import com.linecorp.armeria.common.RpcResponse;
+import com.linecorp.armeria.common.util.Unwrappable;
 
 /**
  * Sends a {@link Request} to a remote {@link Endpoint}.
@@ -37,7 +40,7 @@ import com.linecorp.armeria.common.RpcResponse;
  * @see UserClient
  */
 @FunctionalInterface
-public interface Client<I extends Request, O extends Response> {
+public interface Client<I extends Request, O extends Response> extends Unwrappable {
     /**
      * Sends a {@link Request} to a remote {@link Endpoint}, as specified in
      * {@link ClientRequestContext#endpoint()}.
@@ -45,4 +48,41 @@ public interface Client<I extends Request, O extends Response> {
      * @return the {@link Response} to the specified {@link Request}
      */
     O execute(ClientRequestContext ctx, I req) throws Exception;
+
+    /**
+     * Unwraps this {@link Client} into the object of the specified {@code type}.
+     * Use this method instead of an explicit downcast. For example:
+     * <pre>{@code
+     * WebClient client = WebClient.builder(...)
+     *                             .decorator(LoggingClient.newDecorator())
+     *                             .build();
+     *
+     * LoggingClient unwrapped = client.as(LoggingClient.class);
+     *
+     * // You can also use Clients.unwrap(), which is useful especially for
+     * // Thrift and gRPC where the client object does not implement the 'as()' method.
+     * LoggingClient unwrapped2 = Clients.unwrap(client, LoggingClient.class);
+     * }</pre>
+     *
+     * @param type the type of the object to return
+     * @return the object of the specified {@code type} if found, or {@code null} if not found.
+     *
+     * @see Clients#unwrap(Object, Class)
+     * @see ClientFactory#unwrap(Object, Class)
+     * @see Unwrappable
+     */
+    @Override
+    default <T> T as(Class<T> type) {
+        requireNonNull(type, "type");
+        return Unwrappable.super.as(type);
+    }
+
+    /**
+     * Unwraps this {@link Client} and returns the object being decorated.
+     * If this {@link Client} is the innermost object, this method returns itself.
+     */
+    @Override
+    default Client<? extends Request, ? extends Response> unwrap() {
+        return (Client<? extends Request, ? extends Response>) Unwrappable.super.unwrap();
+    }
 }

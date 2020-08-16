@@ -27,7 +27,7 @@ import com.linecorp.armeria.server.ServiceRequestContext;
 /**
  * Determines whether a given {@code data} is authorized for the service registered in.
  * {@code ctx} can be used for storing authorization information about the request for use in
- * business logic. {@code data} is usually a {@link HttpRequest}
+ * business logic. {@code data} is usually an {@link HttpRequest}
  * or token extracted from it.
  */
 @FunctionalInterface
@@ -61,7 +61,7 @@ public interface Authorizer<T> {
                         return result ? CompletableFuture.completedFuture(true)
                                       : AuthorizerUtil.authorize(nextAuthorizer, ctx, data);
                     }
-                }, ctx.contextAwareEventLoop());
+                }, ctx.eventLoop());
             }
 
             @Override

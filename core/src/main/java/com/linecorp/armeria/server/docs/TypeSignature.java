@@ -20,7 +20,6 @@ import static java.util.Objects.requireNonNull;
 
 import java.util.List;
 import java.util.Objects;
-import java.util.Optional;
 import java.util.regex.Pattern;
 
 import javax.annotation.Nullable;
@@ -28,6 +27,8 @@ import javax.annotation.Nullable;
 import com.fasterxml.jackson.databind.annotation.JsonSerialize;
 import com.google.common.base.Joiner;
 import com.google.common.collect.ImmutableList;
+
+import com.linecorp.armeria.common.annotation.UnstableApi;
 
 /**
  * Type signature of a method parameter, a method return value or a struct/exception field.
@@ -53,6 +54,7 @@ import com.google.common.collect.ImmutableList;
  *   </ul></li>
  * </ul>
  */
+@UnstableApi
 @JsonSerialize(using = TypeSignatureJsonSerializer.class)
 public final class TypeSignature {
 
@@ -104,7 +106,7 @@ public final class TypeSignature {
 
     /**
      * Creates a new type signature for the list with the specified element type signature.
-     * This method is a shortcut of:
+     * This method is a shortcut for:
      * <pre>{@code
      * ofContainer("list", elementTypeSignature);
      * }</pre>
@@ -116,7 +118,7 @@ public final class TypeSignature {
 
     /**
      * Creates a new type signature for the list with the specified named element type.
-     * This method is a shortcut of:
+     * This method is a shortcut for:
      * <pre>{@code
      * ofList(ofNamed(namedElementType));
      * }</pre>
@@ -127,7 +129,7 @@ public final class TypeSignature {
 
     /**
      * Creates a new type signature for the set with the specified element type signature.
-     * This method is a shortcut of:
+     * This method is a shortcut for:
      * <pre>{@code
      * ofContainer("set", elementTypeSignature);
      * }</pre>
@@ -139,7 +141,7 @@ public final class TypeSignature {
 
     /**
      * Creates a new type signature for the set with the specified named element type.
-     * This method is a shortcut of:
+     * This method is a shortcut for:
      * <pre>{@code
      * ofSet(ofNamed(namedElementType));
      * }</pre>
@@ -150,7 +152,7 @@ public final class TypeSignature {
 
     /**
      * Creates a new type signature for the map with the specified key and value type signatures.
-     * This method is a shortcut of:
+     * This method is a shortcut for:
      * <pre>{@code
      * ofMap("map", keyTypeSignature, valueTypeSignature);
      * }</pre>
@@ -163,7 +165,7 @@ public final class TypeSignature {
 
     /**
      * Creates a new type signature for the map with the specified named key and value types.
-     * This method is a shortcut of:
+     * This method is a shortcut for:
      * <pre>{@code
      * ofMap(ofNamed(namedKeyType), ofNamed(namedValueType));
      * }</pre>
@@ -247,8 +249,9 @@ public final class TypeSignature {
      * For reflection-based {@link DocServicePlugin}s, this will probably be a {@link Class}, but
      * other plugins may use an actual instance with descriptor information.
      */
-    public Optional<Object> namedTypeDescriptor() {
-        return Optional.ofNullable(namedTypeDescriptor);
+    @Nullable
+    public Object namedTypeDescriptor() {
+        return namedTypeDescriptor;
     }
 
     /**
@@ -299,7 +302,7 @@ public final class TypeSignature {
     }
 
     @Override
-    public boolean equals(Object o) {
+    public boolean equals(@Nullable Object o) {
         if (this == o) {
             return true;
         }

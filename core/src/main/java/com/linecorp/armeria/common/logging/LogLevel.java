@@ -13,8 +13,9 @@
  * License for the specific language governing permissions and limitations
  * under the License.
  */
-
 package com.linecorp.armeria.common.logging;
+
+import static java.util.Objects.requireNonNull;
 
 import javax.annotation.Nullable;
 
@@ -24,6 +25,10 @@ import org.slf4j.Logger;
  * Log level.
  */
 public enum LogLevel {
+    /**
+     * OFF log level.
+     */
+    OFF,
     /**
      * TRACE log level.
      */
@@ -49,7 +54,10 @@ public enum LogLevel {
      * Returns {@code true} if this level is enabled.
      */
     public boolean isEnabled(Logger logger) {
+        requireNonNull(logger, "logger");
         switch (this) {
+            case OFF:
+                return false;
             case TRACE:
                 return logger.isTraceEnabled();
             case DEBUG:
@@ -69,7 +77,11 @@ public enum LogLevel {
      * Logs a message at this level.
      */
     public void log(Logger logger, String message) {
+        requireNonNull(logger, "logger");
+        requireNonNull(message, "message");
         switch (this) {
+            case OFF:
+                break;
             case TRACE:
                 logger.trace(message);
                 break;
@@ -94,8 +106,12 @@ public enum LogLevel {
      * Logs a message at this level.
      */
     @SuppressWarnings("MethodParameterNamingConvention")
-    public void log(Logger logger, String format, Object arg1) {
+    public void log(Logger logger, String format, @Nullable Object arg1) {
+        requireNonNull(logger, "logger");
+        requireNonNull(format, "format");
         switch (this) {
+            case OFF:
+                break;
             case TRACE:
                 logger.trace(format, arg1);
                 break;
@@ -121,7 +137,11 @@ public enum LogLevel {
      */
     @SuppressWarnings("MethodParameterNamingConvention")
     public void log(Logger logger, String format, @Nullable Object arg1, @Nullable Object arg2) {
+        requireNonNull(logger, "logger");
+        requireNonNull(format, "format");
         switch (this) {
+            case OFF:
+                break;
             case TRACE:
                 logger.trace(format, arg1, arg2);
                 break;
@@ -136,6 +156,66 @@ public enum LogLevel {
                 break;
             case ERROR:
                 logger.error(format, arg1, arg2);
+                break;
+            default:
+                throw new Error();
+        }
+    }
+
+    /**
+     * Logs a message at this level.
+     */
+    @SuppressWarnings("MethodParameterNamingConvention")
+    public void log(Logger logger, String format,
+                    @Nullable Object arg1, @Nullable Object arg2, @Nullable Object arg3) {
+        requireNonNull(logger, "logger");
+        requireNonNull(format, "format");
+        switch (this) {
+            case OFF:
+                break;
+            case TRACE:
+                logger.trace(format, arg1, arg2, arg3);
+                break;
+            case DEBUG:
+                logger.debug(format, arg1, arg2, arg3);
+                break;
+            case INFO:
+                logger.info(format, arg1, arg2, arg3);
+                break;
+            case WARN:
+                logger.warn(format, arg1, arg2, arg3);
+                break;
+            case ERROR:
+                logger.error(format, arg1, arg2, arg3);
+                break;
+            default:
+                throw new Error();
+        }
+    }
+
+    /**
+     * Logs a message at this level.
+     */
+    public void log(Logger logger, String format, Object... args) {
+        requireNonNull(logger, "logger");
+        requireNonNull(format, "format");
+        switch (this) {
+            case OFF:
+                break;
+            case TRACE:
+                logger.trace(format, args);
+                break;
+            case DEBUG:
+                logger.debug(format, args);
+                break;
+            case INFO:
+                logger.info(format, args);
+                break;
+            case WARN:
+                logger.warn(format, args);
+                break;
+            case ERROR:
+                logger.error(format, args);
                 break;
             default:
                 throw new Error();

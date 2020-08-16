@@ -15,7 +15,8 @@
  */
 package com.linecorp.armeria.server.file;
 
-import java.io.IOException;
+import static java.util.Objects.requireNonNull;
+
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 
@@ -25,8 +26,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.google.common.base.MoreObjects;
-import com.google.common.util.concurrent.MoreExecutors;
-import com.spotify.futures.CompletableFutures;
 
 import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.ResponseHeaders;
@@ -45,109 +44,89 @@ final class CachingHttpFile implements HttpFile {
     private volatile AggregatedHttpFile cachedFile;
 
     CachingHttpFile(HttpFile file, int maxCachingLength) {
-        this.file = file;
+        this.file = requireNonNull(file, "file");
         this.maxCachingLength = maxCachingLength;
     }
 
-    @Nullable
     @Override
-    public HttpFileAttributes readAttributes() throws IOException {
-        return file.readAttributes();
+    public CompletableFuture<HttpFileAttributes> readAttributes(Executor fileReadExecutor) {
+        return file.readAttributes(fileReadExecutor);
     }
 
-    @Nullable
     @Override
-    public ResponseHeaders readHeaders() throws IOException {
-        return file.readHeaders();
+    public CompletableFuture<ResponseHeaders> readHeaders(Executor fileReadExecutor) {
+        return file.readHeaders(fileReadExecutor);
     }
 
-    @Nullable
     @Override
-    public HttpResponse read(Executor fileReadExecutor, ByteBufAllocator alloc) {
-        try {
-            final HttpFile file = getFile();
-            return file != null ? file.read(fileReadExecutor, alloc) : null;
-        } catch (Exception e) {
-            return HttpResponse.ofFailure(e);
-        }
+    public CompletableFuture<HttpResponse> read(Executor fileReadExecutor, ByteBufAllocator alloc) {
+        return getFile(fileReadExecutor).read(fileReadExecutor, alloc);
     }
 
     @Override
     public CompletableFuture<AggregatedHttpFile> aggregate(Executor fileReadExecutor) {
-        try {
-            final HttpFile file = getFile();
-            return file != null ? file.aggregate(fileReadExecutor)
-                                : CompletableFuture.completedFuture(HttpFile.nonExistent());
-        } catch (Exception e) {
-            return CompletableFutures.exceptionallyCompletedFuture(e);
-        }
+        return getFile(fileReadExecutor).aggregate(fileReadExecutor);
     }
 
     @Override
     public CompletableFuture<AggregatedHttpFile> aggregateWithPooledObjects(Executor fileReadExecutor,
                                                                             ByteBufAllocator alloc) {
-        try {
-            final HttpFile file = getFile();
-            return file != null ? file.aggregateWithPooledObjects(fileReadExecutor, alloc)
-                                : CompletableFuture.completedFuture(HttpFile.nonExistent());
-        } catch (Exception e) {
-            return CompletableFutures.exceptionallyCompletedFuture(e);
-        }
+        return getFile(fileReadExecutor).aggregateWithPooledObjects(fileReadExecutor, alloc);
     }
 
     @Override
     public HttpService asService() {
         return (ctx, req) -> {
-            final HttpFile file = MoreObjects.firstNonNull(getFile(), HttpFile.nonExistent());
-            return file.asService().serve(ctx, req);
+            try {
+                return getFile(ctx.blockingTaskExecutor()).asService().serve(ctx, req);
+            } catch (Exception e) {
+                return Exceptions.throwUnsafely(e);
+            }
         };
     }
 
-    @Nullable
-    private HttpFile getFile() throws IOException {
-        final HttpFileAttributes uncachedAttrs = file.readAttributes();
-        if (uncachedAttrs == null) {
-            // Non-existent file. Invalidate the cache just in case it existed before.
-            cachedFile = null;
-            return null;
-        }
+    private HttpFile getFile(Executor fileReadExecutor) {
+        requireNonNull(fileReadExecutor, "fileReadExecutor");
+        return HttpFile.from(file.readAttributes(fileReadExecutor).thenApply(uncachedAttrs -> {
+            if (uncachedAttrs == null) {
+                // Non-existent file. Invalidate the cache just in case it existed before.
+                cachedFile = null;
+                return HttpFile.nonExistent();
+            }
 
-        if (uncachedAttrs.length() > maxCachingLength) {
-            // Invalidate the cache just in case the file was small previously.
-            cachedFile = null;
-            return file;
-        }
+            if (uncachedAttrs.length() > maxCachingLength) {
+                // Invalidate the cache just in case the file was small previously.
+                cachedFile = null;
+                return file;
+            }
 
-        final AggregatedHttpFile cachedFile = this.cachedFile;
-        if (cachedFile == null) {
-            // Cache miss. Add a new entry to the cache.
-            return cache();
-        }
+            final AggregatedHttpFile cachedFile = this.cachedFile;
+            if (cachedFile == null) {
+                // Cache miss. Add a new entry to the cache.
+                return cache(fileReadExecutor);
+            }
 
-        final HttpFileAttributes cachedAttrs = cachedFile.readAttributes();
-        assert cachedAttrs != null;
-        if (cachedAttrs.equals(uncachedAttrs)) {
-            // Cache hit, and the cached file is up-to-date.
-            return cachedFile;
-        }
+            final HttpFileAttributes cachedAttrs = cachedFile.attributes();
+            assert cachedAttrs != null;
+            if (cachedAttrs.equals(uncachedAttrs)) {
+                // Cache hit, and the cached file is up-to-date.
+                return cachedFile.toHttpFile();
+            }
 
-        // Cache hit, but the cached file is out of date. Replace the old entry from the cache.
-        this.cachedFile = null;
-        return cache();
+            // Cache hit, but the cached file is out of date. Replace the old entry from the cache.
+            this.cachedFile = null;
+            return cache(fileReadExecutor);
+        }));
     }
 
-    private HttpFile cache() {
-        // TODO(trustin): We assume here that the file being read is small enough that it will not block
-        //                an event loop for a long time. Revisit if the assumption turns out to be false.
-        AggregatedHttpFile cachedFile = null;
-        try {
-            this.cachedFile = cachedFile = file.aggregate(MoreExecutors.directExecutor()).get();
-        } catch (Exception e) {
-            this.cachedFile = null;
-            logger.warn("Failed to cache a file: {}", file, Exceptions.peel(e));
-        }
-
-        return MoreObjects.firstNonNull(cachedFile, file);
+    private HttpFile cache(Executor fileReadExecutor) {
+        return HttpFile.from(file.aggregate(fileReadExecutor).thenApply(aggregated -> {
+            cachedFile = aggregated;
+            return aggregated.toHttpFile();
+        }).exceptionally(cause -> {
+            logger.warn("Failed to cache a file: {}", file, Exceptions.peel(cause));
+            return file;
+        }));
     }
 
     @Override

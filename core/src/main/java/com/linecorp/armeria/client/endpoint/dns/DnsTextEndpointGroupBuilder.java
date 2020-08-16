@@ -17,28 +17,25 @@ package com.linecorp.armeria.client.endpoint.dns;
 
 import static java.util.Objects.requireNonNull;
 
+import java.net.InetSocketAddress;
+import java.time.Duration;
 import java.util.function.Function;
 
 import com.linecorp.armeria.client.Endpoint;
+import com.linecorp.armeria.client.endpoint.EndpointSelectionStrategy;
+import com.linecorp.armeria.client.retry.Backoff;
+
+import io.netty.channel.EventLoop;
 
 /**
  * Builds a new {@link DnsTextEndpointGroup} that sources its {@link Endpoint} list from the {@code TXT}
  * DNS records of a certain hostname.
  */
-public final class DnsTextEndpointGroupBuilder
-        extends DnsEndpointGroupBuilder<DnsTextEndpointGroupBuilder> {
+public final class DnsTextEndpointGroupBuilder extends DnsEndpointGroupBuilder {
 
     private final Function<byte[], Endpoint> mapping;
 
-    /**
-     * Creates a new instance that builds a {@link DnsTextEndpointGroup} for the specified {@code hostname}.
-     *
-     * @param hostname the hostname to query DNS queries for
-     * @param mapping the {@link Function} that maps the content of a {@code TXT} record into
-     *                an {@link Endpoint}. The {@link Function} is expected to return {@code null}
-     *                if the record contains unsupported content.
-     */
-    public DnsTextEndpointGroupBuilder(String hostname, Function<byte[], Endpoint> mapping) {
+    DnsTextEndpointGroupBuilder(String hostname, Function<byte[], Endpoint> mapping) {
         super(hostname);
         this.mapping = requireNonNull(mapping, "mapping");
     }
@@ -47,8 +44,50 @@ public final class DnsTextEndpointGroupBuilder
      * Returns a newly created {@link DnsTextEndpointGroup}.
      */
     public DnsTextEndpointGroup build() {
-        return new DnsTextEndpointGroup(eventLoop(), minTtl(), maxTtl(),
-                                        serverAddressStreamProvider(),
-                                        backoff(), hostname(), mapping);
+        return new DnsTextEndpointGroup(selectionStrategy(), eventLoop(), minTtl(), maxTtl(),
+                                        queryTimeoutMillis(), serverAddressStreamProvider(), backoff(),
+                                        hostname(), mapping);
+    }
+
+    // Override the return type of the chaining methods in the superclass.
+
+    @Override
+    public DnsTextEndpointGroupBuilder eventLoop(EventLoop eventLoop) {
+        return (DnsTextEndpointGroupBuilder) super.eventLoop(eventLoop);
+    }
+
+    @Override
+    public DnsTextEndpointGroupBuilder ttl(int minTtl, int maxTtl) {
+        return (DnsTextEndpointGroupBuilder) super.ttl(minTtl, maxTtl);
+    }
+
+    @Override
+    public DnsTextEndpointGroupBuilder queryTimeout(Duration queryTimeout) {
+        return (DnsTextEndpointGroupBuilder) super.queryTimeout(queryTimeout);
+    }
+
+    @Override
+    public DnsTextEndpointGroupBuilder queryTimeoutMillis(long queryTimeoutMillis) {
+        return (DnsTextEndpointGroupBuilder) super.queryTimeoutMillis(queryTimeoutMillis);
+    }
+
+    @Override
+    public DnsTextEndpointGroupBuilder serverAddresses(InetSocketAddress... serverAddresses) {
+        return (DnsTextEndpointGroupBuilder) super.serverAddresses(serverAddresses);
+    }
+
+    @Override
+    public DnsTextEndpointGroupBuilder serverAddresses(Iterable<InetSocketAddress> serverAddresses) {
+        return (DnsTextEndpointGroupBuilder) super.serverAddresses(serverAddresses);
+    }
+
+    @Override
+    public DnsTextEndpointGroupBuilder backoff(Backoff backoff) {
+        return (DnsTextEndpointGroupBuilder) super.backoff(backoff);
+    }
+
+    @Override
+    public DnsTextEndpointGroupBuilder selectionStrategy(EndpointSelectionStrategy selectionStrategy) {
+        return (DnsTextEndpointGroupBuilder) super.selectionStrategy(selectionStrategy);
     }
 }

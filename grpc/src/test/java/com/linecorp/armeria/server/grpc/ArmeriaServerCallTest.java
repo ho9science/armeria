@@ -22,7 +22,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.same;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.verifyZeroInteractions;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
 import java.util.IdentityHashMap;
@@ -44,14 +44,16 @@ import com.linecorp.armeria.common.HttpHeaders;
 import com.linecorp.armeria.common.HttpMethod;
 import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.HttpResponseWriter;
+import com.linecorp.armeria.common.HttpStatus;
+import com.linecorp.armeria.common.ResponseHeaders;
 import com.linecorp.armeria.common.grpc.GrpcSerializationFormats;
-import com.linecorp.armeria.common.grpc.protocol.ArmeriaMessageDeframer.ByteBufOrStream;
+import com.linecorp.armeria.common.grpc.protocol.ArmeriaMessageDeframer.DeframedMessage;
 import com.linecorp.armeria.grpc.testing.Messages.SimpleRequest;
 import com.linecorp.armeria.grpc.testing.Messages.SimpleResponse;
 import com.linecorp.armeria.grpc.testing.TestServiceGrpc;
-import com.linecorp.armeria.internal.grpc.GrpcTestUtil;
+import com.linecorp.armeria.internal.common.grpc.DefaultJsonMarshaller;
+import com.linecorp.armeria.internal.common.grpc.GrpcTestUtil;
 import com.linecorp.armeria.server.ServiceRequestContext;
-import com.linecorp.armeria.server.ServiceRequestContextBuilder;
 import com.linecorp.armeria.testing.junit4.common.EventLoopRule;
 import com.linecorp.armeria.unsafe.grpc.GrpcUnsafeBufferUtil;
 
@@ -97,11 +99,11 @@ public class ArmeriaServerCallTest {
     @Before
     public void setUp() {
         completionFuture = new CompletableFuture<>();
-        when(res.completionFuture()).thenReturn(completionFuture);
+        when(res.whenComplete()).thenReturn(completionFuture);
 
-        ctx = ServiceRequestContextBuilder.of(HttpRequest.of(HttpMethod.POST, "/"))
-                                          .eventLoop(eventLoop.get())
-                                          .build();
+        ctx = ServiceRequestContext.builder(HttpRequest.of(HttpMethod.POST, "/"))
+                                   .eventLoop(eventLoop.get())
+                                   .build();
 
         call = new ArmeriaServerCall<>(
                 HttpHeaders.of(),
@@ -113,14 +115,16 @@ public class ArmeriaServerCallTest {
                 MAX_MESSAGE_BYTES,
                 ctx,
                 GrpcSerializationFormats.PROTO,
-                MessageMarshaller.builder().build(),
+                new DefaultJsonMarshaller(MessageMarshaller.builder().build()),
                 false,
                 false,
-                "gzip");
+                ResponseHeaders.builder(HttpStatus.OK)
+                               .contentType(GrpcSerializationFormats.PROTO.mediaType())
+                               .build());
         call.setListener(listener);
         call.messageReader().onSubscribe(subscription);
 
-        ctx.attr(GrpcUnsafeBufferUtil.BUFFERS).set(buffersAttr);
+        ctx.setAttr(GrpcUnsafeBufferUtil.BUFFERS, buffersAttr);
     }
 
     @After
@@ -138,7 +142,7 @@ public class ArmeriaServerCallTest {
 
         // messageRead is always called from the event loop.
         eventLoop.get().submit(() -> {
-            call.messageRead(new ByteBufOrStream(GrpcTestUtil.requestByteBuf()));
+            call.messageRead(new DeframedMessage(GrpcTestUtil.requestByteBuf(), 0));
 
             verify(listener, never()).onMessage(any());
         }).syncUninterruptibly();
@@ -147,9 +151,9 @@ public class ArmeriaServerCallTest {
     @Test
     public void messageRead_notWrappedByteBuf() {
         final ByteBuf buf = GrpcTestUtil.requestByteBuf();
-        call.messageRead(new ByteBufOrStream(buf));
+        call.messageRead(new DeframedMessage(buf, 0));
 
-        verifyZeroInteractions(buffersAttr);
+        verifyNoMoreInteractions(buffersAttr);
     }
 
     @Test
@@ -166,13 +170,15 @@ public class ArmeriaServerCallTest {
                 MAX_MESSAGE_BYTES,
                 ctx,
                 GrpcSerializationFormats.PROTO,
-                MessageMarshaller.builder().build(),
+                new DefaultJsonMarshaller(MessageMarshaller.builder().build()),
                 true,
                 false,
-                "gzip");
+                ResponseHeaders.builder(HttpStatus.OK)
+                               .contentType(GrpcSerializationFormats.PROTO.mediaType())
+                               .build());
 
         final ByteBuf buf = GrpcTestUtil.requestByteBuf();
-        call.messageRead(new ByteBufOrStream(buf));
+        call.messageRead(new DeframedMessage(buf, 0));
 
         verify(buffersAttr).put(any(), same(buf));
     }
@@ -183,7 +189,8 @@ public class ArmeriaServerCallTest {
 
         // messageRead is always called from the event loop.
         eventLoop.get().submit(() -> {
-            call.messageRead(new ByteBufOrStream(new ByteBufInputStream(GrpcTestUtil.requestByteBuf(), true)));
+            call.messageRead(new DeframedMessage(new ByteBufInputStream(GrpcTestUtil.requestByteBuf(), true),
+                                                 0));
 
             verify(listener, never()).onMessage(any());
         }).syncUninterruptibly();

@@ -31,14 +31,14 @@ import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.ArgumentsProvider;
 import org.junit.jupiter.params.provider.ArgumentsSource;
 
-import com.linecorp.armeria.client.HttpClient;
+import com.linecorp.armeria.client.WebClient;
 import com.linecorp.armeria.common.FixedHttpRequest.EmptyFixedHttpRequest;
 import com.linecorp.armeria.common.FixedHttpRequest.OneElementFixedHttpRequest;
 import com.linecorp.armeria.common.FixedHttpRequest.RegularFixedHttpRequest;
 import com.linecorp.armeria.common.FixedHttpRequest.TwoElementFixedHttpRequest;
 import com.linecorp.armeria.common.stream.RegularFixedStreamMessage;
 import com.linecorp.armeria.server.ServerBuilder;
-import com.linecorp.armeria.testing.junit.server.ServerExtension;
+import com.linecorp.armeria.testing.junit5.server.ServerExtension;
 
 public class HttpRequestSubscriberTest {
 
@@ -63,11 +63,11 @@ public class HttpRequestSubscriberTest {
         }
     };
 
-    static HttpClient client;
+    static WebClient client;
 
     @BeforeAll
     static void beforeClass() {
-        client = HttpClient.of(rule.httpUri("/"));
+        client = WebClient.of(rule.httpUri());
     }
 
     @ParameterizedTest
@@ -76,7 +76,7 @@ public class HttpRequestSubscriberTest {
         final AggregatedHttpResponse response = client.execute(request).aggregate().join();
         assertThat(response.status()).isEqualTo(HttpStatus.OK);
 
-        final CompletableFuture<Void> f = request.completionFuture();
+        final CompletableFuture<Void> f = request.whenComplete();
         assertThat(f.isDone()).isTrue();
         f.get();
         assertThat(f.isCompletedExceptionally()).isFalse();

@@ -22,7 +22,7 @@ import org.reactivestreams.Subscription;
 import com.linecorp.armeria.common.Flags;
 
 /**
- * A {@link RuntimeException} that is raised to notify {@link StreamMessage#completionFuture()} when a
+ * A {@link RuntimeException} that is raised to notify {@link StreamMessage#whenComplete()} when a
  * {@link Subscriber} has cancelled its {@link Subscription}.
  */
 public final class CancelledSubscriptionException extends RuntimeException {
@@ -33,10 +33,11 @@ public final class CancelledSubscriptionException extends RuntimeException {
 
     /**
      * Returns a {@link CancelledSubscriptionException} which may be a singleton or a new instance, depending
-     * on whether {@linkplain Flags#verboseExceptions() the verbose exception mode} is enabled.
+     * on {@link Flags#verboseExceptionSampler()}'s decision.
      */
     public static CancelledSubscriptionException get() {
-        return Flags.verboseExceptions() ? new CancelledSubscriptionException() : INSTANCE;
+        return Flags.verboseExceptionSampler().isSampled(CancelledSubscriptionException.class) ?
+               new CancelledSubscriptionException() : INSTANCE;
     }
 
     private CancelledSubscriptionException() {}

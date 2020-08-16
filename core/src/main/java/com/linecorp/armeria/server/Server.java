@@ -16,8 +16,10 @@
 
 package com.linecorp.armeria.server;
 
+import static com.google.common.collect.ImmutableSet.toImmutableSet;
 import static java.util.Objects.requireNonNull;
 
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -25,11 +27,11 @@ import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -42,28 +44,33 @@ import java.util.stream.Collectors;
 
 import javax.annotation.Nullable;
 
+import org.jctools.maps.NonBlockingHashSet;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Joiner;
 import com.google.common.base.MoreObjects;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.ImmutableSet.Builder;
-import com.google.common.collect.Iterables;
 import com.spotify.futures.CompletableFutures;
 
 import com.linecorp.armeria.common.SessionProtocol;
 import com.linecorp.armeria.common.metric.MeterIdPrefix;
 import com.linecorp.armeria.common.util.EventLoopGroups;
+import com.linecorp.armeria.common.util.Exceptions;
+import com.linecorp.armeria.common.util.ListenableAsyncCloseable;
 import com.linecorp.armeria.common.util.StartStopSupport;
-import com.linecorp.armeria.internal.ChannelUtil;
-import com.linecorp.armeria.internal.ConnectionLimitingHandler;
-import com.linecorp.armeria.internal.PathAndQuery;
-import com.linecorp.armeria.internal.TransportType;
+import com.linecorp.armeria.common.util.Version;
+import com.linecorp.armeria.internal.common.PathAndQuery;
+import com.linecorp.armeria.internal.common.util.ChannelUtil;
+import com.linecorp.armeria.internal.common.util.TransportType;
 import com.linecorp.armeria.server.logging.AccessLogWriter;
 
+import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Tag;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
@@ -71,8 +78,9 @@ import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.EventLoop;
 import io.netty.channel.EventLoopGroup;
+import io.netty.channel.ServerChannel;
 import io.netty.handler.ssl.SslContext;
-import io.netty.util.DomainNameMapping;
+import io.netty.util.Mapping;
 import io.netty.util.concurrent.FastThreadLocalThread;
 import io.netty.util.concurrent.Future;
 import io.netty.util.concurrent.ImmediateEventExecutor;
@@ -82,23 +90,31 @@ import io.netty.util.concurrent.ImmediateEventExecutor;
  *
  * @see ServerBuilder
  */
-public final class Server implements AutoCloseable {
+public final class Server implements ListenableAsyncCloseable {
 
     private static final Logger logger = LoggerFactory.getLogger(Server.class);
 
+    /**
+     * Creates a new {@link ServerBuilder}.
+     */
+    public static ServerBuilder builder() {
+        return new ServerBuilder();
+    }
+
     private final ServerConfig config;
     @Nullable
-    private final DomainNameMapping<SslContext> sslContexts;
+    private final Mapping<String, SslContext> sslContexts;
 
     private final StartStopSupport<Void, Void, Void, ServerListener> startStop;
-    private final Set<Channel> serverChannels = Collections.newSetFromMap(new ConcurrentHashMap<>());
+    private final Set<ServerChannel> serverChannels = new NonBlockingHashSet<>();
     private final Map<InetSocketAddress, ServerPort> activePorts = new LinkedHashMap<>();
     private final ConnectionLimitingHandler connectionLimitingHandler;
 
     @Nullable
-    private ServerBootstrap serverBootstrap;
+    @VisibleForTesting
+    ServerBootstrap serverBootstrap;
 
-    Server(ServerConfig config, @Nullable DomainNameMapping<SslContext> sslContexts) {
+    Server(ServerConfig config, @Nullable Mapping<String, SslContext> sslContexts) {
         this.config = requireNonNull(config, "config");
         this.sslContexts = sslContexts;
         startStop = new ServerStartStopSupport(config.startStopExecutor());
@@ -107,8 +123,10 @@ public final class Server implements AutoCloseable {
         config.setServer(this);
 
         // Server-wide cache metrics.
-        final MeterIdPrefix idPrefix = new MeterIdPrefix("armeria.server.parsedPathCache");
+        final MeterIdPrefix idPrefix = new MeterIdPrefix("armeria.server.parsed.path.cache");
         PathAndQuery.registerMetrics(config.meterRegistry(), idPrefix);
+
+        setupVersionMetrics();
 
         // Invoke the serviceAdded() method in Service so that it can keep the reference to this Server or
         // add a listener to it.
@@ -151,21 +169,79 @@ public final class Server implements AutoCloseable {
     }
 
     /**
-     * Returns the primary {@link ServerPort} that this {@link Server} is listening to. This method is useful
-     * when a {@link Server} listens to only one {@link ServerPort}.
+     * Returns the primary {@link ServerPort} that this {@link Server} is listening to. If this {@link Server}
+     * has both a local port and a non-local port, the non-local port is returned.
      *
-     * @return {@link Optional#empty()} if this {@link Server} did not start
+     * @return the primary {@link ServerPort}, or {@code null} if this {@link Server} did not start.
      */
-    public Optional<ServerPort> activePort() {
-        synchronized (activePorts) {
-            return Optional.ofNullable(Iterables.getFirst(activePorts.values(), null));
-        }
+    @Nullable
+    public ServerPort activePort() {
+        return activePort0(null);
+    }
+
+    /**
+     * Returns the primary {@link ServerPort} which serves the given {@link SessionProtocol}
+     * that this {@link Server} is listening to. If this {@link Server} has both a local port and
+     * a non-local port, the non-local port is returned.
+     *
+     * @return the primary {@link ServerPort}, or {@code null} if there is no active port available for
+     *         the given {@link SessionProtocol}.
+     */
+    @Nullable
+    public ServerPort activePort(SessionProtocol protocol) {
+        return activePort0(requireNonNull(protocol, "protocol"));
     }
 
     @Nullable
-    @VisibleForTesting
-    ServerBootstrap serverBootstrap() {
-        return serverBootstrap;
+    private ServerPort activePort0(@Nullable SessionProtocol protocol) {
+        ServerPort candidate = null;
+        synchronized (activePorts) {
+            for (ServerPort serverPort : activePorts.values()) {
+                if (protocol == null || serverPort.hasProtocol(protocol)) {
+                    if (!isLocalPort(serverPort)) {
+                        return serverPort;
+                    } else if (candidate == null) {
+                        candidate = serverPort;
+                    }
+                }
+            }
+        }
+        return candidate;
+    }
+
+    /**
+     * Returns the local {@link ServerPort} that this {@link Server} is listening to.
+     *
+     * @throws IllegalStateException if there is no active local port available
+     *                               or the server is not started yet
+     */
+    public int activeLocalPort() {
+        return activeLocalPort0(null);
+    }
+
+    /**
+     * Returns the local {@link ServerPort} which serves the given {@link SessionProtocol}.
+     *
+     * @throws IllegalStateException if there is no active local port available for the given
+     *                               {@link SessionProtocol} or the server is not started yet
+     */
+    public int activeLocalPort(SessionProtocol protocol) {
+        return activeLocalPort0(requireNonNull(protocol, "protocol"));
+    }
+
+    private int activeLocalPort0(@Nullable SessionProtocol protocol) {
+        synchronized (activePorts) {
+            return activePorts.values().stream()
+                              .filter(activePort -> (protocol == null || activePort.hasProtocol(protocol)) &&
+                                                    isLocalPort(activePort))
+                              .findFirst()
+                              .orElseThrow(() -> new IllegalStateException(
+                                      (protocol == null ? "no active local ports: "
+                                                        : ("no active local ports for " + protocol + ": ")) +
+                                      activePorts.values()))
+                              .localAddress()
+                              .getPort();
+        }
     }
 
     /**
@@ -215,7 +291,7 @@ public final class Server implements AutoCloseable {
      * Note that the startup procedure is asynchronous and thus this method returns immediately. To wait until
      * this {@link Server} is fully started up, wait for the returned {@link CompletableFuture}:
      * <pre>{@code
-     * ServerBuilder builder = new ServerBuilder();
+     * ServerBuilder builder = Server.builder();
      * ...
      * Server server = builder.build();
      * server.start().get();
@@ -248,9 +324,26 @@ public final class Server implements AutoCloseable {
         return config().workerGroup().next();
     }
 
-    /**
-     * A shortcut to {@link #stop() stop().get()}.
-     */
+    @Override
+    public boolean isClosing() {
+        return startStop.isClosing();
+    }
+
+    @Override
+    public boolean isClosed() {
+        return startStop.isClosed();
+    }
+
+    @Override
+    public CompletableFuture<?> whenClosed() {
+        return startStop.whenClosed();
+    }
+
+    @Override
+    public CompletableFuture<?> closeAsync() {
+        return startStop.closeAsync();
+    }
+
     @Override
     public void close() {
         startStop.close();
@@ -261,6 +354,38 @@ public final class Server implements AutoCloseable {
      */
     public int numConnections() {
         return connectionLimitingHandler.numConnections();
+    }
+
+    /**
+     * Waits until the result of {@link CompletableFuture} which is completed after the {@link #close()} or
+     * {@link #closeAsync()} operation is completed.
+     */
+    public void blockUntilShutdown() throws InterruptedException {
+        try {
+            whenClosed().get();
+        } catch (ExecutionException e) {
+            throw new CompletionException(e.toString(), Exceptions.peel(e));
+        }
+    }
+
+    /**
+     * Sets up the version metrics.
+     */
+    @VisibleForTesting
+    void setupVersionMetrics() {
+        final MeterRegistry meterRegistry = config().meterRegistry();
+        final Version versionInfo = Version.get("armeria", Server.class.getClassLoader());
+        final String version = versionInfo.artifactVersion();
+        final String commit = versionInfo.longCommitHash();
+        final String repositoryStatus = versionInfo.repositoryStatus();
+        final List<Tag> tags = ImmutableList.of(Tag.of("version", version),
+                                                Tag.of("commit", commit),
+                                                Tag.of("repo.status", repositoryStatus));
+        Gauge.builder("armeria.build.info", () -> 1)
+             .tags(tags)
+             .description("A metric with a constant '1' value labeled by version and commit hash" +
+                          " from which Armeria was built.")
+             .register(meterRegistry);
     }
 
     @Override
@@ -336,11 +461,13 @@ public final class Server implements AutoCloseable {
                 b.childOption(castOption, v);
             });
 
-            b.group(EventLoopGroups.newEventLoopGroup(1, r -> {
+            final EventLoopGroup bossGroup = EventLoopGroups.newEventLoopGroup(1, r -> {
                 final FastThreadLocalThread thread = new FastThreadLocalThread(r, bossThreadName(port));
                 thread.setDaemon(false);
                 return thread;
-            }), config.workerGroup());
+            });
+
+            b.group(bossGroup, config.workerGroup());
             b.channel(TransportType.detectTransportType().serverChannelType());
             b.handler(connectionLimitingHandler);
             b.childHandler(new HttpServerPipelineConfigurator(config, port, sslContexts,
@@ -354,7 +481,7 @@ public final class Server implements AutoCloseable {
             final GracefulShutdownSupport gracefulShutdownSupport = this.gracefulShutdownSupport;
             assert gracefulShutdownSupport != null;
 
-            meterRegistry.gauge("armeria.server.pendingResponses", gracefulShutdownSupport,
+            meterRegistry.gauge("armeria.server.pending.responses", gracefulShutdownSupport,
                                 GracefulShutdownSupport::pendingResponses);
             meterRegistry.gauge("armeria.server.connections", connectionLimitingHandler,
                                 ConnectionLimitingHandler::numConnections);
@@ -433,16 +560,21 @@ public final class Server implements AutoCloseable {
                     }
 
                     workerShutdownFuture.addListener(unused5 -> {
-                        // If starts to shutdown before initializing serverChannels, completes the future
-                        // immediately.
-                        if (serverChannels.isEmpty()) {
+                        final Set<EventLoopGroup> bossGroups =
+                                Server.this.serverChannels.stream()
+                                                          .map(ch -> ch.eventLoop().parent())
+                                                          .collect(toImmutableSet());
+
+                        // If started to shutdown before initializing a boss group,
+                        // complete the future immediately.
+                        if (bossGroups.isEmpty()) {
                             finishDoStop(future);
                             return;
                         }
+
                         // Shut down all boss groups and wait until they are terminated.
-                        final AtomicInteger remainingBossGroups = new AtomicInteger(serverChannels.size());
-                        serverChannels.forEach(ch -> {
-                            final EventLoopGroup bossGroup = ch.eventLoop().parent();
+                        final AtomicInteger remainingBossGroups = new AtomicInteger(bossGroups.size());
+                        bossGroups.forEach(bossGroup -> {
                             bossGroup.shutdownGracefully();
                             bossGroup.terminationFuture().addListener(unused6 -> {
                                 if (remainingBossGroups.decrementAndGet() != 0) {
@@ -464,11 +596,14 @@ public final class Server implements AutoCloseable {
         }
 
         private void finishDoStop(CompletableFuture<Void> future) {
+            serverChannels.clear();
+
             if (config.shutdownBlockingTaskExecutorOnStop()) {
-                final ExecutorService executor;
-                final ExecutorService blockingTaskExecutor = config.blockingTaskExecutor();
-                if (blockingTaskExecutor instanceof InterminableExecutorService) {
-                    executor = ((InterminableExecutorService) blockingTaskExecutor).getExecutorService();
+                final ScheduledExecutorService executor;
+                final ScheduledExecutorService blockingTaskExecutor = config.blockingTaskExecutor();
+                if (blockingTaskExecutor instanceof UnstoppableScheduledExecutorService) {
+                    executor =
+                            ((UnstoppableScheduledExecutorService) blockingTaskExecutor).getExecutorService();
                 } else {
                     executor = blockingTaskExecutor;
                 }
@@ -487,15 +622,7 @@ public final class Server implements AutoCloseable {
                 }
             }
 
-            if (!config.shutdownAccessLogWriterOnStop()) {
-                future.complete(null);
-                return;
-            }
-
             final Builder<AccessLogWriter> builder = ImmutableSet.builder();
-            if (config.shutdownAccessLogWriterOnStop()) {
-                builder.add(config.accessLogWriter());
-            }
             config.virtualHosts()
                   .stream()
                   .filter(VirtualHost::shutdownAccessLogWriterOnStop)
@@ -571,14 +698,11 @@ public final class Server implements AutoCloseable {
 
         @Override
         public void operationComplete(ChannelFuture f) {
-            final Channel ch = f.channel();
+            final ServerChannel ch = (ServerChannel) f.channel();
             assert ch.eventLoop().inEventLoop();
+            serverChannels.add(ch);
 
             if (f.isSuccess()) {
-                serverChannels.add(ch);
-                ch.closeFuture()
-                  .addListener((ChannelFutureListener) future -> serverChannels.remove(future.channel()));
-
                 final InetSocketAddress localAddress = (InetSocketAddress) ch.localAddress();
                 final ServerPort actualPort = new ServerPort(localAddress, port.protocols());
 
@@ -591,8 +715,7 @@ public final class Server implements AutoCloseable {
                 }
 
                 if (logger.isInfoEnabled()) {
-                    if (localAddress.getAddress().isAnyLocalAddress() ||
-                        localAddress.getAddress().isLoopbackAddress()) {
+                    if (isLocalPort(actualPort)) {
                         port.protocols().forEach(p -> logger.info(
                                 "Serving {} at {} - {}://127.0.0.1:{}/",
                                 p.name(), localAddress, p.uriText(), localAddress.getPort()));
@@ -616,5 +739,10 @@ public final class Server implements AutoCloseable {
                                          .map(SessionProtocol::uriText)
                                          .collect(Collectors.joining("+"));
         return "armeria-boss-" + protocolNames + '-' + localHostName + ':' + localAddr.getPort();
+    }
+
+    private static boolean isLocalPort(ServerPort serverPort) {
+        final InetAddress address = serverPort.localAddress().getAddress();
+        return address.isAnyLocalAddress() || address.isLoopbackAddress();
     }
 }

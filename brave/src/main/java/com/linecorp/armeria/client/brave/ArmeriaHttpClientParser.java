@@ -18,16 +18,20 @@ package com.linecorp.armeria.client.brave;
 
 import java.net.SocketAddress;
 
+import com.linecorp.armeria.client.ClientRequestContext;
+import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.RpcRequest;
 import com.linecorp.armeria.common.logging.RequestLog;
-import com.linecorp.armeria.internal.brave.SpanTags;
+import com.linecorp.armeria.internal.common.brave.SpanTags;
 
 import brave.SpanCustomizer;
-import brave.http.HttpAdapter;
-import brave.http.HttpClientParser;
+import brave.http.HttpRequestParser;
+import brave.http.HttpResponse;
+import brave.http.HttpResponseParser;
+import brave.propagation.TraceContext;
 
 /**
- * Default implementation of {@link HttpClientParser}.
+ * Default implementation of {@link HttpRequestParser} and {@link HttpResponseParser} for clients.
  * This parser adds some custom tags and overwrites the name of span if {@link RequestLog#requestContent()}
  * is {@link RpcRequest}.
  * The following tags become available:
@@ -40,7 +44,7 @@ import brave.http.HttpClientParser;
  *   <li>address.local</li>
  * </ul>
  */
-final class ArmeriaHttpClientParser extends HttpClientParser {
+final class ArmeriaHttpClientParser implements HttpRequestParser, HttpResponseParser {
 
     private static final ArmeriaHttpClientParser INSTANCE = new ArmeriaHttpClientParser();
 
@@ -48,38 +52,59 @@ final class ArmeriaHttpClientParser extends HttpClientParser {
         return INSTANCE;
     }
 
-    private ArmeriaHttpClientParser() {
+    private ArmeriaHttpClientParser() {}
+
+    @Override
+    public void parse(brave.http.HttpRequest request, TraceContext context, SpanCustomizer span) {
+        HttpRequestParser.DEFAULT.parse(request, context, span);
+
+        final Object unwrapped = request.unwrap();
+        if (!(unwrapped instanceof ClientRequestContext)) {
+            return;
+        }
+
+        final ClientRequestContext ctx = (ClientRequestContext) unwrapped;
+        final HttpRequest httpReq = ctx.request();
+        if (httpReq == null) {
+            // Should never reach here because BraveClient is an HTTP-level decorator.
+            return;
+        }
+
+        span.tag(SpanTags.TAG_HTTP_HOST, httpReq.authority())
+            .tag(SpanTags.TAG_HTTP_URL, httpReq.uri().toString());
     }
 
     @Override
-    public <T> void response(HttpAdapter<?, T> rawAdapter, T res, Throwable error, SpanCustomizer customizer) {
-        super.response(rawAdapter, res, error, customizer);
-        if (res instanceof RequestLog && rawAdapter instanceof ArmeriaHttpClientAdapter) {
-            final RequestLog requestLog = (RequestLog) res;
-            final ArmeriaHttpClientAdapter adapter = (ArmeriaHttpClientAdapter) rawAdapter;
-            customizer.tag(SpanTags.TAG_HTTP_HOST, adapter.authority(requestLog))
-                      .tag(SpanTags.TAG_HTTP_URL, adapter.url(requestLog))
-                      .tag(SpanTags.TAG_HTTP_PROTOCOL, adapter.protocol(requestLog));
+    public void parse(HttpResponse response, TraceContext context, SpanCustomizer span) {
+        HttpResponseParser.DEFAULT.parse(response, context, span);
 
-            final String serFmt = adapter.serializationFormat(requestLog);
-            if (serFmt != null) {
-                customizer.tag(SpanTags.TAG_HTTP_SERIALIZATION_FORMAT, serFmt);
-            }
+        final Object res = response.unwrap();
+        if (!(res instanceof ClientRequestContext)) {
+            return;
+        }
 
-            final SocketAddress raddr = requestLog.context().remoteAddress();
-            if (raddr != null) {
-                customizer.tag(SpanTags.TAG_ADDRESS_REMOTE, raddr.toString());
-            }
+        final ClientRequestContext ctx = (ClientRequestContext) res;
+        final RequestLog log = ctx.log().ensureComplete();
+        span.tag(SpanTags.TAG_HTTP_PROTOCOL, ClientRequestContextAdapter.protocol(log));
 
-            final SocketAddress laddr = requestLog.context().localAddress();
-            if (laddr != null) {
-                customizer.tag(SpanTags.TAG_ADDRESS_LOCAL, laddr.toString());
-            }
+        final String serFmt = ClientRequestContextAdapter.serializationFormat(log);
+        if (serFmt != null) {
+            span.tag(SpanTags.TAG_HTTP_SERIALIZATION_FORMAT, serFmt);
+        }
 
-            final String rpcMethod = adapter.rpcMethod(requestLog);
-            if (rpcMethod != null) {
-                customizer.name(rpcMethod);
-            }
+        final SocketAddress raddr = ctx.remoteAddress();
+        if (raddr != null) {
+            span.tag(SpanTags.TAG_ADDRESS_REMOTE, raddr.toString());
+        }
+
+        final SocketAddress laddr = ctx.localAddress();
+        if (laddr != null) {
+            span.tag(SpanTags.TAG_ADDRESS_LOCAL, laddr.toString());
+        }
+
+        final String name = log.name();
+        if (name != null) {
+            span.name(name);
         }
     }
 }

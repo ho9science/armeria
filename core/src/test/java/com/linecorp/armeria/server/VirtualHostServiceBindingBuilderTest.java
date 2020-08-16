@@ -21,7 +21,6 @@ import static com.linecorp.armeria.common.MediaType.JSON;
 import static com.linecorp.armeria.common.MediaType.JSON_UTF_8;
 import static com.linecorp.armeria.common.MediaType.PLAIN_TEXT_UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.Mockito.mock;
 
 import java.util.List;
 
@@ -29,26 +28,21 @@ import org.junit.jupiter.api.Test;
 
 import com.linecorp.armeria.common.HttpMethod;
 import com.linecorp.armeria.common.HttpResponse;
-import com.linecorp.armeria.common.logging.ContentPreviewerFactory;
 
 class VirtualHostServiceBindingBuilderTest {
 
     @Test
     void serviceBindingBuilder() {
-        final ServerBuilder sb = new ServerBuilder();
-        final ContentPreviewerFactory requestFactory = mock(ContentPreviewerFactory.class);
-        final ContentPreviewerFactory responseFactory = mock(ContentPreviewerFactory.class);
+        final ServerBuilder sb = Server.builder();
 
         sb.virtualHost("example.com")
-          .route().pathUnder("/foo/bar")
+          .route().pathPrefix("/foo/bar")
           .methods(HttpMethod.GET)
           .consumes(JSON, PLAIN_TEXT_UTF_8)
           .produces(JSON_UTF_8, PLAIN_TEXT_UTF_8)
           .requestTimeoutMillis(10)
           .maxRequestLength(8192)
           .verboseResponses(true)
-          .requestContentPreviewerFactory(requestFactory)
-          .responseContentPreviewerFactory(responseFactory)
           .build((ctx, req) -> HttpResponse.of(OK));
 
         final List<ServiceConfig> serviceConfigs = sb.build().serviceConfigs();
@@ -60,20 +54,18 @@ class VirtualHostServiceBindingBuilderTest {
         assertThat(route.paths()).containsExactly("/foo/bar/", "/foo/bar/*");
         assertThat(route.consumes()).containsExactly(JSON, PLAIN_TEXT_UTF_8);
         assertThat(route.produces()).containsExactly(JSON_UTF_8,
-                                                               PLAIN_TEXT_UTF_8);
+                                                     PLAIN_TEXT_UTF_8);
         assertThat(serviceConfig.requestTimeoutMillis()).isEqualTo(10);
         assertThat(serviceConfig.maxRequestLength()).isEqualTo(8192);
         assertThat(serviceConfig.verboseResponses()).isEqualTo(true);
-        assertThat(serviceConfig.requestContentPreviewerFactory()).isSameAs(requestFactory);
-        assertThat(serviceConfig.responseContentPreviewerFactory()).isSameAs(responseFactory);
     }
 
     @Test
     void withRoute() {
-        final ServerBuilder sb = new ServerBuilder();
+        final ServerBuilder sb = Server.builder();
 
         sb.virtualHost("example.com").withRoute(builder -> {
-            builder.pathUnder("/foo/bar")
+            builder.pathPrefix("/foo/bar")
                    .methods(HttpMethod.GET)
                    .consumes(JSON, PLAIN_TEXT_UTF_8)
                    .produces(JSON_UTF_8, PLAIN_TEXT_UTF_8)
@@ -92,7 +84,7 @@ class VirtualHostServiceBindingBuilderTest {
         assertThat(route.paths()).containsExactly("/foo/bar/", "/foo/bar/*");
         assertThat(route.consumes()).containsExactly(JSON, PLAIN_TEXT_UTF_8);
         assertThat(route.produces()).containsExactly(JSON_UTF_8,
-                                                               PLAIN_TEXT_UTF_8);
+                                                     PLAIN_TEXT_UTF_8);
         assertThat(serviceConfig.requestTimeoutMillis()).isEqualTo(10);
         assertThat(serviceConfig.maxRequestLength()).isEqualTo(8192);
         assertThat(serviceConfig.verboseResponses()).isEqualTo(true);

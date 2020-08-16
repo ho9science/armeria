@@ -15,6 +15,8 @@
  */
 package com.linecorp.armeria.common;
 
+import java.net.URI;
+
 import javax.annotation.Nullable;
 
 /**
@@ -23,6 +25,15 @@ import javax.annotation.Nullable;
  * @see ResponseHeaderGetters
  */
 interface RequestHeaderGetters extends HttpHeaderGetters {
+
+    /**
+     * Returns the request URI generated from the {@code ":scheme"}, {@code ":authority"} and {@code ":path"}
+     * headers.
+     *
+     * @throws IllegalStateException if any of the required headers do not exist or
+     *                               the resulting URI is not valid.
+     */
+    URI uri();
 
     /**
      * Returns the value of the {@code ":method"} header as an {@link HttpMethod}.
@@ -46,7 +57,8 @@ interface RequestHeaderGetters extends HttpHeaderGetters {
     String scheme();
 
     /**
-     * Returns the value of the {@code ":authority"} header or {@code null} if there is no such header.
+     * Returns the value of the {@code ":authority"} for HTTP/2 request or {@code "Host"} header for HTTP/1.1.
+     * {@code null} if there is no such headers.
      */
     @Nullable
     String authority();

@@ -17,8 +17,7 @@
 package com.linecorp.armeria.server;
 
 import static com.google.common.base.MoreObjects.firstNonNull;
-import static com.linecorp.armeria.internal.RouteUtil.GLOB;
-import static com.linecorp.armeria.internal.RouteUtil.newLoggerName;
+import static com.linecorp.armeria.internal.server.RouteUtil.GLOB;
 
 import java.util.List;
 import java.util.Set;
@@ -53,8 +52,7 @@ final class GlobPathMapping extends AbstractPathMapping {
     private final Pattern pattern;
     private final int numParams;
     private final Set<String> paramNames;
-    private final String loggerName;
-    private final String meterTag;
+    private final String pathPattern;
     private final String strVal;
     private final List<String> paths;
 
@@ -76,8 +74,7 @@ final class GlobPathMapping extends AbstractPathMapping {
         // Make the glob pattern as an absolute form to distinguish 'glob:foo' from 'exact:/foo'
         // when generating logger and metric names.
         final String aGlob = glob.startsWith("/") ? glob : "/**/" + glob;
-        loggerName = newLoggerName(aGlob);
-        meterTag = GLOB + aGlob;
+        pathPattern = aGlob;
         paths = ImmutableList.of(pattern.pattern(), aGlob);
     }
 
@@ -89,7 +86,7 @@ final class GlobPathMapping extends AbstractPathMapping {
             return null;
         }
 
-        final RoutingResultBuilder builder = RoutingResult.builder()
+        final RoutingResultBuilder builder = RoutingResult.builderWithExpectedNumParams(numParams)
                                                           .path(routingCtx.path())
                                                           .query(routingCtx.query());
         for (int i = 1; i <= numParams; i++) {
@@ -106,13 +103,8 @@ final class GlobPathMapping extends AbstractPathMapping {
     }
 
     @Override
-    public String loggerName() {
-        return loggerName;
-    }
-
-    @Override
-    public String meterTag() {
-        return meterTag;
+    public String patternString() {
+        return pathPattern;
     }
 
     @Override
@@ -127,11 +119,11 @@ final class GlobPathMapping extends AbstractPathMapping {
 
     @Override
     public int hashCode() {
-        return strVal.hashCode();
+        return glob.hashCode();
     }
 
     @Override
-    public boolean equals(Object obj) {
+    public boolean equals(@Nullable Object obj) {
         return obj instanceof GlobPathMapping &&
                (this == obj || glob.equals(((GlobPathMapping) obj).glob));
     }

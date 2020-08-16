@@ -15,8 +15,8 @@
  */
 package com.linecorp.armeria.common;
 
-import static com.linecorp.armeria.internal.ArmeriaHttpUtil.parseDirectiveValueAsSeconds;
-import static com.linecorp.armeria.internal.ArmeriaHttpUtil.parseDirectives;
+import static com.linecorp.armeria.internal.common.ArmeriaHttpUtil.parseDirectiveValueAsSeconds;
+import static com.linecorp.armeria.internal.common.ArmeriaHttpUtil.parseDirectives;
 import static java.util.Objects.requireNonNull;
 
 import java.util.Map;
@@ -39,25 +39,30 @@ public final class ServerCacheControl extends CacheControl {
     /**
      * An empty instance with all directives disabled.
      */
-    public static final ServerCacheControl EMPTY = new ServerCacheControlBuilder().build();
+    public static final ServerCacheControl EMPTY = builder().build();
 
     /**
      * {@code "no-cache, no-store, must-revalidate"}.
      */
-    public static final ServerCacheControl DISABLED = new ServerCacheControlBuilder()
-            .noCache().noStore().mustRevalidate().build();
+    public static final ServerCacheControl DISABLED = builder().noCache()
+                                                               .noStore()
+                                                               .mustRevalidate()
+                                                               .build();
 
     /**
      * {@code "no-cache, must-revalidate"}.
      */
-    public static final ServerCacheControl REVALIDATED = new ServerCacheControlBuilder()
-            .noCache().mustRevalidate().build();
+    public static final ServerCacheControl REVALIDATED = builder().noCache()
+                                                                  .mustRevalidate()
+                                                                  .build();
 
     /**
      * {@code "max-age=31536000, public, immutable"}.
      */
-    public static final ServerCacheControl IMMUTABLE = new ServerCacheControlBuilder()
-            .maxAgeSeconds(31536000).cachePublic().immutable().build();
+    public static final ServerCacheControl IMMUTABLE = builder().maxAgeSeconds(31536000)
+                                                                .cachePublic()
+                                                                .immutable()
+                                                                .build();
 
     private static final Map<String, BiConsumer<ServerCacheControlBuilder, String>> DIRECTIVES =
             ImmutableMap.<String, BiConsumer<ServerCacheControlBuilder, String>>builder()
@@ -101,7 +106,7 @@ public final class ServerCacheControl extends CacheControl {
      */
     public static ServerCacheControl parse(Iterable<String> directives) {
         requireNonNull(directives, "directives");
-        final ServerCacheControlBuilder builder = new ServerCacheControlBuilder();
+        final ServerCacheControlBuilder builder = builder();
         for (String d : directives) {
             parseDirectives(d, (name, value) -> {
                 final BiConsumer<ServerCacheControlBuilder, String> action = DIRECTIVES.get(name);
@@ -112,6 +117,13 @@ public final class ServerCacheControl extends CacheControl {
         }
 
         return builder.build();
+    }
+
+    /**
+     * Returns a newly created {@link ServerCacheControlBuilder} with all directives disabled initially.
+     */
+    public static ServerCacheControlBuilder builder() {
+        return new ServerCacheControlBuilder();
     }
 
     private final boolean cachePublic;
@@ -226,7 +238,7 @@ public final class ServerCacheControl extends CacheControl {
     }
 
     @Override
-    public boolean equals(Object o) {
+    public boolean equals(@Nullable Object o) {
         if (!super.equals(o)) {
             return false;
         }

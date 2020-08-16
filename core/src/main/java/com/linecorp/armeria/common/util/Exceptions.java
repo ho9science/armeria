@@ -37,12 +37,18 @@ import org.slf4j.Logger;
 
 import com.google.common.base.Throwables;
 
+import com.linecorp.armeria.client.UnprocessedRequestException;
+import com.linecorp.armeria.client.WriteTimeoutException;
 import com.linecorp.armeria.common.ClosedSessionException;
 import com.linecorp.armeria.common.Flags;
 import com.linecorp.armeria.common.SessionProtocol;
+import com.linecorp.armeria.common.stream.AbortedStreamException;
+import com.linecorp.armeria.common.stream.CancelledSubscriptionException;
+import com.linecorp.armeria.common.stream.ClosedStreamException;
 
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelException;
+import io.netty.handler.codec.http2.Http2Error;
 import io.netty.handler.codec.http2.Http2Exception;
 
 /**
@@ -62,21 +68,12 @@ public final class Exceptions {
     private static final StackTraceElement[] EMPTY_STACK_TRACE = new StackTraceElement[0];
 
     /**
-     * Returns whether the verbose exception mode is enabled. When enabled, the exceptions frequently thrown by
-     * Armeria will have full stack trace. When disabled, such exceptions will have empty stack trace to
-     * eliminate the cost of capturing the stack trace.
-     *
-     * @deprecated Use {@link Flags#verboseExceptions()} instead.
-     */
-    @Deprecated
-    public static boolean isVerbose() {
-        return Flags.verboseExceptions();
-    }
-
-    /**
      * Logs the specified exception if it is {@linkplain #isExpected(Throwable) unexpected}.
      */
     public static void logIfUnexpected(Logger logger, Channel ch, Throwable cause) {
+        requireNonNull(logger, "logger");
+        requireNonNull(ch, "ch");
+        requireNonNull(cause, "cause");
         if (!logger.isWarnEnabled() || isExpected(cause)) {
             return;
         }
@@ -88,7 +85,10 @@ public final class Exceptions {
      * Logs the specified exception if it is {@linkplain #isExpected(Throwable) unexpected}.
      */
     public static void logIfUnexpected(Logger logger, Channel ch, String debugData, Throwable cause) {
-
+        requireNonNull(logger, "logger");
+        requireNonNull(ch, "ch");
+        requireNonNull(debugData, "debugData");
+        requireNonNull(cause, "cause");
         if (!logger.isWarnEnabled() || isExpected(cause)) {
             return;
         }
@@ -101,6 +101,9 @@ public final class Exceptions {
      */
     public static void logIfUnexpected(Logger logger, Channel ch,
                                        @Nullable SessionProtocol protocol, Throwable cause) {
+        requireNonNull(logger, "logger");
+        requireNonNull(ch, "ch");
+        requireNonNull(cause, "cause");
         if (!logger.isWarnEnabled() || isExpected(cause)) {
             return;
         }
@@ -114,7 +117,10 @@ public final class Exceptions {
      */
     public static void logIfUnexpected(Logger logger, Channel ch, @Nullable SessionProtocol protocol,
                                        String debugData, Throwable cause) {
-
+        requireNonNull(logger, "logger");
+        requireNonNull(ch, "ch");
+        requireNonNull(debugData, "debugData");
+        requireNonNull(cause, "cause");
         if (!logger.isWarnEnabled() || isExpected(cause)) {
             return;
         }
@@ -141,6 +147,7 @@ public final class Exceptions {
      * @see Flags#verboseSocketExceptions()
      */
     public static boolean isExpected(Throwable cause) {
+        requireNonNull(cause, "cause");
         if (Flags.verboseSocketExceptions()) {
             return false;
         }
@@ -172,6 +179,23 @@ public final class Exceptions {
         }
 
         return false;
+    }
+
+    /**
+     * Returns {@code true} if the specified exception will cancel the current request or response stream.
+     */
+    public static boolean isStreamCancelling(Throwable cause) {
+        requireNonNull(cause, "cause");
+        if (cause instanceof UnprocessedRequestException) {
+            cause = cause.getCause();
+        }
+
+        return cause instanceof ClosedStreamException ||
+               cause instanceof CancelledSubscriptionException ||
+               cause instanceof WriteTimeoutException ||
+               cause instanceof AbortedStreamException ||
+               (cause instanceof Http2Exception.StreamException &&
+                ((Http2Exception.StreamException) cause).error() == Http2Error.CANCEL);
     }
 
     /**
@@ -211,6 +235,37 @@ public final class Exceptions {
         return null; // Never reaches here.
     }
 
+    // This is copied from
+    // https://github.com/ReactiveX/RxJava/blob/v3.0.0/src/main/java/io/reactivex/rxjava3/exceptions/Exceptions.java
+
+    /**
+     * Throws a particular {@code Throwable} only if it belongs to a set of "fatal" error varieties. These
+     * varieties are as follows:
+     * <ul>
+     * <li>{@code VirtualMachineError}</li>
+     * <li>{@code ThreadDeath}</li>
+     * <li>{@code LinkageError}</li>
+     * </ul>
+     * This can be useful if you are writing an operator that calls user-supplied code, and you want to
+     * notify subscribers of errors encountered in that code by calling their {@code onError} methods, but only
+     * if the errors are not so catastrophic that such a call would be futile, in which case you simply want to
+     * rethrow the error.
+     *
+     * @param t the {@code Throwable} to test and perhaps throw
+     * @see <a href="https://github.com/ReactiveX/RxJava/issues/748#issuecomment-32471495">
+     *     RxJava: StackOverflowError is swallowed (Issue #748)</a>
+     */
+    public static void throwIfFatal(Throwable t) {
+        requireNonNull(t, "t");
+        if (t instanceof VirtualMachineError) {
+            throw (VirtualMachineError) t;
+        } else if (t instanceof ThreadDeath) {
+            throw (ThreadDeath) t;
+        } else if (t instanceof LinkageError) {
+            throw (LinkageError) t;
+        }
+    }
+
     // This black magic causes the Java compiler to believe E is an unchecked exception type.
     @SuppressWarnings("unchecked")
     private static <E extends Throwable> void doThrowUnsafely(Throwable cause) throws E {
@@ -242,6 +297,7 @@ public final class Exceptions {
      * {@link Throwable#printStackTrace(PrintWriter)} or {@link Throwables#getStackTraceAsString(Throwable)}.
      */
     public static String traceText(Throwable exception) {
+        requireNonNull(exception, "exception");
         final StackTraceWriter writer = new StackTraceWriter();
         exception.printStackTrace(writer);
         return writer.toString();

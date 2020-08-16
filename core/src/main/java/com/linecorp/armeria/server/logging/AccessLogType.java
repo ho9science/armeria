@@ -21,11 +21,13 @@ import static com.linecorp.armeria.server.logging.AccessLogType.VariableRequirem
 import static com.linecorp.armeria.server.logging.AccessLogType.VariableRequirement.YES;
 
 import java.util.Map;
-import java.util.Optional;
+
+import javax.annotation.Nullable;
 
 import com.google.common.collect.ImmutableMap;
 
 import com.linecorp.armeria.common.RequestContext;
+import com.linecorp.armeria.common.RequestId;
 import com.linecorp.armeria.common.logging.RequestLog;
 
 import io.netty.util.AttributeMap;
@@ -105,7 +107,11 @@ enum AccessLogType {
     /**
      * A plain text which would be written to access log message.
      */
-    TEXT('%', false, NO);
+    TEXT('%', false, NO),
+    /**
+     * {@code "%I"} - the {@link RequestId}. Use {@code "%{short}I"} to get the short form.
+     */
+    REQUEST_ID('I', false, OPTIONAL);
 
     private static final Map<Character, AccessLogType> tokenToEnum;
 
@@ -117,8 +123,9 @@ enum AccessLogType {
         tokenToEnum = builder.build();
     }
 
-    static Optional<AccessLogType> find(char token) {
-        return Optional.ofNullable(tokenToEnum.get(token));
+    @Nullable
+    static AccessLogType find(char token) {
+        return tokenToEnum.get(token);
     }
 
     enum VariableRequirement {

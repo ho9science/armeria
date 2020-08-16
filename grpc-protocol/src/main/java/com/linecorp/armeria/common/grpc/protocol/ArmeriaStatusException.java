@@ -18,12 +18,15 @@ package com.linecorp.armeria.common.grpc.protocol;
 
 import javax.annotation.Nullable;
 
+import com.linecorp.armeria.common.annotation.UnstableApi;
+
 /**
  * An {@link Exception} that contains enough information to convert it to a gRPC status.
  */
-public class ArmeriaStatusException extends RuntimeException {
+@UnstableApi
+public final class ArmeriaStatusException extends RuntimeException {
 
-    public static final long serialVersionUID = -8370257107063108923L;
+    private static final long serialVersionUID = -8370257107063108923L;
 
     private final int code;
 

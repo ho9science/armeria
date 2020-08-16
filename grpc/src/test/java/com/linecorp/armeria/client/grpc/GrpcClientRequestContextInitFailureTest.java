@@ -23,15 +23,13 @@ import java.util.function.Consumer;
 
 import org.junit.jupiter.api.Test;
 
-import com.linecorp.armeria.client.ClientBuilder;
 import com.linecorp.armeria.client.ClientRequestContext;
 import com.linecorp.armeria.client.Clients;
+import com.linecorp.armeria.client.Endpoint;
 import com.linecorp.armeria.client.UnprocessedRequestException;
+import com.linecorp.armeria.client.endpoint.EmptyEndpointGroupException;
 import com.linecorp.armeria.client.endpoint.EndpointGroup;
-import com.linecorp.armeria.client.endpoint.EndpointGroupException;
-import com.linecorp.armeria.client.endpoint.EndpointGroupRegistry;
-import com.linecorp.armeria.client.endpoint.EndpointSelectionStrategy;
-import com.linecorp.armeria.common.logging.RequestLogAvailability;
+import com.linecorp.armeria.common.logging.RequestLog;
 import com.linecorp.armeria.common.util.SafeCloseable;
 import com.linecorp.armeria.grpc.testing.TestServiceGrpc.TestServiceBlockingStub;
 import com.linecorp.armeria.protobuf.EmptyProtos.Empty;
@@ -41,24 +39,10 @@ import io.grpc.StatusRuntimeException;
 
 class GrpcClientRequestContextInitFailureTest {
     @Test
-    void missingEndpointGroup() {
-        assertFailure("group:none", actualCause -> {
-            assertThat(actualCause).isInstanceOf(EndpointGroupException.class)
-                                   .hasMessageContaining("non-existent");
-        });
-    }
-
-    @Test
     void endpointSelectionFailure() {
-        EndpointGroupRegistry.register("foo", EndpointGroup.empty(), EndpointSelectionStrategy.ROUND_ROBIN);
-        try {
-            assertFailure("group:foo", actualCause -> {
-                assertThat(actualCause).isInstanceOf(EndpointGroupException.class)
-                                       .hasMessageContaining("empty");
-            });
-        } finally {
-            EndpointGroupRegistry.unregister("foo");
-        }
+        assertFailure(EndpointGroup.of(), actualCause -> {
+            assertThat(actualCause).isInstanceOf(EmptyEndpointGroupException.class);
+        });
     }
 
     @Test
@@ -67,20 +51,21 @@ class GrpcClientRequestContextInitFailureTest {
         try (SafeCloseable ignored = Clients.withContextCustomizer(ctx -> {
             throw cause;
         })) {
-            assertFailure("127.0.0.1:1", actualCause -> {
+            assertFailure(Endpoint.of("127.0.0.1", 1), actualCause -> {
                 assertThat(actualCause).isSameAs(cause);
             });
         }
     }
 
-    private static void assertFailure(String authority, Consumer<Throwable> requirements) {
+    private static void assertFailure(EndpointGroup group, Consumer<Throwable> requirements) {
         final AtomicReference<ClientRequestContext> capturedCtx = new AtomicReference<>();
-        final TestServiceBlockingStub client = new ClientBuilder("gproto+http://" + authority)
-                .decorator((delegate, ctx, req) -> {
-                    capturedCtx.set(ctx);
-                    return delegate.execute(ctx, req);
-                })
-                .build(TestServiceBlockingStub.class);
+        final TestServiceBlockingStub client =
+                Clients.builder("gproto+http", group)
+                       .decorator((delegate, ctx, req) -> {
+                           capturedCtx.set(ctx);
+                           return delegate.execute(ctx, req);
+                       })
+                       .build(TestServiceBlockingStub.class);
 
         final Throwable grpcCause = catchThrowable(() -> client.emptyCall(Empty.getDefaultInstance()));
         assertThat(grpcCause).isInstanceOfSatisfying(StatusRuntimeException.class, cause -> {
@@ -92,9 +77,9 @@ class GrpcClientRequestContextInitFailureTest {
         assertThat(actualCause.getCause()).satisfies((Consumer) requirements);
 
         assertThat(capturedCtx.get()).satisfies(ctx -> {
-            ctx.log().ensureAvailability(RequestLogAvailability.COMPLETE);
-            assertThat(ctx.log().requestCause()).isSameAs(actualCause);
-            assertThat(ctx.log().responseCause()).isSameAs(actualCause);
+            final RequestLog log = ctx.log().ensureComplete();
+            assertThat(log.requestCause()).isSameAs(actualCause);
+            assertThat(log.responseCause()).isSameAs(actualCause);
         });
     }
 }

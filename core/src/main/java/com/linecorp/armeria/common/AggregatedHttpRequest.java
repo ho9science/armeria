@@ -25,6 +25,9 @@ import java.util.Locale;
 
 import javax.annotation.Nullable;
 
+import com.google.errorprone.annotations.FormatMethod;
+import com.google.errorprone.annotations.FormatString;
+
 /**
  * A complete HTTP request whose content is readily available as a single {@link HttpData}.
  */
@@ -59,7 +62,7 @@ public interface AggregatedHttpRequest extends AggregatedHttpMessage {
         requireNonNull(content, "content");
         requireNonNull(mediaType, "mediaType");
         return of(method, path, mediaType,
-                  HttpData.of(mediaType.charset().orElse(StandardCharsets.UTF_8), content));
+                  HttpData.of(mediaType.charset(StandardCharsets.UTF_8), content));
     }
 
     /**
@@ -76,7 +79,7 @@ public interface AggregatedHttpRequest extends AggregatedHttpMessage {
         requireNonNull(content, "content");
         requireNonNull(mediaType, "mediaType");
         return of(method, path, mediaType,
-                  HttpData.of(mediaType.charset().orElse(StandardCharsets.UTF_8), content));
+                  HttpData.of(mediaType.charset(StandardCharsets.UTF_8), content));
     }
 
     /**
@@ -89,15 +92,16 @@ public interface AggregatedHttpRequest extends AggregatedHttpMessage {
      * @param format {@linkplain Formatter the format string} of the request content
      * @param args the arguments referenced by the format specifiers in the format string
      */
+    @FormatMethod
     static AggregatedHttpRequest of(HttpMethod method, String path, MediaType mediaType,
-                                    String format, Object... args) {
+                                    @FormatString String format, Object... args) {
         requireNonNull(method, "method");
         requireNonNull(path, "path");
         requireNonNull(mediaType, "mediaType");
         requireNonNull(format, "format");
         requireNonNull(args, "args");
         return of(method, path, mediaType,
-                  HttpData.of(mediaType.charset().orElse(StandardCharsets.UTF_8), format, args));
+                  HttpData.of(mediaType.charset(StandardCharsets.UTF_8), format, args));
     }
 
     /**
@@ -161,7 +165,7 @@ public interface AggregatedHttpRequest extends AggregatedHttpMessage {
      */
     static AggregatedHttpRequest of(RequestHeaders headers) {
         requireNonNull(headers, "headers");
-        return of(headers, HttpData.EMPTY_DATA, HttpHeaders.of());
+        return of(headers, HttpData.empty(), HttpHeaders.of());
     }
 
     /**
@@ -230,4 +234,13 @@ public interface AggregatedHttpRequest extends AggregatedHttpMessage {
      */
     @Nullable
     String authority();
+
+    /**
+     * Converts this request into a new complete {@link HttpRequest}.
+     *
+     * @return the new {@link HttpRequest} converted from this request.
+     */
+    default HttpRequest toHttpRequest() {
+        return HttpRequest.of(headers(), content(), trailers());
+    }
 }

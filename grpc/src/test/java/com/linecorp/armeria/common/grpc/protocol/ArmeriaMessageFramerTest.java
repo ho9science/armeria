@@ -16,77 +16,142 @@
 
 package com.linecorp.armeria.common.grpc.protocol;
 
+import static com.linecorp.armeria.common.grpc.protocol.ArmeriaMessageFramer.COMPRESSED_TRAILERS;
+import static com.linecorp.armeria.common.grpc.protocol.ArmeriaMessageFramer.UNCOMPRESSED_TRAILERS;
+import static com.linecorp.armeria.internal.common.grpc.protocol.GrpcTrailersUtil.serializeTrailersAsMessage;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.lang.reflect.Method;
+import java.util.Base64;
 import java.util.Random;
 
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestInfo;
 
 import com.google.common.base.Strings;
 import com.google.protobuf.ByteString;
 
+import com.linecorp.armeria.common.HttpData;
+import com.linecorp.armeria.common.ResponseHeaders;
+import com.linecorp.armeria.common.ResponseHeadersBuilder;
+import com.linecorp.armeria.common.grpc.GrpcSerializationFormats;
 import com.linecorp.armeria.grpc.testing.Messages.Payload;
 import com.linecorp.armeria.grpc.testing.Messages.SimpleRequest;
-import com.linecorp.armeria.internal.grpc.ForwardingCompressor;
-import com.linecorp.armeria.internal.grpc.GrpcTestUtil;
-import com.linecorp.armeria.unsafe.ByteBufHttpData;
+import com.linecorp.armeria.internal.common.grpc.ForwardingCompressor;
+import com.linecorp.armeria.internal.common.grpc.GrpcTestUtil;
+import com.linecorp.armeria.internal.common.grpc.protocol.GrpcTrailersUtil;
+import com.linecorp.armeria.internal.common.grpc.protocol.StatusCodes;
 
 import io.grpc.Codec.Gzip;
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.UnpooledByteBufAllocator;
 
-public class ArmeriaMessageFramerTest {
+class ArmeriaMessageFramerTest {
 
     private ArmeriaMessageFramer framer;
 
-    @Before
-    public void setUp() {
-        framer = new ArmeriaMessageFramer(UnpooledByteBufAllocator.DEFAULT, 1024);
+    @BeforeEach
+    void setUp(TestInfo info) {
+        final Method method = info.getTestMethod().get();
+        final boolean decodeBase64 = method.getName().contains("Base64");
+        framer = new ArmeriaMessageFramer(UnpooledByteBufAllocator.DEFAULT, 1024, decodeBase64);
     }
 
-    @After
-    public void close() {
+    @AfterEach
+    void close() {
         framer.close();
     }
 
     @Test
-    public void writeUncompressed() throws Exception {
+    void writeUncompressed() {
         final ByteBuf buf = GrpcTestUtil.requestByteBuf();
-        final ByteBufHttpData framed = framer.writePayload(buf);
-        assertThat(framed.array()).isEqualTo(GrpcTestUtil.uncompressedFrame(GrpcTestUtil.requestByteBuf()));
-        assertThat(buf.refCnt()).isEqualTo(0);
-        framed.release();
+        try (HttpData framed = framer.writePayload(buf)) {
+            assertThat(framed.array()).isEqualTo(GrpcTestUtil.uncompressedFrame(GrpcTestUtil.requestByteBuf()));
+            assertThat(buf.refCnt()).isEqualTo(0);
+        }
     }
 
     @Test
-    public void compressed() throws Exception {
+    void encodeBase64_writeUncompressedAnd() {
+        final ByteBuf buf = GrpcTestUtil.requestByteBuf();
+        try (ArmeriaMessageFramer framer = new ArmeriaMessageFramer(
+                UnpooledByteBufAllocator.DEFAULT, 1024, true);
+             HttpData framed = framer.writePayload(buf)) {
+            assertThat(Base64.getDecoder().decode(framed.array()))
+                    .isEqualTo(GrpcTestUtil.uncompressedFrame(GrpcTestUtil.requestByteBuf()));
+            assertThat(buf.refCnt()).isEqualTo(0);
+        }
+    }
+
+    @Test
+    void writeCompressed() {
         framer.setCompressor(ForwardingCompressor.forGrpc(new Gzip()));
         framer.setMessageCompression(true);
         final ByteBuf buf = GrpcTestUtil.requestByteBuf();
-        final ByteBufHttpData framed = framer.writePayload(buf);
-        assertThat(framed.array()).isEqualTo(GrpcTestUtil.compressedFrame(GrpcTestUtil.requestByteBuf()));
-        assertThat(buf.refCnt()).isEqualTo(0);
-        framed.release();
+        try (HttpData framed = framer.writePayload(buf)) {
+            assertThat(framed.array()).isEqualTo(GrpcTestUtil.compressedFrame(GrpcTestUtil.requestByteBuf()));
+            assertThat(buf.refCnt()).isEqualTo(0);
+        }
     }
 
     @Test
-    public void emptyNotCompressed() throws Exception {
+    void encodeBase64_writeCompressed() {
+        try (ArmeriaMessageFramer framer = new ArmeriaMessageFramer(
+                UnpooledByteBufAllocator.DEFAULT, 1024, true)) {
+            framer.setCompressor(ForwardingCompressor.forGrpc(new Gzip()));
+            framer.setMessageCompression(true);
+            final ByteBuf buf = GrpcTestUtil.requestByteBuf();
+            try (HttpData framed = framer.writePayload(buf)) {
+                assertThat(Base64.getDecoder().decode(framed.array()))
+                        .isEqualTo(GrpcTestUtil.compressedFrame(GrpcTestUtil.requestByteBuf()));
+                assertThat(buf.refCnt()).isEqualTo(0);
+            }
+        }
+    }
+
+    @Test
+    void writeUncompressedTrailers() {
+        final ByteBuf serialized = serializedTrailers();
+        try (HttpData framed = framer.writePayload(serialized, true)) {
+            assertThat(framed.isEndOfStream()).isTrue();
+            assertThat(framed.array()).isEqualTo(
+                    GrpcTestUtil.uncompressedFrame(serializedTrailers(), UNCOMPRESSED_TRAILERS));
+            assertThat(serialized.refCnt()).isEqualTo(0);
+        }
+    }
+
+    @Test
+    void writeCompressedTrailers() {
+        framer.setCompressor(ForwardingCompressor.forGrpc(new Gzip()));
+        framer.setMessageCompression(true);
+        final ByteBuf serialized = serializedTrailers();
+        try (HttpData framed = framer.writePayload(serialized, true)) {
+            assertThat(framed.isEndOfStream()).isTrue();
+            assertThat(framed.array()).isEqualTo(
+                    GrpcTestUtil.compressedFrame(serializedTrailers(), COMPRESSED_TRAILERS));
+            assertThat(serialized.refCnt()).isEqualTo(0);
+        }
+    }
+
+    @Test
+    void emptyNotCompressed() {
         framer.setCompressor(ForwardingCompressor.forGrpc(new Gzip()));
         framer.setMessageCompression(true);
         final ByteBuf buf = GrpcTestUtil.protoByteBuf(SimpleRequest.getDefaultInstance());
         assertThat(buf.readableBytes()).isEqualTo(0);
-        final ByteBufHttpData framed = framer.writePayload(buf);
-        assertThat(framed.array()).isEqualTo(GrpcTestUtil.uncompressedFrame(
-                GrpcTestUtil.protoByteBuf(SimpleRequest.getDefaultInstance())));
-        assertThat(buf.refCnt()).isEqualTo(0);
-        framed.release();
+        try (HttpData framed = framer.writePayload(buf)) {
+            assertThat(framed.array()).isEqualTo(GrpcTestUtil.uncompressedFrame(
+                    GrpcTestUtil.protoByteBuf(SimpleRequest.getDefaultInstance())));
+            assertThat(buf.refCnt()).isEqualTo(0);
+        }
     }
 
     @Test
-    public void tooLargeUncompressed() throws Exception {
+    void tooLargeUncompressed() {
         final SimpleRequest request =
                 SimpleRequest.newBuilder()
                              .setPayload(Payload.newBuilder()
@@ -98,7 +163,19 @@ public class ArmeriaMessageFramerTest {
     }
 
     @Test
-    public void notTooLargeCompressed() throws Exception {
+    void encodeBase64_tooLargeUncompressed() {
+        final SimpleRequest request =
+                SimpleRequest.newBuilder()
+                             .setPayload(Payload.newBuilder()
+                                                .setBody(ByteString.copyFromUtf8(
+                                                        Strings.repeat("a", 758)))) // Encoded size is 1028.
+                             .build();
+        assertThatThrownBy(() -> framer.writePayload(GrpcTestUtil.protoByteBuf(request)))
+                .isInstanceOf(ArmeriaStatusException.class);
+    }
+
+    @Test
+    void notTooLargeCompressed() {
         framer.setCompressor(ForwardingCompressor.forGrpc(new Gzip()));
         framer.setMessageCompression(true);
         final SimpleRequest request =
@@ -107,13 +184,14 @@ public class ArmeriaMessageFramerTest {
                                                 .setBody(ByteString.copyFromUtf8(
                                                         Strings.repeat("a", 1024))))
                              .build();
-        final ByteBufHttpData framed = framer.writePayload(GrpcTestUtil.protoByteBuf(request));
-        assertThat(framed.array()).isEqualTo(GrpcTestUtil.compressedFrame(GrpcTestUtil.protoByteBuf(request)));
-        framed.release();
+        try (HttpData framed = framer.writePayload(GrpcTestUtil.protoByteBuf(request))) {
+            assertThat(framed.array()).isEqualTo(
+                    GrpcTestUtil.compressedFrame(GrpcTestUtil.protoByteBuf(request)));
+        }
     }
 
     @Test
-    public void tooLargeCompressed() throws Exception {
+    void tooLargeCompressed() {
         framer.setCompressor(ForwardingCompressor.forGrpc(new Gzip()));
         framer.setMessageCompression(true);
         final Random random = new Random(1);
@@ -126,5 +204,12 @@ public class ArmeriaMessageFramerTest {
                              .build();
         assertThatThrownBy(() -> framer.writePayload(GrpcTestUtil.protoByteBuf(request)))
                 .isInstanceOf(ArmeriaStatusException.class);
+    }
+
+    private static ByteBuf serializedTrailers() {
+        final ResponseHeadersBuilder trailersBuilder = ResponseHeaders.builder(200).contentType(
+                GrpcSerializationFormats.PROTO.mediaType());
+        GrpcTrailersUtil.addStatusMessageToTrailers(trailersBuilder, StatusCodes.OK, null);
+        return serializeTrailersAsMessage(ByteBufAllocator.DEFAULT, trailersBuilder.build());
     }
 }

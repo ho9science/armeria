@@ -24,7 +24,7 @@ import javax.annotation.Nullable;
  *
  * <pre>{@code
  * ClientCacheControl cacheControl =
- *     new ClientCacheControlBuilder().noCache().build();
+ *     ClientCacheControl.builder().noCache().build();
  * }</pre>
  *
  * @see ServerCacheControlBuilder
@@ -39,10 +39,7 @@ public final class ClientCacheControlBuilder extends CacheControlBuilder {
     private long staleWhileRevalidateSeconds = -1;
     private long staleIfErrorSeconds = -1;
 
-    /**
-     * Creates a new builder with all directives disabled initially.
-     */
-    public ClientCacheControlBuilder() {}
+    ClientCacheControlBuilder() {}
 
     ClientCacheControlBuilder(ClientCacheControl c) {
         super(c);
